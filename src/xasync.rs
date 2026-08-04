@@ -155,18 +155,17 @@ fn interface() -> Result<IXAsync, HRESULT> {
     Ok(unsafe { IXAsync::from_raw(out) })
 }
 
-fn result<T>(r: T, h: HRESULT) -> Result<T, HRESULT> {
-    if h == S_OK { Ok(r) } else { Err(h) }
-}
-
-pub unsafe fn begin(
+unsafe fn begin(
     async_block: *mut XAsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
     identity_name: *const c_char,
     provider: XAsyncProvider,
-) -> Result<(), HRESULT> {
-    let xasync = interface()?;
+) -> HRESULT {
+    let xasync = match interface() {
+        Ok(xasync) => xasync,
+        Err(hr) => return hr,
+    };
     let hr = unsafe {
         xasync.XAsyncBegin(
             async_block.cast(),
@@ -176,31 +175,38 @@ pub unsafe fn begin(
             provider as *mut c_void,
         )
     };
-    result((), hr)
+    std::mem::forget(xasync);
+    hr
 }
 
-pub unsafe fn schedule(async_block: *mut XAsyncBlock, delay_ms: u32) -> Result<(), HRESULT> {
-    let xasync = interface()?;
+unsafe fn schedule(async_block: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
+    let xasync = match interface() {
+        Ok(xasync) => xasync,
+        Err(hr) => return hr,
+    };
     let hr = unsafe { xasync.XAsyncSchedule(async_block.cast(), delay_ms) };
-    result((), hr)
+    std::mem::forget(xasync);
+    hr
 }
 
-pub unsafe fn complete(
-    async_block: *mut XAsyncBlock,
-    result: HRESULT,
-    required_buffer_size: usize,
-) -> Result<(), HRESULT> {
-    let xasync = interface()?;
+unsafe fn complete(async_block: *mut XAsyncBlock, result: HRESULT, required_buffer_size: usize) {
+    let xasync = match interface() {
+        Ok(xasync) => xasync,
+        Err(_) => return,
+    };
     unsafe { xasync.XAsyncComplete(async_block.cast(), result.0, required_buffer_size as u64) };
-    Ok(())
+    std::mem::forget(xasync);
 }
 
-pub unsafe fn get_result<T>(
+pub(crate) unsafe fn get_result<T>(
     async_block: *mut XAsyncBlock,
     identity: *const c_void,
     out: *mut T,
-) -> Result<(), HRESULT> {
-    let xasync = interface()?;
+) -> HRESULT {
+    let xasync = match interface() {
+        Ok(xasync) => xasync,
+        Err(hr) => return hr,
+    };
     let mut buffer_used = 0usize;
     let hr = unsafe {
         xasync.XAsyncGetResult(
@@ -211,20 +217,29 @@ pub unsafe fn get_result<T>(
             &mut buffer_used,
         )
     };
-    result((), hr)
+    std::mem::forget(xasync);
+    hr
 }
 
-pub unsafe fn get_status(async_block: *mut XAsyncBlock, wait: bool) -> Result<(), HRESULT> {
-    let xasync = interface()?;
+pub(crate) unsafe fn get_status(async_block: *mut XAsyncBlock, wait: bool) -> HRESULT {
+    let xasync = match interface() {
+        Ok(xasync) => xasync,
+        Err(hr) => return hr,
+    };
     let hr = unsafe { xasync.XAsyncGetStatus(async_block.cast(), wait.into()) };
-    result((), hr)
+    std::mem::forget(xasync);
+    hr
 }
 
-pub unsafe fn get_result_size(async_block: *mut XAsyncBlock) -> Result<usize, HRESULT> {
-    let xasync = interface()?;
+pub(crate) unsafe fn get_result_size(async_block: *mut XAsyncBlock) -> Result<usize, HRESULT> {
+    let xasync = match interface() {
+        Ok(xasync) => xasync,
+        Err(hr) => return Err(hr),
+    };
     let mut buffer_size: usize = 0;
     let hr = unsafe { xasync.XAsyncGetResultSize(async_block.cast(), &mut buffer_size) };
-    result(buffer_size, hr)
+    std::mem::forget(xasync);
+    if hr == S_OK { Ok(buffer_size) } else { Err(hr) }
 }
 
 struct XAsyncContextHelper<T: Sized> {
@@ -243,6 +258,7 @@ unsafe impl Send for XAsyncWaker {}
 
 impl Wake for XAsyncWaker {
     fn wake(self: Arc<Self>) {
+        // println!("wake");
         unsafe { schedule(self.block, 0) };
     }
 }
@@ -254,15 +270,13 @@ unsafe extern "system" fn run_async_helper<T: Sized>(
     let Some(data) = (unsafe { data.as_ref() }) else {
         return E_POINTER;
     };
-    let Some(async_context) = (unsafe { (data.context as *mut XAsyncContextHelper<T>).as_mut() })
-    else {
+    let async_context = data.context as *mut XAsyncContextHelper<T>;
+    let Some(async_context) = (unsafe { async_context.as_mut() }) else {
         return E_POINTER;
     };
 
     match op {
-        XAsyncOp::Begin => unsafe { schedule(data.async_, 0) }
-            .map(|_| S_OK)
-            .unwrap_or_else(|hr| hr),
+        XAsyncOp::Begin => unsafe { schedule(data.async_, 0) },
         XAsyncOp::DoWork => {
             if async_context.canceled {
                 async_context.result = E_ABORT;
@@ -272,26 +286,31 @@ unsafe extern "system" fn run_async_helper<T: Sized>(
                 match async_context.future.as_mut().poll(&mut cx) {
                     Poll::Ready(value) => {
                         match value {
+                            Err(hr) => async_context.result = hr,
                             Ok(value) => {
                                 async_context.result = S_OK;
                                 async_context.payload = Some(value);
                             }
-                            Err(hr) => async_context.result = hr,
                         };
                     }
                     Poll::Pending => {
+                        // println!("pending");
                         return E_PENDING;
                     }
                 }
             }
-            unsafe { complete(data.async_, async_context.result, size_of::<T>()) }
-                .map(|_| S_OK)
-                .unwrap_or_else(|hr| hr)
+            // println!("required_buf_size {}", size_of::<T>());
+            unsafe {
+                complete(data.async_, async_context.result, size_of::<T>());
+            }
+            S_OK
         }
         XAsyncOp::GetResult => {
+            // println!("get_result {}", size_of::<T>());
             if async_context.result == S_OK
                 && let Some(payload) = &async_context.payload
             {
+                // println!("copy result {}", size_of::<T>());
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         (payload as *const T).cast::<u8>(),
@@ -323,13 +342,14 @@ where
         return S_OK;
     }
 
-    let async_context = Box::into_raw(Box::new(XAsyncContextHelper {
+    let async_context = Box::new(XAsyncContextHelper {
         canceled: false,
         payload: None as Option<T>,
         result: E_ABORT,
         future: Box::pin(future),
-    }));
-    match unsafe {
+    });
+    let async_context = Box::into_raw(async_context);
+    let hr = unsafe {
         begin(
             async_,
             async_context.cast(),
@@ -337,15 +357,13 @@ where
             c"run_async".as_ptr(),
             run_async_helper::<T>,
         )
-    } {
-        Ok(_) => S_OK,
-        Err(hr) => {
-            unsafe {
-                drop(Box::from_raw(async_context));
-            }
-            return hr;
+    };
+    if hr != S_OK {
+        unsafe {
+            drop(Box::from_raw(async_context));
         }
     }
+    hr
 }
 
 struct XsyncContextHelper<T: Sized, F: Fn() -> Result<T, HRESULT>> {
@@ -362,29 +380,31 @@ unsafe extern "system" fn run_sync_helper<T: Sized, F: Fn() -> Result<T, HRESULT
     let Some(data) = (unsafe { data.as_ref() }) else {
         return E_POINTER;
     };
-    let Some(async_context) = (unsafe { (data.context as *mut XsyncContextHelper<T, F>).as_mut() })
-    else {
+    let async_context = data.context as *mut XsyncContextHelper<T, F>;
+    let Some(async_context) = (unsafe { async_context.as_mut() }) else {
         return E_POINTER;
     };
 
     match op {
         XAsyncOp::Begin => unsafe {
-            match (async_context.future)() {
+            let value = (async_context.future)();
+            match value {
+                Err(hr) => async_context.result = hr,
                 Ok(value) => {
                     async_context.result = S_OK;
                     async_context.payload = Some(value);
                 }
-                Err(hr) => async_context.result = hr,
             };
-            complete(data.async_, async_context.result, size_of::<T>())
-                .map(|_| S_OK)
-                .unwrap_or_else(|hr| hr)
+            complete(data.async_, async_context.result, size_of::<T>());
+            S_OK
         },
         XAsyncOp::DoWork => S_OK,
         XAsyncOp::GetResult => {
+            // println!("get_result {}", size_of::<T>());
             if async_context.result == S_OK
                 && let Some(payload) = &async_context.payload
             {
+                // println!("copy result {}", size_of::<T>());
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         (payload as *const T).cast::<u8>(),
@@ -416,13 +436,14 @@ where
         return S_OK;
     }
 
-    let async_context = Box::into_raw(Box::new(XsyncContextHelper {
+    let async_context = Box::new(XsyncContextHelper {
         canceled: false,
         payload: None as Option<T>,
         result: E_ABORT,
         future: future,
-    }));
-    match unsafe {
+    });
+    let async_context = Box::into_raw(async_context);
+    let hr = unsafe {
         begin(
             async_,
             async_context.cast(),
@@ -430,13 +451,11 @@ where
             c"run_async".as_ptr(),
             run_sync_helper::<T, F>,
         )
-    } {
-        Ok(_) => S_OK,
-        Err(hr) => {
-            unsafe {
-                drop(Box::from_raw(async_context));
-            }
-            return hr;
+    };
+    if hr != S_OK {
+        unsafe {
+            drop(Box::from_raw(async_context));
         }
     }
+    hr
 }

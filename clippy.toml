@@ -1,0 +1,4 @@
+# GDK interface methods legitimately take many parameters (handler + context + multiple
+# out-params), so raise clippy's default 7-argument threshold instead of scaffolding
+# per-trait `#[allow]`s that the `#[interface]` proc-macro would reject anyway.
+too-many-arguments-threshold = 10
