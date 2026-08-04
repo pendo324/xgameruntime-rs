@@ -13,8 +13,9 @@
 //! - `xodus::ipc`: the env vars `xodus-cli run` sets on the game process
 //!   (`ENV_TCP_PORT`/`ENV_TCP_SECRET`), and that the secret is hex-encoded on the wire.
 //! - `xodus-service::connection`: the handshake (`tcp.rs`) and v2 XML framing
-//!   (`mod.rs`/`xml.rs`) byte layouts. Only `Ping` and `MsaTokenRequest` have a working
-//!   handler server-side today - everything else in `XodusMessageType` is schema-only.
+//!   (`mod.rs`/`xml.rs`) byte layouts. `Ping`, `MsaTokenRequest`, `XstsTokenRequest`,
+//!   `UserInfoRequest`, and `LicenseRequest` have working handlers server-side today -
+//!   everything else in `XodusMessageType` is schema-only.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -56,6 +57,27 @@ const MSG_TYPE_XSTS_TOKEN_REQUEST: u16 = 5;
 const MSG_TYPE_XSTS_TOKEN_RESPONSE: u16 = 6;
 const MSG_TYPE_USER_INFO_REQUEST: u16 = 7;
 const MSG_TYPE_USER_INFO_RESPONSE: u16 = 8;
+const MSG_TYPE_LICENSE_REQUEST: u16 = 9;
+const MSG_TYPE_LICENSE_RESPONSE: u16 = 10;
+const MSG_TYPE_ENTITLED_PRODUCTS_REQUEST: u16 = 13;
+const MSG_TYPE_ENTITLED_PRODUCTS_RESPONSE: u16 = 14;
+const MSG_TYPE_COLLECTIONS_ID_REQUEST: u16 = 15;
+const MSG_TYPE_COLLECTIONS_ID_RESPONSE: u16 = 16;
+const MSG_TYPE_LICENSE_TOKEN_REQUEST: u16 = 17;
+const MSG_TYPE_LICENSE_TOKEN_RESPONSE: u16 = 18;
+const MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST: u16 = 19;
+const MSG_TYPE_ASSOCIATED_PRODUCTS_RESPONSE: u16 = 20;
+
+/// `xodus-cli run` publishes the launched package's `ContentId` here (`xodus::ipc::ENV_CONTENT_ID`
+/// on the `xodus` side - this crate can't depend on that crate, so the literal is hand-mirrored,
+/// same as [`ENV_TCP_PORT`]/[`ENV_TCP_SECRET`]). Unset when not running under `xodus-cli run`.
+const ENV_CONTENT_ID: &str = "XODUS_CONTENT_ID";
+
+/// `xodus-cli run` publishes the launched package's computed `PackageFamilyName` here
+/// (`xodus::ipc::ENV_PACKAGE_FAMILY_NAME` on the `xodus` side, hand-mirrored for the same
+/// reason as [`ENV_CONTENT_ID`]). Unset when not running under `xodus-cli run`, or when
+/// `xodus-cli run` couldn't find/parse an `AppxManifest.xml`.
+const ENV_PACKAGE_FAMILY_NAME: &str = "XODUS_PACKAGE_FAMILY_NAME";
 
 /// Xbox Live's own MSA app registration id, used throughout `xodus`'s auth flow
 /// (`xodus::auth::TitleIdentity::default`) - not a per-title/per-game id, so hardcoding it
@@ -133,6 +155,123 @@ struct UserInfoResponse {
     #[serde(default)]
     gamertag_modern: String,
     age_group: String,
+}
+
+/// No user field - like `UserInfoRequest`, `xodus-service` always answers for whichever
+/// account's credentials are on this connection.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LicenseRequest {
+    content_id: String,
+    #[serde(default)]
+    market: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LicenseResponse {
+    is_active: bool,
+    #[serde(default)]
+    expiration_date: i64,
+}
+
+/// No user field - like `LicenseRequest`, `xodus-service` always answers for whichever
+/// account's credentials are on this connection.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct EntitledProductsRequest {
+    #[serde(default)]
+    market: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct EntitledProductsResponse {
+    #[serde(default, rename = "Product")]
+    products: Vec<EntitledProduct>,
+}
+
+/// `XStoreEnumerateProductsQuery`'s per-product payload. Kept as owned `String`s here;
+/// `com.rs`'s handle table is responsible for converting these into the `CString`/raw-pointer
+/// backing storage `XStoreProduct` (`wine/include/xstore.idl`) needs and keeping it alive for
+/// the query handle's lifetime.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct EntitledProduct {
+    pub(crate) store_id: String,
+    pub(crate) title: String,
+    pub(crate) product_kind: String,
+    #[serde(default)]
+    pub(crate) included_in_game_pass: bool,
+}
+
+/// No user field - like `EntitledProductsRequest`, `xodus-service` always answers for
+/// whichever account's credentials are on this connection. `service_ticket`/
+/// `publisher_user_id` are the caller's own opaque values, forwarded verbatim to
+/// `collections.mp.microsoft.com` - xodus does not generate or interpret them.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CollectionsIdRequest {
+    service_ticket: String,
+    publisher_user_id: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CollectionsIdResponse {
+    #[serde(default)]
+    key: String,
+}
+
+/// `product_ids[0]` is the parent product, the rest are related products - matching
+/// `XStoreQueryLicenseTokenAsync`'s real GDK signature (one flat `productIds` array).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LicenseTokenRequest {
+    #[serde(rename = "ProductId")]
+    product_ids: Vec<String>,
+    custom_developer_string: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LicenseTokenResponse {
+    #[serde(default)]
+    token: String,
+}
+
+/// No user field - like `EntitledProductsRequest`, `xodus-service` always answers for
+/// whichever account's credentials are on this connection. `package_family_name` is read
+/// from [`ENV_PACKAGE_FAMILY_NAME`] rather than accepted as a parameter here: unlike
+/// `service_ticket`/`publisher_user_id`, it isn't something the caller passes to
+/// `XStoreQueryAssociatedProductsAsync` - it's the running game's own identity.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AssociatedProductsRequest {
+    #[serde(default)]
+    package_family_name: String,
+    #[serde(default)]
+    market: String,
+    #[serde(default)]
+    max_items: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AssociatedProductsResponse {
+    #[serde(default, rename = "Product")]
+    products: Vec<AssociatedProduct>,
+}
+
+/// `XStoreQueryAssociatedProductsAsync`'s per-product payload - see
+/// `EntitledProduct`'s docs for why this is owned `String`s rather than the raw-pointer
+/// `XStoreProduct` shape.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct AssociatedProduct {
+    pub(crate) store_id: String,
+    pub(crate) title: String,
+    pub(crate) product_kind: String,
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -321,6 +460,130 @@ pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
     ))
 }
 
+/// `XStoreQueryGameLicenseAsync`'s real backing. Returns `(is_active, expiration_date)` for
+/// the package `xodus-cli run` launched (identified by its `ContentId`, published via
+/// [`ENV_CONTENT_ID`]). `Err(E_NOTIMPL)` when that env var is unset - not running under
+/// `xodus-cli run`, so there is no package to ask about - distinct from a reachable service
+/// that actually answered "not entitled".
+pub fn get_game_license() -> Result<(bool, i64), HRESULT> {
+    let content_id = std::env::var(ENV_CONTENT_ID).map_err(|_| E_NOTIMPL)?;
+
+    let request_body = LicenseRequest {
+        content_id,
+        market: String::new(),
+    };
+    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) = request(MSG_TYPE_LICENSE_REQUEST, body.as_bytes())?;
+    if reply_type != MSG_TYPE_LICENSE_RESPONSE {
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: LicenseResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    Ok((response.is_active, response.expiration_date))
+}
+
+/// `XStoreQueryEntitledProductsAsync`'s real backing - titles this account owns outright or
+/// through a subscription (PC Game Pass / Game Pass Ultimate), from `xodus-service`'s "My
+/// games" library lookup. Unlike [`get_game_license`], not gated on [`ENV_CONTENT_ID`]: this
+/// always answers for whichever account is signed in, package or no package.
+pub(crate) fn get_entitled_products(market: &str) -> Result<Vec<EntitledProduct>, HRESULT> {
+    let request_body = EntitledProductsRequest {
+        market: market.to_string(),
+    };
+    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) = request(MSG_TYPE_ENTITLED_PRODUCTS_REQUEST, body.as_bytes())?;
+    if reply_type != MSG_TYPE_ENTITLED_PRODUCTS_RESPONSE {
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: EntitledProductsResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    Ok(response.products)
+}
+
+/// `XStoreGetUserCollectionsIdAsync`'s real backing, via `xodus-service`'s
+/// `CollectionsIdRequest` handler - a real call against
+/// `collections.mp.microsoft.com/v7.0/beneficiaries/me/keys` (endpoint confirmed via
+/// static analysis of the real `xgameruntime.dll`'s embedded service-configuration blob,
+/// not guessed). `service_ticket`/`publisher_user_id` are forwarded verbatim; the result
+/// is an opaque signed blob meant for the title's own backend, returned as-is.
+pub(crate) fn get_user_collections_id(
+    service_ticket: &str,
+    publisher_user_id: &str,
+) -> Result<String, HRESULT> {
+    let request_body = CollectionsIdRequest {
+        service_ticket: service_ticket.to_string(),
+        publisher_user_id: publisher_user_id.to_string(),
+    };
+    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) = request(MSG_TYPE_COLLECTIONS_ID_REQUEST, body.as_bytes())?;
+    if reply_type != MSG_TYPE_COLLECTIONS_ID_RESPONSE {
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: CollectionsIdResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    Ok(response.key)
+}
+
+/// `XStoreQueryLicenseTokenAsync`'s real backing, via `xodus-service`'s
+/// `LicenseTokenRequest` handler - a real call against
+/// `licensing.mp.microsoft.com/v8.0/licenseToken` (endpoint confirmed the same way as
+/// [`get_user_collections_id`]). The result is an opaque token meant for the title's own
+/// backend, returned as-is.
+pub(crate) fn get_license_token(
+    product_ids: &[String],
+    custom_developer_string: &str,
+) -> Result<String, HRESULT> {
+    let request_body = LicenseTokenRequest {
+        product_ids: product_ids.to_vec(),
+        custom_developer_string: custom_developer_string.to_string(),
+    };
+    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) = request(MSG_TYPE_LICENSE_TOKEN_REQUEST, body.as_bytes())?;
+    if reply_type != MSG_TYPE_LICENSE_TOKEN_RESPONSE {
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: LicenseTokenResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    Ok(response.token)
+}
+
+/// `XStoreQueryAssociatedProductsAsync`'s real backing, via `xodus-service`'s
+/// `AssociatedProductsRequest` handler - products "sellable by" (DLC/add-ons for) the
+/// running game's own catalog entry. `Err(E_NOTIMPL)` when [`ENV_PACKAGE_FAMILY_NAME`] is
+/// unset (not running under `xodus-cli run`, or `xodus-cli run` couldn't find/parse an
+/// `AppxManifest.xml`) - same honest "nothing to resolve" stance as [`get_game_license`]'s
+/// gate on [`ENV_CONTENT_ID`].
+pub(crate) fn get_associated_products(
+    max_items: u32,
+) -> Result<Vec<AssociatedProduct>, HRESULT> {
+    let package_family_name = std::env::var(ENV_PACKAGE_FAMILY_NAME).map_err(|_| E_NOTIMPL)?;
+    let request_body = AssociatedProductsRequest {
+        package_family_name,
+        market: String::new(),
+        max_items,
+    };
+    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) =
+        request(MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST, body.as_bytes())?;
+    if reply_type != MSG_TYPE_ASSOCIATED_PRODUCTS_RESPONSE {
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: AssociatedProductsResponse =
+        quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    Ok(response.products)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
@@ -346,6 +609,13 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_TCP_PORT);
             std::env::remove_var(ENV_TCP_SECRET);
+            std::env::remove_var(ENV_CONTENT_ID);
+        }
+    }
+
+    fn set_content_id_env(content_id: &str) {
+        unsafe {
+            std::env::set_var(ENV_CONTENT_ID, content_id);
         }
     }
 
@@ -592,5 +862,315 @@ mod tests {
         assert_eq!(gamertag, "FakeGamer");
         assert_eq!(gamertag_modern, "FakeGamer");
         assert_eq!(age_group, "Adult");
+    }
+
+    #[test]
+    fn missing_content_id_is_reported_as_not_implemented_not_a_crash() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        clear_endpoint_env();
+        assert_eq!(get_game_license().unwrap_err(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn license_request_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x77u8; SECRET_LEN];
+        let secret_for_server = secret;
+        let content_id = "01234567-89ab-cdef-0123-456789abcdef";
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            let msg_type = u16::from_le_bytes([header[0], header[1]]);
+            assert_eq!(msg_type, MSG_TYPE_LICENSE_REQUEST);
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let body = read_exact_blocking(&mut socket, size);
+            let request: LicenseRequest =
+                quick_xml::de::from_str(std::str::from_utf8(&body).unwrap()).expect("parses");
+            assert_eq!(request.content_id, "01234567-89ab-cdef-0123-456789abcdef");
+
+            let response = LicenseResponse {
+                is_active: true,
+                expiration_date: 1_800_000_000,
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_LICENSE_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        set_content_id_env(content_id);
+        let result = get_game_license();
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        let (is_active, expiration_date) = result.expect("round trip succeeds");
+        assert!(is_active);
+        assert_eq!(expiration_date, 1_800_000_000);
+    }
+
+    #[test]
+    fn entitled_products_request_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x55u8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            let msg_type = u16::from_le_bytes([header[0], header[1]]);
+            assert_eq!(msg_type, MSG_TYPE_ENTITLED_PRODUCTS_REQUEST);
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let body = read_exact_blocking(&mut socket, size);
+            let request: EntitledProductsRequest =
+                quick_xml::de::from_str(std::str::from_utf8(&body).unwrap()).expect("parses");
+            assert_eq!(request.market, "US");
+
+            let response = EntitledProductsResponse {
+                products: vec![
+                    EntitledProduct {
+                        store_id: "9ABC123".to_string(),
+                        title: "Some Game".to_string(),
+                        product_kind: "Game".to_string(),
+                        included_in_game_pass: true,
+                    },
+                    EntitledProduct {
+                        store_id: "9DEF456".to_string(),
+                        title: "Another Game".to_string(),
+                        product_kind: "Game".to_string(),
+                        included_in_game_pass: false,
+                    },
+                ],
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_ENTITLED_PRODUCTS_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = get_entitled_products("US");
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        let products = result.expect("round trip succeeds");
+        assert_eq!(products.len(), 2);
+        assert_eq!(products[0].store_id, "9ABC123");
+        assert!(products[0].included_in_game_pass);
+        assert_eq!(products[1].store_id, "9DEF456");
+        assert!(!products[1].included_in_game_pass);
+    }
+
+    #[test]
+    fn empty_entitled_products_response_round_trips() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x66u8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            assert_eq!(
+                u16::from_le_bytes([header[0], header[1]]),
+                MSG_TYPE_ENTITLED_PRODUCTS_REQUEST
+            );
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let _body = read_exact_blocking(&mut socket, size);
+
+            let response = EntitledProductsResponse { products: vec![] };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_ENTITLED_PRODUCTS_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = get_entitled_products("US");
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert!(result.expect("round trip succeeds").is_empty());
+    }
+
+    #[test]
+    fn collections_id_request_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x88u8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            let msg_type = u16::from_le_bytes([header[0], header[1]]);
+            assert_eq!(msg_type, MSG_TYPE_COLLECTIONS_ID_REQUEST);
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let body = read_exact_blocking(&mut socket, size);
+            let request: CollectionsIdRequest =
+                quick_xml::de::from_str(std::str::from_utf8(&body).unwrap()).expect("parses");
+            assert_eq!(request.service_ticket, "fake-service-ticket");
+            assert_eq!(request.publisher_user_id, "fake-publisher-user-id");
+
+            let response = CollectionsIdResponse {
+                key: "fake-collections-key".to_string(),
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_COLLECTIONS_ID_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = get_user_collections_id("fake-service-ticket", "fake-publisher-user-id");
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert_eq!(result.expect("round trip succeeds"), "fake-collections-key");
+    }
+
+    #[test]
+    fn license_token_request_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x33u8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            let msg_type = u16::from_le_bytes([header[0], header[1]]);
+            assert_eq!(msg_type, MSG_TYPE_LICENSE_TOKEN_REQUEST);
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let body = read_exact_blocking(&mut socket, size);
+            let request: LicenseTokenRequest =
+                quick_xml::de::from_str(std::str::from_utf8(&body).unwrap()).expect("parses");
+            assert_eq!(
+                request.product_ids,
+                vec!["9ABC123".to_string(), "9DEF456".to_string()]
+            );
+            assert_eq!(request.custom_developer_string, "custom-string");
+
+            let response = LicenseTokenResponse {
+                token: "fake-license-token".to_string(),
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_LICENSE_TOKEN_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = get_license_token(
+            &["9ABC123".to_string(), "9DEF456".to_string()],
+            "custom-string",
+        );
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert_eq!(result.expect("round trip succeeds"), "fake-license-token");
     }
 }
