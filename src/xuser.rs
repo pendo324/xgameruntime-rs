@@ -4,13 +4,13 @@
 //!
 //! This lands the handle table and every slot that can be answered honestly with no
 //! external state: duplicate/close/compare, local-id and global-id lookup, guest/state
-//! queries, the RemoteConnect plumbing `lib.rs` already wires up. Everything that needs a
-//! real signed-in identity - `XUserAddAsync`, `XUserGetTokenAndSignatureAsync`,
-//! `XUserGetMsaTokenSilentlyAsync`, `XUserGetGamertag` - returns `E_NOTIMPL` until
-//! `xgameruntime-rs/src/ipc.rs` exists to ask `xodus-service` for an answer (PLAN.md Phase
-//! 1 remainder). Faking a signed-in user here would be actively wrong, unlike the XStore
-//! license placeholder: a game that thinks nobody is signed in behaves correctly, a game
-//! that thinks the wrong person is signed in does not.
+//! queries, the RemoteConnect plumbing `lib.rs` already wires up. `XUserGetMsaTokenSilentlyAsync`
+//! and `XUserGetTokenAndSignatureAsync` are wired to real `xodus-service` IPC calls
+//! (`crate::ipc`). Everything else that needs a real signed-in identity -
+//! `XUserAddAsync`, `XUserGetGamertag` - still returns `E_NOTIMPL` until the corresponding
+//! server-side handler exists. Faking a signed-in user here would be actively wrong, unlike
+//! the XStore license placeholder: a game that thinks nobody is signed in behaves correctly,
+//! a game that thinks the wrong person is signed in does not.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
@@ -474,6 +474,13 @@ pub unsafe trait IXUserGamertagImpl: IUnknown {
 )]
 pub struct XUserObject;
 
+/// Keyed by the caller's `XAsyncBlock` pointer, same rationale and lifetime tradeoff as
+/// `MSA_TOKEN_RESULTS` below - the `(authorization, signature)` pair has no size known
+/// until after the IPC round trip, so it can't ride in `xasync::run_sync`'s fixed-size `T`.
+static TOKEN_AND_SIGNATURE_RESULTS: Mutex<
+    Option<HashMap<usize, Result<(String, String), HRESULT>>>,
+> = Mutex::new(None);
+
 impl IXUserImpl_Impl for XUserObject_Impl {
     unsafe fn XUserDuplicateHandle(&self, handle: u64, duplicated_handle: *mut u64) -> HRESULT {
         if duplicated_handle.is_null() {
@@ -623,9 +630,6 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         unsafe fn XUserGetGamerPictureResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
         unsafe fn XUserGetGamerPictureResult(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, buffer_used: *mut usize) -> HRESULT;
         unsafe fn XUserGetAgeGroup(&self, user: u64, age_group: *mut u32) -> HRESULT;
-        unsafe fn XUserGetTokenAndSignatureAsync(&self, user: u64, options: u32, method: *const c_char, url: *const c_char, header_count: usize, headers: *const XUserGetTokenAndSignatureHttpHeader, body_size: usize, body_buffer: *const c_void, async_: *mut XAsyncBlock) -> HRESULT;
-        unsafe fn XUserGetTokenAndSignatureResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
-        unsafe fn XUserGetTokenAndSignatureResult(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureData, buffer_used: *mut usize) -> HRESULT;
         unsafe fn XUserGetTokenAndSignatureUtf16Async(&self, user: u64, options: u32, method: *const u16, url: *const u16, header_count: usize, headers: *const XUserGetTokenAndSignatureUtf16HttpHeader, body_size: usize, body_buffer: *const c_void, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserGetTokenAndSignatureUtf16ResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
         unsafe fn XUserGetTokenAndSignatureUtf16Result(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureUtf16Data, buffer_used: *mut usize) -> HRESULT;
@@ -633,6 +637,139 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         unsafe fn XUserResolveIssueWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiUtf16Async(&self, user: u64, url: *const u16, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiUtf16Result(&self, async_: *mut XAsyncBlock) -> HRESULT;
+    }
+
+    unsafe fn XUserGetTokenAndSignatureAsync(
+        &self,
+        user: u64,
+        _options: u32,
+        method: *const c_char,
+        url: *const c_char,
+        _header_count: usize,
+        _headers: *const XUserGetTokenAndSignatureHttpHeader,
+        body_size: usize,
+        body_buffer: *const c_void,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT {
+        if (unsafe { UserHandleTable::get(user) }).is_none() {
+            return E_INVALIDARG;
+        }
+        if method.is_null() || url.is_null() {
+            return E_POINTER;
+        }
+        let method = unsafe { std::ffi::CStr::from_ptr(method) }
+            .to_string_lossy()
+            .into_owned();
+        let url = unsafe { std::ffi::CStr::from_ptr(url) }
+            .to_string_lossy()
+            .into_owned();
+        let body = if body_size == 0 || body_buffer.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(body_buffer.cast::<u8>(), body_size) }.to_vec()
+        };
+
+        let key = async_ as usize;
+        unsafe {
+            xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
+                let result = crate::ipc::get_token_and_signature(&method, &url, &body);
+                let outcome = match &result {
+                    Ok(_) => Ok(()),
+                    Err(hr) => Err(*hr),
+                };
+                TOKEN_AND_SIGNATURE_RESULTS
+                    .lock()
+                    .expect("token and signature results poisoned")
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key, result);
+                outcome
+            })
+        }
+    }
+
+    unsafe fn XUserGetTokenAndSignatureResultSize(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: *mut usize,
+    ) -> HRESULT {
+        if buffer_size.is_null() {
+            return E_POINTER;
+        }
+        let key = async_ as usize;
+        let results = TOKEN_AND_SIGNATURE_RESULTS
+            .lock()
+            .expect("token and signature results poisoned");
+        match results.as_ref().and_then(|results| results.get(&key)) {
+            Some(Ok((token, signature))) => {
+                unsafe {
+                    *buffer_size = size_of::<XUserGetTokenAndSignatureData>()
+                        + token.len()
+                        + 1
+                        + signature.len()
+                        + 1
+                };
+                S_OK
+            }
+            Some(Err(hr)) => *hr,
+            None => E_ILLEGAL_METHOD_CALL,
+        }
+    }
+
+    unsafe fn XUserGetTokenAndSignatureResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: usize,
+        buffer: *mut c_void,
+        ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureData,
+        buffer_used: *mut usize,
+    ) -> HRESULT {
+        let key = async_ as usize;
+        let results = TOKEN_AND_SIGNATURE_RESULTS
+            .lock()
+            .expect("token and signature results poisoned");
+        match results.as_ref().and_then(|results| results.get(&key)) {
+            Some(Ok((token, signature))) => {
+                let header_size = size_of::<XUserGetTokenAndSignatureData>();
+                let token_size = token.len() + 1;
+                let signature_size = signature.len() + 1;
+                let needed = header_size + token_size + signature_size;
+                if needed > buffer_size {
+                    return E_NOT_SUFFICIENT_BUFFER;
+                }
+                if buffer.is_null() || ptr_to_buffer.is_null() {
+                    return E_POINTER;
+                }
+
+                unsafe {
+                    let base = buffer.cast::<u8>();
+                    let token_ptr = base.add(header_size);
+                    let signature_ptr = token_ptr.add(token_size);
+
+                    std::ptr::copy_nonoverlapping(token.as_ptr(), token_ptr, token.len());
+                    *token_ptr.add(token.len()) = 0;
+                    std::ptr::copy_nonoverlapping(
+                        signature.as_ptr(),
+                        signature_ptr,
+                        signature.len(),
+                    );
+                    *signature_ptr.add(signature.len()) = 0;
+
+                    let data = buffer.cast::<XUserGetTokenAndSignatureData>();
+                    (*data).token_size = token_size;
+                    (*data).signature_size = signature_size;
+                    (*data).token = token_ptr.cast();
+                    (*data).signature = signature_ptr.cast();
+                    *ptr_to_buffer = data;
+
+                    if !buffer_used.is_null() {
+                        *buffer_used = needed;
+                    }
+                }
+                S_OK
+            }
+            Some(Err(hr)) => *hr,
+            None => E_ILLEGAL_METHOD_CALL,
+        }
     }
 
     unsafe fn XUserCheckPrivilege(
@@ -727,11 +864,114 @@ impl IXUserImpl2_Impl for XUserObject_Impl {
     }
 }
 
+/// Keyed by the caller's `XAsyncBlock` pointer, since the token (unlike the fixed-size
+/// payloads `xasync::run_sync`'s generic `T` is built for) has no size known in advance -
+/// `XUserGetMsaTokenSilentlyResultSize` has to answer before `Result` is called at all.
+/// Entries are not removed on read: a caller is allowed to call `ResultSize` then `Result`
+/// with a too-small buffer and retry, and the real GDK contract has no separate "I am
+/// done with this async block" signal short of the block going out of scope. This leaks
+/// one small entry per call that never asks for its result, same tradeoff already made by
+/// `CHANGE_EVENT_REGISTRY` and the user handle table.
+static MSA_TOKEN_RESULTS: Mutex<Option<HashMap<usize, Result<(String, i64), HRESULT>>>> =
+    Mutex::new(None);
+
 impl IXUserImpl3_Impl for XUserObject_Impl {
-    hresult_stub! {
-        unsafe fn XUserGetMsaTokenSilentlyAsync(&self, user: u64, options: u32, scope: *const c_char, async_: *mut XAsyncBlock) -> HRESULT;
-        unsafe fn XUserGetMsaTokenSilentlyResult(&self, async_: *mut XAsyncBlock, result_token_size: usize, result_token: *mut c_char, result_token_used: *mut usize) -> HRESULT;
-        unsafe fn XUserGetMsaTokenSilentlyResultSize(&self, async_: *mut XAsyncBlock, token_size: *mut usize) -> HRESULT;
+    unsafe fn XUserGetMsaTokenSilentlyAsync(
+        &self,
+        user: u64,
+        _options: u32,
+        scope: *const c_char,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT {
+        if (unsafe { UserHandleTable::get(user) }).is_none() {
+            return E_INVALIDARG;
+        }
+        let scope = if scope.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(scope) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        let key = async_ as usize;
+        unsafe {
+            xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
+                let result = crate::ipc::get_msa_token_silently(scope.as_deref());
+                let outcome = match &result {
+                    Ok(_) => Ok(()),
+                    Err(hr) => Err(*hr),
+                };
+                MSA_TOKEN_RESULTS
+                    .lock()
+                    .expect("msa token results poisoned")
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key, result);
+                outcome
+            })
+        }
+    }
+
+    unsafe fn XUserGetMsaTokenSilentlyResultSize(
+        &self,
+        async_: *mut XAsyncBlock,
+        token_size: *mut usize,
+    ) -> HRESULT {
+        if token_size.is_null() {
+            return E_POINTER;
+        }
+        let key = async_ as usize;
+        let results = MSA_TOKEN_RESULTS
+            .lock()
+            .expect("msa token results poisoned");
+        match results.as_ref().and_then(|results| results.get(&key)) {
+            Some(Ok((token, _))) => {
+                unsafe { *token_size = token.len() + 1 };
+                S_OK
+            }
+            Some(Err(hr)) => *hr,
+            None => E_ILLEGAL_METHOD_CALL,
+        }
+    }
+
+    unsafe fn XUserGetMsaTokenSilentlyResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        result_token_size: usize,
+        result_token: *mut c_char,
+        result_token_used: *mut usize,
+    ) -> HRESULT {
+        let key = async_ as usize;
+        let results = MSA_TOKEN_RESULTS
+            .lock()
+            .expect("msa token results poisoned");
+        match results.as_ref().and_then(|results| results.get(&key)) {
+            Some(Ok((token, _))) => {
+                let bytes = token.as_bytes();
+                let needed = bytes.len() + 1;
+                if needed > result_token_size {
+                    return E_NOT_SUFFICIENT_BUFFER;
+                }
+                if result_token.is_null() {
+                    return E_POINTER;
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        result_token.cast::<u8>(),
+                        bytes.len(),
+                    );
+                    *result_token.cast::<u8>().add(bytes.len()) = 0;
+                }
+                if !result_token_used.is_null() {
+                    unsafe { *result_token_used = needed };
+                }
+                S_OK
+            }
+            Some(Err(hr)) => *hr,
+            None => E_ILLEGAL_METHOD_CALL,
+        }
     }
 }
 

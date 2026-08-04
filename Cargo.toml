@@ -8,6 +8,11 @@ name = "xgameruntime"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# XML wire format for xodus-service's loopback IPC (src/ipc.rs) - matches the
+# MSATokenRequest/MSATokenResponse shape in xodus::models::xgameruntime::xuser exactly,
+# so hand-rolling the (un)escaping instead would just be a worse reimplementation of this.
+serde = { version = "1", features = ["derive"] }
+quick-xml = { version = "0.40.1", features = ["serialize"] }
 
 [dependencies.windows-core]
 git = "https://github.com/microsoft/windows-rs"
