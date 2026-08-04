@@ -54,6 +54,8 @@ const MSG_TYPE_MSA_TOKEN_REQUEST: u16 = 3;
 const MSG_TYPE_MSA_TOKEN_RESPONSE: u16 = 4;
 const MSG_TYPE_XSTS_TOKEN_REQUEST: u16 = 5;
 const MSG_TYPE_XSTS_TOKEN_RESPONSE: u16 = 6;
+const MSG_TYPE_USER_INFO_REQUEST: u16 = 7;
+const MSG_TYPE_USER_INFO_RESPONSE: u16 = 8;
 
 /// Xbox Live's own MSA app registration id, used throughout `xodus`'s auth flow
 /// (`xodus::auth::TitleIdentity::default`) - not a per-title/per-game id, so hardcoding it
@@ -115,6 +117,22 @@ struct XstsTokenResponse {
     signature: String,
     #[allow(dead_code)]
     expiry: i64,
+}
+
+/// No request fields - `xodus-service` always answers for whichever user's credentials
+/// are on this connection.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UserInfoRequest {}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UserInfoResponse {
+    xuid: String,
+    gamertag: String,
+    #[serde(default)]
+    gamertag_modern: String,
+    age_group: String,
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -279,6 +297,28 @@ pub fn get_token_and_signature(
     let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
     let response: XstsTokenResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
     Ok((response.authorization, response.signature))
+}
+
+/// `XUserAddAsync`'s silent path, plus `XUserGetGamertag`/`XUserGetAgeGroup`'s backing data -
+/// GDK caches these on the `XUserHandle` at sign-in rather than re-fetching per call, so
+/// callers should do the same. Returns `(xuid, gamertag, gamertag_modern, age_group)`; `age_group`
+/// is Xbox Live's raw claim (`"Adult"`/`"Teen"`/`"Child"`), not yet mapped to `XUserAgeGroup`.
+pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
+    let body = quick_xml::se::to_string(&UserInfoRequest {}).map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) = request(MSG_TYPE_USER_INFO_REQUEST, body.as_bytes())?;
+    if reply_type != MSG_TYPE_USER_INFO_RESPONSE {
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: UserInfoResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    Ok((
+        response.xuid,
+        response.gamertag,
+        response.gamertag_modern,
+        response.age_group,
+    ))
 }
 
 #[cfg(test)]
@@ -491,5 +531,66 @@ mod tests {
         let (authorization, signature) = result.expect("round trip succeeds");
         assert_eq!(authorization, "XBL3.0 x=fake-uhs;fake-xsts-token");
         assert_eq!(signature, "fake-signature");
+    }
+
+    #[test]
+    fn user_info_request_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x99u8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            let msg_type = u16::from_le_bytes([header[0], header[1]]);
+            assert_eq!(msg_type, MSG_TYPE_USER_INFO_REQUEST);
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let body = read_exact_blocking(&mut socket, size);
+            let _request: UserInfoRequest =
+                quick_xml::de::from_str(std::str::from_utf8(&body).unwrap()).expect("parses");
+
+            let response = UserInfoResponse {
+                xuid: "2533274999999999".to_string(),
+                gamertag: "FakeGamer".to_string(),
+                gamertag_modern: "FakeGamer".to_string(),
+                age_group: "Adult".to_string(),
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_USER_INFO_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = get_user_info();
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        let (xuid, gamertag, gamertag_modern, age_group) = result.expect("round trip succeeds");
+        assert_eq!(xuid, "2533274999999999");
+        assert_eq!(gamertag, "FakeGamer");
+        assert_eq!(gamertag_modern, "FakeGamer");
+        assert_eq!(age_group, "Adult");
     }
 }

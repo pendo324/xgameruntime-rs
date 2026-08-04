@@ -4,24 +4,28 @@
 //!
 //! This lands the handle table and every slot that can be answered honestly with no
 //! external state: duplicate/close/compare, local-id and global-id lookup, guest/state
-//! queries, the RemoteConnect plumbing `lib.rs` already wires up. `XUserGetMsaTokenSilentlyAsync`
-//! and `XUserGetTokenAndSignatureAsync` are wired to real `xodus-service` IPC calls
-//! (`crate::ipc`). Everything else that needs a real signed-in identity -
-//! `XUserAddAsync`, `XUserGetGamertag` - still returns `E_NOTIMPL` until the corresponding
-//! server-side handler exists. Faking a signed-in user here would be actively wrong, unlike
-//! the XStore license placeholder: a game that thinks nobody is signed in behaves correctly,
-//! a game that thinks the wrong person is signed in does not.
+//! queries, the RemoteConnect plumbing `lib.rs` already wires up. `XUserGetMsaTokenSilentlyAsync`,
+//! `XUserGetTokenAndSignature(Utf16)Async`, and `XUserAddAsync` are wired to real
+//! `xodus-service` IPC calls (`crate::ipc`); `XUserAddAsync` caches the gamertag/age-group
+//! claims it gets back on the resulting `UserState` so the synchronous
+//! `XUserGetGamertag`/`XUserGetAgeGroup` getters (real GDK never gives them a network round
+//! trip) can answer from it, and `XUserSignOutAsync` transitions that same `UserState` and
+//! fires the matching change events. Everything else that needs a real signed-in identity -
+//! `XUserAddByIdWithUiAsync`, `XUserResolveIssueWithUi(Utf16)Async` - still returns
+//! `E_NOTIMPL` until there's a webview/UI flow to drive it. Faking a signed-in user here
+//! would be actively wrong, unlike the XStore license placeholder: a game that thinks nobody
+//! is signed in behaves correctly, a game that thinks the wrong person is signed in does not.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
+use windows_core::{GUID, HRESULT, IUnknown, Interface, implement, interface};
 
-use crate::E_NOTIMPL;
 use crate::results::*;
 use crate::xasync::{self, XAsyncBlock};
+use crate::{E_FAIL, E_NOTIMPL};
 
 /// Also `IXUserImpl`'s own IID - Wine's idl reuses it as the coclass id.
 pub const CLSID_XUSER: GUID = GUID::from_u128(0x01acd177_91f9_4763_a38e_ccbb55ce32e0);
@@ -142,21 +146,38 @@ struct UserState {
     user_id: u64,
     is_guest: bool,
     state: Mutex<XUserStateValue>,
+    /// Cached at sign-in (`XUserAddAsync`), same as real GDK - `XUserGetGamertag`/
+    /// `XUserGetAgeGroup` are synchronous, so they can't do a network round trip per call.
+    gamertag: String,
+    /// Empty when Xbox Live's `mgt` claim wasn't present for this account; `XUserGetGamertag`
+    /// falls back to `gamertag` in that case.
+    gamertag_modern: String,
+    /// `XUserAgeGroup` (`Unknown`=0, `Child`=1, `Teen`=2, `Adult`=3), mapped from Xbox Live's
+    /// `agg` claim once at sign-in.
+    age_group: u32,
 }
 
 /// Users known well enough to answer `XUserFindUserByLocalId`/`XUserFindUserById`.
-/// Populated when a sign-in actually produces a user - currently never, since
-/// `XUserAddAsync` is not wired to `xodus-service` yet. `Weak` so a fully-closed user
+/// Populated by `XUserAddAsync` once it produces a real user. `Weak` so a fully-closed user
 /// (every handle dropped) falls out of the registry on its own rather than needing an
 /// explicit sign-out path to clean it up.
 static USER_REGISTRY: Mutex<Vec<Weak<UserState>>> = Mutex::new(Vec::new());
 
-/// Not yet called - wire this up alongside `XUserAddAsync` once it produces real users.
-#[allow(dead_code)]
 fn register_user(user: &Arc<UserState>) {
     let mut registry = USER_REGISTRY.lock().expect("user registry poisoned");
     registry.retain(|entry| entry.strong_count() > 0);
     registry.push(Arc::downgrade(user));
+}
+
+/// Xbox Live's `agg` claim (`"Adult"`/`"Teen"`/`"Child"`) mapped to `XUserAgeGroup`
+/// (`wine/include/xuser.h`); anything else (including a missing claim) is `Unknown`=0.
+fn parse_age_group(agg: &str) -> u32 {
+    match agg {
+        "Adult" => 3,
+        "Teen" => 2,
+        "Child" => 1,
+        _ => 0,
+    }
 }
 
 /// A handle table keyed by leaked `Box<Arc<UserState>>` pointers - the same scheme as
@@ -204,15 +225,31 @@ struct ChangeEventRegistration {
 unsafe impl Send for ChangeEventRegistration {}
 unsafe impl Sync for ChangeEventRegistration {}
 
-/// Accepted registrations for `XUserChangeEvent` notifications.
-///
-/// Nothing fires these yet: sign-in state changes only once `XUserAddAsync` talks to
-/// `xodus-service`. Registering and unregistering still behave correctly in the
-/// meantime - a game that registers, runs, and unregisters without ever seeing a callback
-/// is observing "no changes happened", which today is true.
+/// Accepted registrations for `XUserChangeEvent` notifications. `XUserAddAsync` fires
+/// `SignedInAgain` (below) on a successful sign-in; nothing else produces a change yet
+/// (there is no sign-out or gamertag-change path).
 static CHANGE_EVENT_REGISTRY: Mutex<Option<HashMap<u64, ChangeEventRegistration>>> =
     Mutex::new(None);
 static NEXT_CHANGE_EVENT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// `XUserChangeEvent` variants (`wine/include/xuser.h`) this crate actually fires.
+/// `SignedInAgain` is the only one WineGDK's own `XUserAddAsync` fires, for both a first
+/// sign-in and a repeat one. `SigningOut`/`SignedOut` are fired back to back by
+/// `XUserSignOutAsync` - there is no real deferral window to hold between them.
+const CHANGE_EVENT_SIGNED_IN_AGAIN: u32 = 0;
+const CHANGE_EVENT_SIGNING_OUT: u32 = 1;
+const CHANGE_EVENT_SIGNED_OUT: u32 = 2;
+
+fn fire_change_event(local_id: XUserLocalId, event: u32) {
+    let registry = CHANGE_EVENT_REGISTRY
+        .lock()
+        .expect("change registry poisoned");
+    if let Some(registry) = registry.as_ref() {
+        for registration in registry.values() {
+            unsafe { (registration.callback)(registration.context, local_id, event) };
+        }
+    }
+}
 
 fn register_change_event(context: *mut c_void, callback: XUserChangeEventCallback) -> u64 {
     let token = NEXT_CHANGE_EVENT_TOKEN.fetch_add(1, Ordering::Relaxed);
@@ -233,6 +270,18 @@ fn unregister_change_event(token: u64) -> bool {
         .get_or_insert_with(HashMap::new)
         .remove(&token)
         .is_some()
+}
+
+/// Reads a null-terminated UTF-16 string from a raw pointer. `ptr` must be non-null and
+/// point at a valid null-terminated `u16` sequence - callers check `is_null()` first.
+unsafe fn read_utf16_cstr(ptr: *const u16) -> String {
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -481,6 +530,14 @@ static TOKEN_AND_SIGNATURE_RESULTS: Mutex<
     Option<HashMap<usize, Result<(String, String), HRESULT>>>,
 > = Mutex::new(None);
 
+/// Same as `TOKEN_AND_SIGNATURE_RESULTS`, kept separate for `XUserGetTokenAndSignatureUtf16*`
+/// even though the stored `String`s are UTF-8 either way - `ResultSize`/`Result` for this
+/// pair report sizes in UTF-16 code units, not bytes, so mixing the two tables would make
+/// the key space (`XAsyncBlock` pointer) ambiguous about which encoding a lookup wants.
+static TOKEN_AND_SIGNATURE_UTF16_RESULTS: Mutex<
+    Option<HashMap<usize, Result<(String, String), HRESULT>>>,
+> = Mutex::new(None);
+
 impl IXUserImpl_Impl for XUserObject_Impl {
     unsafe fn XUserDuplicateHandle(&self, handle: u64, duplicated_handle: *mut u64) -> HRESULT {
         if duplicated_handle.is_null() {
@@ -517,13 +574,50 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         S_OK
     }
 
-    unsafe fn XUserAddAsync(&self, _options: u32, async_: *mut XAsyncBlock) -> HRESULT {
-        // TODO(Phase 1 remainder / Phase 3): silent sign-in from xodus-service's stored
-        // credentials via xgameruntime-rs/src/ipc.rs, then UI-driven sign-in if the
-        // options allow it and nothing is stored. Neither exists yet.
+    unsafe fn XUserAddAsync(&self, options: u32, async_: *mut XAsyncBlock) -> HRESULT {
+        // XUserAddOptions: None=0, AddDefaultUserSilently=1, AllowGuests=2,
+        // AddDefaultUserAllowingUI=4 (wine/include/xuser.h). WineGDK's own XUserAddAsync
+        // handles Silently and AllowingUI identically (both just load stored credentials);
+        // we do the same, since there is no webview/UI architecture in xodus-service to
+        // drive an AllowingUI-only interactive sign-in yet - it degrades to the same
+        // "fail if nothing is stored" behavior as Silently, rather than fabricating a UI
+        // flow that doesn't exist.
+        if options & 0b101 == 0 {
+            return E_ABORT;
+        }
+
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<u64, HRESULT> {
-                Err(E_NOTIMPL)
+                let (xuid, gamertag, gamertag_modern, age_group) = crate::ipc::get_user_info()?;
+                let user_id: u64 = xuid.parse().map_err(|_| E_FAIL)?;
+
+                let existing = {
+                    let registry = USER_REGISTRY.lock().expect("user registry poisoned");
+                    registry
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .find(|user| user.user_id == user_id)
+                };
+
+                let user = match existing {
+                    Some(user) => user,
+                    None => {
+                        let user = Arc::new(UserState {
+                            local_id: XUserLocalId { value: user_id },
+                            user_id,
+                            is_guest: false,
+                            state: Mutex::new(XUserStateValue::SignedIn),
+                            gamertag,
+                            gamertag_modern,
+                            age_group: parse_age_group(&age_group),
+                        });
+                        register_user(&user);
+                        fire_change_event(user.local_id, CHANGE_EVENT_SIGNED_IN_AGAIN);
+                        user
+                    }
+                };
+
+                Ok(UserHandleTable::create(user))
             })
         }
     }
@@ -629,14 +723,21 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         unsafe fn XUserGetGamerPictureAsync(&self, user: u64, picture_size: u32, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserGetGamerPictureResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
         unsafe fn XUserGetGamerPictureResult(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, buffer_used: *mut usize) -> HRESULT;
-        unsafe fn XUserGetAgeGroup(&self, user: u64, age_group: *mut u32) -> HRESULT;
-        unsafe fn XUserGetTokenAndSignatureUtf16Async(&self, user: u64, options: u32, method: *const u16, url: *const u16, header_count: usize, headers: *const XUserGetTokenAndSignatureUtf16HttpHeader, body_size: usize, body_buffer: *const c_void, async_: *mut XAsyncBlock) -> HRESULT;
-        unsafe fn XUserGetTokenAndSignatureUtf16ResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
-        unsafe fn XUserGetTokenAndSignatureUtf16Result(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureUtf16Data, buffer_used: *mut usize) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiAsync(&self, user: u64, url: *const c_char, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiUtf16Async(&self, user: u64, url: *const u16, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiUtf16Result(&self, async_: *mut XAsyncBlock) -> HRESULT;
+    }
+
+    unsafe fn XUserGetAgeGroup(&self, user: u64, age_group: *mut u32) -> HRESULT {
+        if age_group.is_null() {
+            return E_POINTER;
+        }
+        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+            return E_INVALIDARG;
+        };
+        unsafe { *age_group = user.age_group };
+        S_OK
     }
 
     unsafe fn XUserGetTokenAndSignatureAsync(
@@ -772,6 +873,140 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         }
     }
 
+    unsafe fn XUserGetTokenAndSignatureUtf16Async(
+        &self,
+        user: u64,
+        _options: u32,
+        method: *const u16,
+        url: *const u16,
+        _header_count: usize,
+        _headers: *const XUserGetTokenAndSignatureUtf16HttpHeader,
+        body_size: usize,
+        body_buffer: *const c_void,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT {
+        if (unsafe { UserHandleTable::get(user) }).is_none() {
+            return E_INVALIDARG;
+        }
+        if method.is_null() || url.is_null() {
+            return E_POINTER;
+        }
+        let method = unsafe { read_utf16_cstr(method) };
+        let url = unsafe { read_utf16_cstr(url) };
+        let body = if body_size == 0 || body_buffer.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(body_buffer.cast::<u8>(), body_size) }.to_vec()
+        };
+
+        let key = async_ as usize;
+        unsafe {
+            xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
+                let result = crate::ipc::get_token_and_signature(&method, &url, &body);
+                let outcome = match &result {
+                    Ok(_) => Ok(()),
+                    Err(hr) => Err(*hr),
+                };
+                TOKEN_AND_SIGNATURE_UTF16_RESULTS
+                    .lock()
+                    .expect("token and signature utf16 results poisoned")
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key, result);
+                outcome
+            })
+        }
+    }
+
+    unsafe fn XUserGetTokenAndSignatureUtf16ResultSize(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: *mut usize,
+    ) -> HRESULT {
+        if buffer_size.is_null() {
+            return E_POINTER;
+        }
+        let key = async_ as usize;
+        let results = TOKEN_AND_SIGNATURE_UTF16_RESULTS
+            .lock()
+            .expect("token and signature utf16 results poisoned");
+        match results.as_ref().and_then(|results| results.get(&key)) {
+            Some(Ok((token, signature))) => {
+                let token_count = token.encode_utf16().count() + 1;
+                let signature_count = signature.encode_utf16().count() + 1;
+                unsafe {
+                    *buffer_size = size_of::<XUserGetTokenAndSignatureUtf16Data>()
+                        + (token_count + signature_count) * size_of::<u16>();
+                };
+                S_OK
+            }
+            Some(Err(hr)) => *hr,
+            None => E_ILLEGAL_METHOD_CALL,
+        }
+    }
+
+    unsafe fn XUserGetTokenAndSignatureUtf16Result(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: usize,
+        buffer: *mut c_void,
+        ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureUtf16Data,
+        buffer_used: *mut usize,
+    ) -> HRESULT {
+        let key = async_ as usize;
+        let results = TOKEN_AND_SIGNATURE_UTF16_RESULTS
+            .lock()
+            .expect("token and signature utf16 results poisoned");
+        match results.as_ref().and_then(|results| results.get(&key)) {
+            Some(Ok((token, signature))) => {
+                let header_size = size_of::<XUserGetTokenAndSignatureUtf16Data>();
+                let token_units: Vec<u16> =
+                    token.encode_utf16().chain(std::iter::once(0)).collect();
+                let signature_units: Vec<u16> =
+                    signature.encode_utf16().chain(std::iter::once(0)).collect();
+                let token_bytes = token_units.len() * size_of::<u16>();
+                let signature_bytes = signature_units.len() * size_of::<u16>();
+                let needed = header_size + token_bytes + signature_bytes;
+                if needed > buffer_size {
+                    return E_NOT_SUFFICIENT_BUFFER;
+                }
+                if buffer.is_null() || ptr_to_buffer.is_null() {
+                    return E_POINTER;
+                }
+
+                unsafe {
+                    let base = buffer.cast::<u8>();
+                    let token_ptr = base.add(header_size).cast::<u16>();
+                    let signature_ptr = base.add(header_size + token_bytes).cast::<u16>();
+
+                    std::ptr::copy_nonoverlapping(
+                        token_units.as_ptr(),
+                        token_ptr,
+                        token_units.len(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        signature_units.as_ptr(),
+                        signature_ptr,
+                        signature_units.len(),
+                    );
+
+                    let data = buffer.cast::<XUserGetTokenAndSignatureUtf16Data>();
+                    (*data).token_count = token_units.len();
+                    (*data).signature_count = signature_units.len();
+                    (*data).token = token_ptr;
+                    (*data).signature = signature_ptr;
+                    *ptr_to_buffer = data;
+
+                    if !buffer_used.is_null() {
+                        *buffer_used = needed;
+                    }
+                }
+                S_OK
+            }
+            Some(Err(hr)) => *hr,
+            None => E_ILLEGAL_METHOD_CALL,
+        }
+    }
+
     unsafe fn XUserCheckPrivilege(
         &self,
         user: u64,
@@ -847,9 +1082,11 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if deferral.is_null() {
             return E_POINTER;
         }
-        // No sign-out is ever in flight yet (XUserSignOutAsync is a no-op below), so a
-        // deferral has nothing to defer. A distinct nonzero handle, not zero, so a caller
-        // that checks the handle for validity before closing it isn't misled.
+        // XUserSignOutAsync (below) runs the whole SigningOut -> SignedOut transition
+        // synchronously inside run_sync, so there is no real window to defer - a listener
+        // asking for a deferral just gets a handle it can close once it's done, same as if
+        // it had actually held one up. A distinct nonzero handle, not zero, so a caller that
+        // checks the handle for validity before closing it isn't misled.
         unsafe { *deferral = 1 };
         S_OK
     }
@@ -1027,12 +1264,18 @@ impl IXUserImpl6_Impl for XUserObject_Impl {
     }
 
     unsafe fn XUserSignOutAsync(&self, user: u64, async_: *mut XAsyncBlock) -> HRESULT {
-        // Nothing is really signed in yet (see XUserAddAsync), so there is nothing to
-        // tear down - but a stale/invalid handle is still a real error, not a no-op.
-        if (unsafe { UserHandleTable::get(user) }).is_none() {
+        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
             return E_INVALIDARG;
+        };
+        unsafe {
+            xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
+                *user.state.lock().expect("user state poisoned") = XUserStateValue::SigningOut;
+                fire_change_event(user.local_id, CHANGE_EVENT_SIGNING_OUT);
+                *user.state.lock().expect("user state poisoned") = XUserStateValue::SignedOut;
+                fire_change_event(user.local_id, CHANGE_EVENT_SIGNED_OUT);
+                Ok(())
+            })
         }
-        unsafe { xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> { Ok(()) }) }
     }
 
     unsafe fn XUserSignOutResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
@@ -1043,9 +1286,45 @@ impl IXUserImpl6_Impl for XUserObject_Impl {
     }
 }
 
+/// `XUserGamertagComponent_Modern`/`_ModernSuffix`/`_UniqueModern` (`wine/include/xuser.h`).
+/// WineGDK's own `x_user_gt_XUserGetGamertag` ignores `component` entirely and always
+/// returns the one cached classic gamertag; unlike Wine, we do have a `gamertag_modern`
+/// claim available, so honor the modern-vs-classic distinction where we can.
+const GAMERTAG_COMPONENT_MODERN: u32 = 1;
+
 impl IXUserGamertagImpl_Impl for XUserObject_Impl {
-    hresult_stub! {
-        unsafe fn XUserGetGamertag(&self, user: u64, component: u32, gamertag_size: usize, gamertag: *mut c_char, gamertag_used: *mut usize) -> HRESULT;
+    unsafe fn XUserGetGamertag(
+        &self,
+        user: u64,
+        component: u32,
+        gamertag_size: usize,
+        gamertag: *mut c_char,
+        gamertag_used: *mut usize,
+    ) -> HRESULT {
+        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+            return E_INVALIDARG;
+        };
+        let value = if component == GAMERTAG_COMPONENT_MODERN && !user.gamertag_modern.is_empty() {
+            &user.gamertag_modern
+        } else {
+            &user.gamertag
+        };
+        let bytes = value.as_bytes();
+        let needed = bytes.len() + 1;
+        if !gamertag_used.is_null() {
+            unsafe { *gamertag_used = needed };
+        }
+        if gamertag.is_null() || gamertag_size == 0 {
+            return S_OK;
+        }
+        if gamertag_size < needed {
+            return E_NOT_SUFFICIENT_BUFFER;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), gamertag.cast::<u8>(), bytes.len());
+            *gamertag.cast::<u8>().add(bytes.len()) = 0;
+        }
+        S_OK
     }
 }
 
@@ -1209,6 +1488,9 @@ mod tests {
             user_id,
             is_guest: false,
             state: Mutex::new(XUserStateValue::SignedIn),
+            gamertag: "TestGamer".to_string(),
+            gamertag_modern: String::new(),
+            age_group: 3,
         })
     }
 
@@ -1273,6 +1555,9 @@ mod tests {
             user_id: 700,
             is_guest: true,
             state: Mutex::new(XUserStateValue::SigningOut),
+            gamertag: "TestGamer".to_string(),
+            gamertag_modern: String::new(),
+            age_group: 3,
         });
         let handle = UserHandleTable::create(user);
 
@@ -1325,6 +1610,170 @@ mod tests {
             unsafe { xuser_singleton().XUserGetId(0, &mut id) },
             E_INVALIDARG
         );
+    }
+
+    #[test]
+    fn get_gamertag_and_age_group_reflect_the_backing_user() {
+        let user = make_user(9, 900);
+        let handle = UserHandleTable::create(user);
+
+        let mut age_group = 0u32;
+        let hr = unsafe { xuser_singleton().XUserGetAgeGroup(handle, &mut age_group) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(age_group, 3);
+
+        let gamertag_iface = xuser_singleton().cast::<IXUserGamertagImpl>().unwrap();
+
+        let mut buf = [0i8; 32];
+        let mut used = 0usize;
+        let hr = unsafe {
+            gamertag_iface.XUserGetGamertag(handle, 0, buf.len(), buf.as_mut_ptr(), &mut used)
+        };
+        assert_eq!(hr, S_OK);
+        assert_eq!(used, "TestGamer".len() + 1);
+        let gamertag = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+        assert_eq!(gamertag, "TestGamer");
+
+        // A too-small buffer reports the needed size and errors rather than truncating.
+        let mut tiny = [0i8; 2];
+        let hr = unsafe {
+            gamertag_iface.XUserGetGamertag(
+                handle,
+                0,
+                tiny.len(),
+                tiny.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, E_NOT_SUFFICIENT_BUFFER);
+
+        unsafe { xuser_singleton().XUserCloseHandle(handle) };
+    }
+
+    #[test]
+    fn sign_out_transitions_state_and_fires_signing_out_then_signed_out() {
+        static EVENTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn cb(_context: *mut c_void, _local_id: XUserLocalId, event: u32) {
+            EVENTS.lock().expect("events poisoned").push(event);
+        }
+
+        let mut token = XTaskQueueRegistrationToken::default();
+        let hr = unsafe {
+            xuser_singleton().XUserRegisterForChangeEvent(
+                0,
+                std::ptr::null_mut(),
+                Some(cb),
+                &mut token,
+            )
+        };
+        assert_eq!(hr, S_OK);
+
+        let user = make_user(11, 1100);
+        let handle = UserHandleTable::create(user);
+
+        let mut async_block = XAsyncBlock {
+            queue: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; std::mem::size_of::<*mut c_void>() * 4],
+        };
+        let hr = unsafe { xuser_singleton().XUserSignOutAsync(handle, &mut async_block) };
+        assert_eq!(hr, S_OK);
+
+        let mut state = 0u32;
+        let hr = unsafe { xuser_singleton().XUserGetState(handle, &mut state) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(state, XUserStateValue::SignedOut as u32);
+
+        assert_eq!(
+            *EVENTS.lock().expect("events poisoned"),
+            vec![CHANGE_EVENT_SIGNING_OUT, CHANGE_EVENT_SIGNED_OUT]
+        );
+
+        assert_eq!(
+            unsafe { xuser_singleton().XUserUnregisterForChangeEvent(token, FALSE) },
+            TRUE
+        );
+        unsafe { xuser_singleton().XUserCloseHandle(handle) };
+    }
+
+    #[test]
+    fn token_and_signature_utf16_result_round_trips_via_the_side_table() {
+        let async_block = XAsyncBlock {
+            queue: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; std::mem::size_of::<*mut c_void>() * 4],
+        };
+        let key = &async_block as *const XAsyncBlock as usize;
+        TOKEN_AND_SIGNATURE_UTF16_RESULTS
+            .lock()
+            .expect("token and signature utf16 results poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(key, Ok(("tok3n".to_string(), "s1g".to_string())));
+
+        let async_ptr = &async_block as *const XAsyncBlock as *mut XAsyncBlock;
+
+        let mut needed = 0usize;
+        let hr = unsafe {
+            xuser_singleton().XUserGetTokenAndSignatureUtf16ResultSize(async_ptr, &mut needed)
+        };
+        assert_eq!(hr, S_OK);
+        assert_eq!(
+            needed,
+            size_of::<XUserGetTokenAndSignatureUtf16Data>() + (6 + 4) * size_of::<u16>()
+        );
+
+        let mut buf = vec![0u8; needed];
+        let mut data_ptr: *mut XUserGetTokenAndSignatureUtf16Data = std::ptr::null_mut();
+        let mut used = 0usize;
+        let hr = unsafe {
+            xuser_singleton().XUserGetTokenAndSignatureUtf16Result(
+                async_ptr,
+                buf.len(),
+                buf.as_mut_ptr().cast(),
+                &mut data_ptr,
+                &mut used,
+            )
+        };
+        assert_eq!(hr, S_OK);
+        assert_eq!(used, needed);
+        assert!(!data_ptr.is_null());
+
+        unsafe {
+            let data = &*data_ptr;
+            assert_eq!(data.token_count, 6);
+            assert_eq!(data.signature_count, 4);
+            let token = String::from_utf16_lossy(std::slice::from_raw_parts(
+                data.token,
+                data.token_count - 1,
+            ));
+            let signature = String::from_utf16_lossy(std::slice::from_raw_parts(
+                data.signature,
+                data.signature_count - 1,
+            ));
+            assert_eq!(token, "tok3n");
+            assert_eq!(signature, "s1g");
+        }
+
+        // A too-small buffer reports the error rather than writing a truncated struct.
+        let mut tiny = vec![0u8; needed - 1];
+        let hr = unsafe {
+            xuser_singleton().XUserGetTokenAndSignatureUtf16Result(
+                async_ptr,
+                tiny.len(),
+                tiny.as_mut_ptr().cast(),
+                &mut data_ptr,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, E_NOT_SUFFICIENT_BUFFER);
+
+        TOKEN_AND_SIGNATURE_UTF16_RESULTS
+            .lock()
+            .expect("token and signature utf16 results poisoned")
+            .get_or_insert_with(HashMap::new)
+            .remove(&key);
     }
 
     #[test]
