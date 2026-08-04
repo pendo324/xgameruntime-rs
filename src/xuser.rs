@@ -21,7 +21,7 @@ use std::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use windows_core::{GUID, HRESULT, IUnknown, Interface, implement, interface};
+use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 
 use crate::results::*;
 use crate::xasync::{self, XAsyncBlock};
@@ -327,7 +327,11 @@ unsafe fn read_utf16_cstr(ptr: *const u16) -> String {
 
 macro_rules! hresult_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> HRESULT;)*) => {
-        $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT { $(let _ = $arg;)* E_NOTIMPL })*
+        $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT {
+            $(let _ = $arg;)*
+            eprintln!("[stub {:?}] {} -> E_NOTIMPL", std::thread::current().id(), stringify!($name));
+            E_NOTIMPL
+        })*
     };
 }
 
@@ -549,6 +553,7 @@ pub unsafe trait IXUserGamertagImpl: IUnknown {
     ) -> HRESULT;
 }
 
+#[allow(clippy::too_many_arguments)]
 #[implement(
     IXUserImpl,
     IXUserImpl2,
@@ -560,28 +565,28 @@ pub unsafe trait IXUserGamertagImpl: IUnknown {
 )]
 pub struct XUserObject;
 
+/// Result tables keyed by the caller's `XAsyncBlock` pointer. The `X*ResultSize`/`X*Result`
+/// GDK contract requires answering before any buffer size is known, so the variable-length
+/// payload can't ride in `xasync::run_sync`'s fixed-size `T`.
+type PendingMap<T> = Option<HashMap<usize, Result<T, HRESULT>>>;
+
 /// Keyed by the caller's `XAsyncBlock` pointer, same rationale and lifetime tradeoff as
 /// `MSA_TOKEN_RESULTS` below - the `(authorization, signature)` pair has no size known
 /// until after the IPC round trip, so it can't ride in `xasync::run_sync`'s fixed-size `T`.
-static TOKEN_AND_SIGNATURE_RESULTS: Mutex<
-    Option<HashMap<usize, Result<(String, String), HRESULT>>>,
-> = Mutex::new(None);
+static TOKEN_AND_SIGNATURE_RESULTS: Mutex<PendingMap<(String, String)>> = Mutex::new(None);
 
 /// Same as `TOKEN_AND_SIGNATURE_RESULTS`, kept separate for `XUserGetTokenAndSignatureUtf16*`
 /// even though the stored `String`s are UTF-8 either way - `ResultSize`/`Result` for this
 /// pair report sizes in UTF-16 code units, not bytes, so mixing the two tables would make
 /// the key space (`XAsyncBlock` pointer) ambiguous about which encoding a lookup wants.
-static TOKEN_AND_SIGNATURE_UTF16_RESULTS: Mutex<
-    Option<HashMap<usize, Result<(String, String), HRESULT>>>,
-> = Mutex::new(None);
+static TOKEN_AND_SIGNATURE_UTF16_RESULTS: Mutex<PendingMap<(String, String)>> = Mutex::new(None);
 
 /// Keyed by the caller's `XAsyncBlock` pointer, same rationale as `TOKEN_AND_SIGNATURE_RESULTS`
 /// - the picture is a variable-length raw byte buffer with no size known until after the IPC
-/// round trip. An account with no gamer picture set stores `Ok(vec![])` here, not an `Err` -
-/// `ipc::get_gamer_picture`'s `Ok(None)` is an honest absence, and an empty buffer is the
-/// equivalent honest answer at this layer.
-static GAMER_PICTURE_RESULTS: Mutex<Option<HashMap<usize, Result<Vec<u8>, HRESULT>>>> =
-    Mutex::new(None);
+///   round trip. An account with no gamer picture set stores `Ok(vec![])` here, not an `Err` -
+///   `ipc::get_gamer_picture`'s `Ok(None)` is an honest absence, and an empty buffer is the
+///   equivalent honest answer at this layer.
+static GAMER_PICTURE_RESULTS: Mutex<PendingMap<Vec<u8>>> = Mutex::new(None);
 
 impl IXUserImpl_Impl for XUserObject_Impl {
     unsafe fn XUserDuplicateHandle(&self, handle: u64, duplicated_handle: *mut u64) -> HRESULT {
@@ -622,38 +627,65 @@ impl IXUserImpl_Impl for XUserObject_Impl {
     unsafe fn XUserAddAsync(&self, options: u32, async_: *mut XAsyncBlock) -> HRESULT {
         // XUserAddOptions: None=0, AddDefaultUserSilently=1, AllowGuests=2,
         // AddDefaultUserAllowingUI=4 (wine/include/xuser.h).
+        eprintln!(
+            "[diag] XUserAddAsync called options={options:#x} async_block={:p} callback_set={} queue={:?}",
+            async_,
+            (unsafe { async_.as_ref() }).is_some_and(|b| b.callback.is_some()),
+            (unsafe { async_.as_ref() }).map(|b| b.queue)
+        );
         if options & 0b101 == 0 {
+            eprintln!("[diag] XUserAddAsync rejecting options={options:#x} -> E_ABORT");
             return E_ABORT;
         }
         let allow_ui = options & 0x04 != 0;
 
-        unsafe {
+        let hr = unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<u64, HRESULT> {
                 match crate::ipc::get_user_info() {
-                    Ok(info) => user_handle_from_info(info),
+                    Ok(info) => {
+                        let r = user_handle_from_info(info);
+                        eprintln!("[diag] XUserAddAsync silent path result: {r:?}");
+                        r
+                    }
                     // A game that only asked for Silently should behave as if nobody is
                     // signed in, not pop a window it didn't ask for.
-                    Err(err) if !allow_ui => Err(err),
-                    Err(_) => match crate::ipc::interactive_sign_in()? {
-                        Some(info) => user_handle_from_info(info),
-                        // The human closed the sign-in window without completing it - an
-                        // honest "declined", matching real GDK's behavior when the user
-                        // backs out of the account picker.
-                        None => Err(E_ABORT),
-                    },
+                    Err(err) if !allow_ui => {
+                        eprintln!(
+                            "[diag] XUserAddAsync get_user_info failed and allow_ui=false: {err:?}"
+                        );
+                        Err(err)
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[diag] XUserAddAsync get_user_info failed ({err:?}), falling back to interactive_sign_in"
+                        );
+                        match crate::ipc::interactive_sign_in()? {
+                            Some(info) => user_handle_from_info(info),
+                            // The human closed the sign-in window without completing it - an
+                            // honest "declined", matching real GDK's behavior when the user
+                            // backs out of the account picker.
+                            None => Err(E_ABORT),
+                        }
+                    }
                 }
             })
-        }
+        };
+        eprintln!("[diag] XUserAddAsync run_sync (XAsyncBegin) returned {hr:?}");
+        hr
     }
 
     unsafe fn XUserAddResult(&self, async_: *mut XAsyncBlock, new_user: *mut u64) -> HRESULT {
+        eprintln!("[diag] XUserAddResult called async_block={:p}", async_);
         if new_user.is_null() {
+            eprintln!("[diag] XUserAddResult: new_user is null -> E_POINTER");
             return E_POINTER;
         }
-        match unsafe { xasync::get_result(async_, std::ptr::null(), new_user) } {
+        let hr = match unsafe { xasync::get_result(async_, std::ptr::null(), new_user) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
-        }
+        };
+        eprintln!("[diag] XUserAddResult returning {hr:?}");
+        hr
     }
 
     unsafe fn XUserGetLocalId(&self, user: u64, user_local_id: *mut XUserLocalId) -> HRESULT {
@@ -838,11 +870,63 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         }
     }
 
-    hresult_stub! {
-        unsafe fn XUserResolveIssueWithUiAsync(&self, user: u64, url: *const c_char, async_: *mut XAsyncBlock) -> HRESULT;
-        unsafe fn XUserResolveIssueWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT;
-        unsafe fn XUserResolveIssueWithUiUtf16Async(&self, user: u64, url: *const u16, async_: *mut XAsyncBlock) -> HRESULT;
-        unsafe fn XUserResolveIssueWithUiUtf16Result(&self, async_: *mut XAsyncBlock) -> HRESULT;
+    unsafe fn XUserResolveIssueWithUiAsync(
+        &self,
+        user: u64,
+        url: *const c_char,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT {
+        let _ = (user, async_);
+        let url = if url.is_null() {
+            "<null>".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(url) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        eprintln!(
+            "[stub {:?}] XUserResolveIssueWithUiAsync(url={url:?}) -> E_NOTIMPL",
+            std::thread::current().id()
+        );
+        E_NOTIMPL
+    }
+
+    unsafe fn XUserResolveIssueWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
+        let _ = async_;
+        eprintln!(
+            "[stub {:?}] XUserResolveIssueWithUiResult -> E_NOTIMPL",
+            std::thread::current().id()
+        );
+        E_NOTIMPL
+    }
+
+    unsafe fn XUserResolveIssueWithUiUtf16Async(
+        &self,
+        user: u64,
+        url: *const u16,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT {
+        let _ = (user, async_);
+        let url = if url.is_null() {
+            "<null>".to_string()
+        } else {
+            let len = (0..).take_while(|&i| unsafe { *url.add(i) } != 0).count();
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(url, len) })
+        };
+        eprintln!(
+            "[stub {:?}] XUserResolveIssueWithUiUtf16Async(url={url:?}) -> E_NOTIMPL",
+            std::thread::current().id()
+        );
+        E_NOTIMPL
+    }
+
+    unsafe fn XUserResolveIssueWithUiUtf16Result(&self, async_: *mut XAsyncBlock) -> HRESULT {
+        let _ = async_;
+        eprintln!(
+            "[stub {:?}] XUserResolveIssueWithUiUtf16Result -> E_NOTIMPL",
+            std::thread::current().id()
+        );
+        E_NOTIMPL
     }
 
     unsafe fn XUserGetAgeGroup(&self, user: u64, age_group: *mut u32) -> HRESULT {
@@ -886,10 +970,19 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             unsafe { std::slice::from_raw_parts(body_buffer.cast::<u8>(), body_size) }.to_vec()
         };
 
+        eprintln!(
+            "[diag {:?}] XUserGetTokenAndSignatureAsync(method={method:?}, url={url:?})",
+            std::thread::current().id()
+        );
         let key = async_ as usize;
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result = crate::ipc::get_token_and_signature(&method, &url, &body);
+                eprintln!(
+                    "[diag {:?}] XUserGetTokenAndSignatureAsync(url={url:?}) -> {:?}",
+                    std::thread::current().id(),
+                    result.as_ref().map(|_| ()).map_err(|hr: &HRESULT| *hr)
+                );
                 let outcome = match &result {
                     Ok(_) => Ok(()),
                     Err(hr) => Err(*hr),
@@ -1126,11 +1219,15 @@ impl IXUserImpl_Impl for XUserObject_Impl {
     unsafe fn XUserCheckPrivilege(
         &self,
         user: u64,
-        _options: u32,
-        _privilege: u32,
+        options: u32,
+        privilege: u32,
         has_privilege: *mut Boolean,
         reason: *mut u32,
     ) -> HRESULT {
+        eprintln!(
+            "[diag {:?}] XUserCheckPrivilege(user={user}, options={options:#x}, privilege={privilege:#x})",
+            std::thread::current().id()
+        );
         if has_privilege.is_null() {
             return E_POINTER;
         }
@@ -1148,16 +1245,24 @@ impl IXUserImpl_Impl for XUserObject_Impl {
 
     unsafe fn XUserResolvePrivilegeWithUiAsync(
         &self,
-        _user: u64,
-        _options: u32,
-        _privilege: u32,
+        user: u64,
+        options: u32,
+        privilege: u32,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
+        eprintln!(
+            "[diag {:?}] XUserResolvePrivilegeWithUiAsync(user={user}, options={options:#x}, privilege={privilege:#x})",
+            std::thread::current().id()
+        );
         // Every privilege is already granted, so there is nothing to resolve.
         unsafe { xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> { Ok(()) }) }
     }
 
     unsafe fn XUserResolvePrivilegeWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
+        eprintln!(
+            "[diag {:?}] XUserResolvePrivilegeWithUiResult",
+            std::thread::current().id()
+        );
         match unsafe { xasync::get_result::<()>(async_, std::ptr::null(), &mut () as *mut ()) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -1256,8 +1361,7 @@ impl IXUserImpl2_Impl for XUserObject_Impl {
 /// done with this async block" signal short of the block going out of scope. This leaks
 /// one small entry per call that never asks for its result, same tradeoff already made by
 /// `CHANGE_EVENT_REGISTRY` and the user handle table.
-static MSA_TOKEN_RESULTS: Mutex<Option<HashMap<usize, Result<(String, i64), HRESULT>>>> =
-    Mutex::new(None);
+static MSA_TOKEN_RESULTS: Mutex<PendingMap<(String, i64)>> = Mutex::new(None);
 
 impl IXUserImpl3_Impl for XUserObject_Impl {
     unsafe fn XUserGetMsaTokenSilentlyAsync(
@@ -1484,6 +1588,7 @@ impl IXUserGamertagImpl_Impl for XUserObject_Impl {
     }
 }
 
+#[allow(dead_code)] // Handlers are retained by the platform for the remote-connect prompt.
 struct RemoteConnectHandlers {
     show: Option<XUserPlatformRemoteConnectShowPromptEventHandler>,
     close: Option<XUserPlatformRemoteConnectClosePromptEventHandler>,
@@ -1674,6 +1779,7 @@ pub(crate) fn create_test_user_handle(user_id: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_core::Interface;
 
     fn make_user(local_id: u64, user_id: u64) -> Arc<UserState> {
         Arc::new(UserState {

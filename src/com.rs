@@ -3,14 +3,9 @@ use std::collections::HashMap;
 use std::env::temp_dir;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem::size_of;
-use std::pin::Pin;
 use std::ptr::null_mut;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::task::{Context, Poll, Wake, Waker};
-use windows::minwindef::LPARAM;
-use windows::windef::HWND;
-use windows::winuser::{EnumWindows, MB_OK, MessageBoxW};
-use windows_core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, implement, interface};
+use std::sync::{Mutex, OnceLock};
+use windows_core::{GUID, HRESULT, IUnknown, Interface, implement, interface};
 use windows_sys::core::BOOL;
 
 const CLSID_XSTORE: GUID = GUID::from_u128(0x0dd112ac_7c24_448c_b92b_3960fb5bd30c);
@@ -21,6 +16,7 @@ const CLSID_XPERSISTENT_LOCAL_STORAGE: GUID =
 const STORE_SKU_ID_SIZE: usize = 18;
 const TRIAL_UNIQUE_ID_MAX_SIZE: usize = 64;
 
+#[allow(dead_code)] // GDK handle type kept for the XStore API surface.
 type XStoreContextHandle = u64;
 
 use crate::xasync::{XAsyncBlock, get_result};
@@ -51,16 +47,6 @@ impl Default for XStoreGameLicense {
             trialUniqueId: [0; TRIAL_UNIQUE_ID_MAX_SIZE],
             expirationDate: 0,
         }
-    }
-}
-
-fn write_c_string<const N: usize>(dst: &mut [c_char; N], value: &[u8]) {
-    let len = value.len().min(N.saturating_sub(1));
-    for (index, byte) in value.iter().copied().take(len).enumerate() {
-        dst[index] = byte as c_char;
-    }
-    if N != 0 {
-        dst[len] = 0;
     }
 }
 
@@ -370,7 +356,7 @@ impl IXFeature_Impl for XFeature_Impl {
 }
 
 #[repr(C)]
-struct XPersistentLocalStorageSpaceInfo {
+pub struct XPersistentLocalStorageSpaceInfo {
     availableFreeBytes: u64,
     totalFreeBytes: u64,
     usedBytes: u64,
@@ -539,6 +525,585 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
             *mount_handle = handle;
         }
         S_OK
+    }
+}
+
+/// `IXSystemImpl`'s own IID, reused as the coclass id (same pattern as `CLSID_XUSER`).
+/// Confirmed as the class GDK/XSAPI queries at startup - traced in Wine logs as one of the
+/// unimplemented `query_api_impl` classes before this was added, and matches WineGDK's own
+/// `dlls/xgameruntime/GDKComponent/System/XSystem.c` reference implementation, which this
+/// mirrors byte-for-byte on the string constants (console id, "RETAIL" sandbox).
+pub const CLSID_XSYSTEM: GUID = GUID::from_u128(0xe349bd1a_fc20_4e40_b99c_4178cc6b409f);
+
+const X_SYSTEM_CONSOLE_ID_BYTES: i32 = 39;
+const X_SYSTEM_SANDBOX_ID_MAX_BYTES: i32 = 16;
+
+/// `XSystemHandle`, opaque GDK handle (`typedef void *XSystemHandle` in xsystem.idl).
+pub type XSystemHandle = *mut c_void;
+
+/// `XSystemHandleCallbackReason` / `XSystemHandleType` are `UINT32` enums; they arrive as
+/// plain integer args to the callback and this crate never inspects them.
+pub type XSystemHandleType = u32;
+pub type XSystemHandleCallbackReason = u32;
+
+/// `void __stdcall XSystemHandleCallback(XSystemHandle, XSystemHandleType,
+/// XSystemHandleCallbackReason, void *context)` - see xsystem.idl.
+pub type XSystemHandleCallback =
+    Option<unsafe extern "system" fn(XSystemHandle, XSystemHandleType, XSystemHandleCallbackReason, *mut c_void)>;
+
+// IXSystemImpl / 2 / 3 / 4 / 5. XSAPI (statically linked into titles that bundle it,
+// e.g. Minecraft Bedrock) queries `CLSID_XSYSTEM` and asks for the *newer* interface IIDs
+// (observed live: `IXSystemImpl4`, IID dadc2895-34b0-4ef5-a83e-45114d629b80), not just the
+// base `IXSystemImpl`. Wine's own reference `xsystem.c` returns the same flat vtable for all
+// of these, and windows-rs needs each IID as its own `#[interface]` (same pattern as
+// `xuser.rs`'s IXUserImpl1-6), so the whole chain is declared here. The two empty tiers
+// (`IXSystemImpl2`/`IXSystemImpl5`, no new methods in the IDL) exist purely so their IIDs QI
+// successfully.
+
+#[interface("e349bd1a-fc20-4e40-b99c-4178cc6b409f")]
+pub unsafe trait IXSystem: IUnknown {
+    unsafe fn XSystemGetConsoleId(
+        &self,
+        consoleIdSize: i32,
+        consoleId: *mut c_char,
+        consoleIdUsed: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XSystemGetXboxLiveSandboxId(
+        &self,
+        sandboxIdSize: i32,
+        sandboxId: *mut c_char,
+        sandboxIdUsed: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XSystemGetAppSpecificDeviceId(
+        &self,
+        appSpecificDeviceIdSize: i32,
+        appSpecificDeviceId: *mut c_char,
+        appSpecificDeviceIdUsed: *mut usize,
+    ) -> HRESULT;
+}
+
+#[interface("6fd71f09-7513-49f0-89bc-bfaf5df6f852")]
+pub unsafe trait IXSystem2: IXSystem {}
+
+#[interface("67ce4bfc-b1d1-4ac7-bc3a-cb9219a97a85")]
+pub unsafe trait IXSystem3: IXSystem2 {
+    unsafe fn XSystemHandleTrack(
+        &self,
+        callback: XSystemHandleCallback,
+        context: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XSystemIsHandleValid(&self, handle: XSystemHandle) -> u8;
+}
+
+#[interface("dadc2895-34b0-4ef5-a83e-45114d629b80")]
+pub unsafe trait IXSystem4: IXSystem3 {
+    unsafe fn XSystemAllowFullDownloadBandwidth(&self, enable: u8);
+}
+
+#[interface("1861cf2e-e18b-4834-a9f5-b4a4e6efb4cf")]
+pub unsafe trait IXSystem5: IXSystem4 {}
+
+/// `IXSystemImpl` - the GDK console-identity interface. Without this, `XblInitialize`
+/// (statically linked into titles that bundle XSAPI, e.g. Minecraft Bedrock) queries
+/// `CLSID_XSYSTEM` for the sandbox/console/device id it needs before constructing any Xbox
+/// Live request, gets `E_NOTIMPL`, and silently bails - the title never attempts an XSTS
+/// exchange for `http://xboxlive.com` at all, which otherwise looks identical to "networking
+/// is broken" (zero relevant traffic, no error) rather than "this CLSID was never handled".
+/// `RETAIL` sandbox and the always-zero console id mirror WineGDK's own `x_system.c`, which
+/// documents both as fixed values on real Windows too - Xodus has no sandbox concept of its
+/// own to source these from, and titles do not vary behavior on the console id's contents,
+/// only its presence.
+#[implement(IXSystem, IXSystem2, IXSystem3, IXSystem4, IXSystem5)]
+pub struct XSystem;
+
+impl IXSystem_Impl for XSystem_Impl {
+    unsafe fn XSystemGetConsoleId(
+        &self,
+        console_id_size: i32,
+        console_id: *mut c_char,
+        console_id_used: *mut usize,
+    ) -> HRESULT {
+        const ID: &CStr = c"00000000.00000000.00000000.00000000.00";
+        if console_id_used.is_null() {
+            return E_POINTER;
+        }
+        unsafe {
+            *console_id_used = ID.count_bytes() + 1;
+        }
+        if console_id.is_null() {
+            return E_POINTER;
+        }
+        if console_id_size < X_SYSTEM_CONSOLE_ID_BYTES {
+            return E_NOT_SUFFICIENT_BUFFER;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ID.as_ptr(),
+                console_id,
+                ID.count_bytes() + 1,
+            );
+        }
+        S_OK
+    }
+
+    unsafe fn XSystemGetXboxLiveSandboxId(
+        &self,
+        sandbox_id_size: i32,
+        sandbox_id: *mut c_char,
+        sandbox_id_used: *mut usize,
+    ) -> HRESULT {
+        const ID: &CStr = c"RETAIL";
+        if sandbox_id.is_null() {
+            return E_POINTER;
+        }
+        if sandbox_id_size < X_SYSTEM_SANDBOX_ID_MAX_BYTES {
+            return E_NOT_SUFFICIENT_BUFFER;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ID.as_ptr(),
+                sandbox_id,
+                ID.count_bytes() + 1,
+            );
+        }
+        if !sandbox_id_used.is_null() {
+            unsafe {
+                *sandbox_id_used = ID.count_bytes() + 1;
+            }
+        }
+        S_OK
+    }
+
+    /// A random GUID, generated once per process and cached for its lifetime - matching
+    /// `x_system.c`'s `CoCreateGuid`-once-then-reuse behavior. Titles use this to key local
+    /// analytics/telemetry batching, not identity, so per-process stability is what matters,
+    /// not cross-launch persistence.
+    unsafe fn XSystemGetAppSpecificDeviceId(
+        &self,
+        device_id_size: i32,
+        device_id: *mut c_char,
+        device_id_used: *mut usize,
+    ) -> HRESULT {
+        static DEVICE_ID: OnceLock<CString> = OnceLock::new();
+        let id = DEVICE_ID.get_or_init(|| {
+            use std::hash::{Hash, Hasher};
+            // No `uuid` crate dependency and no `CoCreateGuid` equivalent available here -
+            // hash together entropy sources unique to this process/run (pid, start time, and
+            // a stack address, which ASLR randomizes) instead. This only needs to be
+            // stable-for-the-process and look GUID-shaped, not cryptographically random.
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::process::id().hash(&mut hasher);
+            std::time::SystemTime::now().hash(&mut hasher);
+            let stack_marker = 0u8;
+            (&stack_marker as *const u8 as usize).hash(&mut hasher);
+            let high = hasher.finish();
+            std::mem::size_of::<usize>().hash(&mut hasher);
+            let low = hasher.finish();
+            let text = format!(
+                "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+                (high >> 32) as u32,
+                (high >> 16) as u16,
+                high as u16,
+                (low >> 48) as u16,
+                low & 0xFFFF_FFFF_FFFF,
+            );
+            CString::new(text).expect("hex-formatted guid string has no NUL bytes")
+        });
+        if !device_id_used.is_null() {
+            unsafe {
+                *device_id_used = id.count_bytes() + 1;
+            }
+        }
+        if device_id.is_null() || device_id_size <= 0 {
+            return S_OK;
+        }
+        let len = (id.count_bytes() + 1).min(device_id_size as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(id.as_ptr(), device_id, len);
+        }
+        S_OK
+    }
+}
+
+impl IXSystem2_Impl for XSystem_Impl {}
+
+impl IXSystem3_Impl for XSystem_Impl {
+    /// No real handle-lifecycle notifications exist to track (no suspend/resume, no
+    /// screenshot/broadcast handles under Wine) - matches `x_system.c`'s own `E_NOTIMPL` stub.
+    unsafe fn XSystemHandleTrack(
+        &self,
+        _callback: XSystemHandleCallback,
+        _context: *mut c_void,
+    ) -> HRESULT {
+        E_NOTIMPL
+    }
+
+    /// Matches `x_system.c`: always valid, since Xodus never invalidates a handle it never
+    /// tracked in the first place.
+    unsafe fn XSystemIsHandleValid(&self, _handle: XSystemHandle) -> u8 {
+        1
+    }
+}
+
+impl IXSystem4_Impl for XSystem_Impl {
+    /// No bandwidth throttling exists to toggle; acknowledging the request (rather than
+    /// `x_system.c`'s `E_NOTIMPL`) avoids failing a call titles may not check the result of.
+    unsafe fn XSystemAllowFullDownloadBandwidth(&self, _enable: u8) {}
+}
+
+impl IXSystem5_Impl for XSystem_Impl {}
+
+/// `IXGameImpl`'s own IID, reused as the coclass id (same pattern as `CLSID_XSYSTEM`) - the
+/// game/title identity interface. XSAPI (via `XblInitialize`, statically linked into GDK
+/// titles like Minecraft Bedrock) reads the title id here to scope its Xbox Live requests;
+/// features that check "is this a genuine signed-in Microsoft account" (distinct from a
+/// PlayFab-only session, which needs no title identity) appear to depend on it. Confirmed via
+/// Wine trace logs as one of the classes this title queries and previously got `E_NOTIMPL` for.
+pub const CLSID_XGAME: GUID = GUID::from_u128(0x973a344e_24bf_4d0f_8457_56c534892b29);
+
+#[interface("973a344e-24bf-4d0f-8457-56c534892b29")]
+pub unsafe trait IXGameImpl: IUnknown {
+    unsafe fn XGameGetXboxTitleId(&self, value: *mut u32) -> HRESULT;
+}
+
+#[interface("50849859-0ad8-4f81-80e4-5bc78626f852")]
+pub unsafe trait IXGameImpl2: IXGameImpl {
+    unsafe fn XLaunchNewGame(
+        &self,
+        exe_path: *const c_char,
+        args: *const c_char,
+        default_user: u64,
+    ) -> ();
+}
+
+#[interface("2549f142-6419-4a06-97b5-931aab7c2f34")]
+pub unsafe trait IXGameImpl3: IXGameImpl2 {
+    unsafe fn XLaunchRestartOnCrash(&self, args: *const c_char, reserved: u32) -> HRESULT;
+}
+
+#[implement(IXGameImpl, IXGameImpl2, IXGameImpl3)]
+pub struct XGame;
+
+/// Parses the real `<TitleId>` out of the launched title's `MicrosoftGame.Config`, walking up
+/// from the game executable the same way WineGDK's own `x_game.c` does (the file lives next to
+/// the exe, occasionally a parent directory) - not hardcoded, per PLAN.md's standing rule
+/// against baking in title identity.
+fn read_game_title_id() -> Option<u32> {
+    static TITLE_ID: OnceLock<Option<u32>> = OnceLock::new();
+    *TITLE_ID.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let mut dir = exe.parent()?.to_path_buf();
+        loop {
+            for name in ["MicrosoftGame.Config", "MicrosoftGame.config"] {
+                let candidate = dir.join(name);
+                if let Ok(contents) = std::fs::read_to_string(&candidate)
+                    && let Some(id) = parse_title_id_from_config(&contents)
+                {
+                    return Some(id);
+                }
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    })
+}
+
+fn parse_title_id_from_config(contents: &str) -> Option<u32> {
+    let start = contents.find("<TitleId")?;
+    let open_end = contents[start..].find('>')? + start + 1;
+    let close = contents[open_end..].find("</TitleId>")? + open_end;
+    let text = contents[open_end..close].trim();
+    if text.len() != 8 {
+        return None;
+    }
+    u32::from_str_radix(text, 16).ok()
+}
+
+impl IXGameImpl_Impl for XGame_Impl {
+    unsafe fn XGameGetXboxTitleId(&self, value: *mut u32) -> HRESULT {
+        if value.is_null() {
+            return E_POINTER;
+        }
+        match read_game_title_id() {
+            Some(id) => {
+                unsafe {
+                    *value = id;
+                }
+                S_OK
+            }
+            None => {
+                unsafe {
+                    *value = 0;
+                }
+                E_NOTIMPL
+            }
+        }
+    }
+}
+
+impl IXGameImpl2_Impl for XGame_Impl {
+    /// Not something Xodus can actually do under Wine (no shell to hand off to, no second
+    /// process registration) - matches WineGDK's own `FIXME ... stub!`, which is also a no-op
+    /// (the method has no return value to signal failure with).
+    unsafe fn XLaunchNewGame(
+        &self,
+        _exe_path: *const c_char,
+        _args: *const c_char,
+        _default_user: u64,
+    ) {
+    }
+}
+
+impl IXGameImpl3_Impl for XGame_Impl {
+    /// Matches WineGDK's own stub: not implemented there either.
+    unsafe fn XLaunchRestartOnCrash(&self, _args: *const c_char, _reserved: u32) -> HRESULT {
+        E_NOTIMPL
+    }
+}
+
+// The five classes below have no WineGDK reference implementation (only `XSystemAnalyticsImpl`
+// appears anywhere in WineGDK's source tree - the other four do not exist there at all), so
+// their IIDs/method layouts come from `xgameruntime-docs` instead. That source documents some
+// of these interfaces as having methods with unknown signatures (flagged inline below) - those
+// slots are still given a plausible stub so the vtable's *layout* (and therefore every method
+// after it) stays correct, even though the stub itself may not be what a real call expects. On
+// x64, an unexpected extra/ignored argument or return value is harmless as long as the argument
+// *count* and *pointer-ness* look right, so this is safe unless the title actually calls one of
+// the genuinely-unknown methods, which none of these titles are expected to.
+
+/// `IXGameInviteImpl`'s own IID, reused as the coclass id (same pattern as `CLSID_XGAME`) -
+/// confirmed via Wine trace logs as one of the classes this title queries and previously got
+/// `E_NOTIMPL` for. Xodus has no invite/multiplayer-activation transport, so registration always
+/// succeeds (there is nothing to fail) and simply never fires a callback.
+pub const CLSID_XGAME_INVITE: GUID = GUID::from_u128(0x0651aae2_4012_4077_bf84_8b9097090e2c);
+
+#[interface("0651aae2-4012-4077-bf84-8b9097090e2c")]
+pub unsafe trait IXGameInviteImpl: IUnknown {
+    unsafe fn XGameInviteRegisterForEvent(
+        &self,
+        queue: u64,
+        context: *mut c_void,
+        callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XGameInviteUnregisterForEvent(&self, token: u64, wait: BOOL) -> ();
+}
+
+#[interface("014d1cc3-bcfe-41ff-b2f0-e1ef07155828")]
+pub unsafe trait IXGameInviteImpl2: IXGameInviteImpl {
+    unsafe fn XGameInviteRegisterForPendingEvent(
+        &self,
+        queue: u64,
+        context: *mut c_void,
+        callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XGameInviteUnregisterForPendingEvent(&self, token: u64, wait: BOOL) -> ();
+    /// `xgameruntime-docs` has no documentation at all for this method (added in a GDK update
+    /// alongside the "pending event" pair above) - not even a parameter list. This signature is
+    /// a guess based on the name and the shape of every other invite-acceptance call in this
+    /// family (an invite/activation URI string in, HRESULT out); it exists purely to keep
+    /// `XGameInviteUnregisterForPendingEvent`'s vtable slot position correct, not because the
+    /// guess is trusted.
+    unsafe fn XGameInviteAcceptPendingInvite(&self, invite_uri: *const c_char) -> HRESULT;
+}
+
+#[implement(IXGameInviteImpl, IXGameInviteImpl2)]
+pub struct XGameInvite;
+
+impl IXGameInviteImpl_Impl for XGameInvite_Impl {
+    unsafe fn XGameInviteRegisterForEvent(
+        &self,
+        _queue: u64,
+        _context: *mut c_void,
+        _callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT {
+        if !token.is_null() {
+            unsafe {
+                *(token as *mut u64) = 0;
+            }
+        }
+        S_OK
+    }
+
+    unsafe fn XGameInviteUnregisterForEvent(&self, _token: u64, _wait: BOOL) {}
+}
+
+impl IXGameInviteImpl2_Impl for XGameInvite_Impl {
+    unsafe fn XGameInviteRegisterForPendingEvent(
+        &self,
+        _queue: u64,
+        _context: *mut c_void,
+        _callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT {
+        if !token.is_null() {
+            unsafe {
+                *(token as *mut u64) = 0;
+            }
+        }
+        S_OK
+    }
+
+    unsafe fn XGameInviteUnregisterForPendingEvent(&self, _token: u64, _wait: BOOL) {}
+
+    unsafe fn XGameInviteAcceptPendingInvite(&self, _invite_uri: *const c_char) -> HRESULT {
+        E_NOTIMPL
+    }
+}
+
+/// Unlike `CLSID_XGAME_INVITE`, `XGameProtocolImpl`'s coclass id (`95fd18d2...`, confirmed via
+/// Wine trace logs) is *not* the same value as `IXGameProtocolImpl`'s own IID
+/// (`026b010c...`) - `xgameruntime-docs`' `XGameProtocolImpl/README.md` documents them as
+/// distinct, so this needs its own constant rather than reusing the interface's IID.
+pub const CLSID_XGAME_PROTOCOL: GUID = GUID::from_u128(0x95fd18d2_74dd_4d7c_aa1b_0b51827665d6);
+
+#[interface("026b010c-06c3-4cdd-bbcb-43f229db1cff")]
+pub unsafe trait IXGameProtocolImpl: IUnknown {
+    unsafe fn XGameProtocolRegisterForActivation(
+        &self,
+        queue: u64,
+        context: *mut c_void,
+        callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XGameProtocolUnregisterForActivation(&self, token: u64, wait: BOOL) -> ();
+}
+
+#[implement(IXGameProtocolImpl)]
+pub struct XGameProtocol;
+
+impl IXGameProtocolImpl_Impl for XGameProtocol_Impl {
+    /// No custom-protocol activation transport exists under Wine (no shell association to
+    /// register against) - registration succeeds and simply never fires, matching
+    /// `XGameInviteRegisterForEvent`'s reasoning above.
+    unsafe fn XGameProtocolRegisterForActivation(
+        &self,
+        _queue: u64,
+        _context: *mut c_void,
+        _callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT {
+        if !token.is_null() {
+            unsafe {
+                *(token as *mut u64) = 0;
+            }
+        }
+        S_OK
+    }
+
+    unsafe fn XGameProtocolUnregisterForActivation(&self, _token: u64, _wait: BOOL) {}
+}
+
+/// `IXErrorImpl`'s own IID, reused as the coclass id (same pattern as `CLSID_XGAME`) - confirmed
+/// via Wine trace logs as one of the classes this title queries and previously got `E_NOTIMPL`
+/// for.
+pub const CLSID_XERROR: GUID = GUID::from_u128(0x8ca467f7_22e8_4096_8456_bb8aa13f79d8);
+
+#[interface("8ca467f7-22e8-4096-8456-bb8aa13f79d8")]
+pub unsafe trait IXErrorImpl: IUnknown {
+    /// `xgameruntime-docs` lists this vtable slot (the first method after `IUnknown`'s three) as
+    /// `*unknown*` - no name, no signature, nothing derivable from WineGDK either. This stub
+    /// exists only to hold the slot's position so `XErrorSetCallback`/`XErrorSetOptions` land at
+    /// the right vtable offsets; if this title ever actually calls slot 4 directly, whatever this
+    /// returns is not meaningful.
+    unsafe fn XErrorImpl_UnknownMethod0(&self) -> HRESULT;
+    unsafe fn XErrorSetCallback(&self, callback: *mut c_void, context: *mut c_void) -> ();
+    unsafe fn XErrorSetOptions(&self, options: u32) -> ();
+}
+
+#[implement(IXErrorImpl)]
+pub struct XError;
+
+impl IXErrorImpl_Impl for XError_Impl {
+    unsafe fn XErrorImpl_UnknownMethod0(&self) -> HRESULT {
+        E_NOTIMPL
+    }
+
+    /// No error-reporting sink to forward to (see `XErrorReport`'s own `E_NOTIMPL` in `lib.rs`) -
+    /// accepting the registration without ever invoking it is honest about that absence rather
+    /// than silently dropping the call as unimplemented.
+    unsafe fn XErrorSetCallback(&self, _callback: *mut c_void, _context: *mut c_void) {}
+
+    unsafe fn XErrorSetOptions(&self, _options: u32) {}
+}
+
+/// `IXSystemAnalyticsImpl`'s own IID, reused as the coclass id - confirmed via Wine trace logs
+/// as one of the classes this title queries and previously got `E_NOTIMPL` for. This is the only
+/// one of the five newly-added classes with a real reference implementation in WineGDK
+/// (`GDKComponent/System/XSystemAnalytics.c`), which sources its values from Windows'
+/// `Windows.System.Profile.AnalyticsInfo` WinRT API. Xodus has no WinRT host to query that from,
+/// so the fields are fixed desktop-shaped values instead - same "no real console/sandbox concept,
+/// so use a stable fixed value" reasoning as `CLSID_XSYSTEM`'s console/sandbox ids.
+pub const CLSID_XSYSTEM_ANALYTICS: GUID = GUID::from_u128(0xb884675d_b738_4a9c_815d_9a9a1e0c6c9b);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct XVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub build: u16,
+    pub revision: u16,
+}
+
+#[repr(C)]
+pub struct XSystemAnalyticsInfo {
+    pub os_version: XVersion,
+    pub hosting_os_version: XVersion,
+    pub family: [c_char; 64],
+    pub form: [c_char; 64],
+}
+
+#[interface("b884675d-b738-4a9c-815d-9a9a1e0c6c9b")]
+pub unsafe trait IXSystemAnalyticsImpl: IUnknown {
+    /// Mirrors WineGDK's own C ABI for this method exactly (`XSystemAnalyticsInfo *
+    /// x_system_analytics_XSystemGetAnalyticsInfo(iface, XSystemAnalyticsInfo *__ret)`): the IDL's
+    /// `[out, retval]` struct return becomes a hidden out-pointer parameter that the function also
+    /// returns, per the MSVC x64 ABI for large struct returns.
+    unsafe fn XSystemGetAnalyticsInfo(
+        &self,
+        result: *mut XSystemAnalyticsInfo,
+    ) -> *mut XSystemAnalyticsInfo;
+}
+
+#[implement(IXSystemAnalyticsImpl)]
+pub struct XSystemAnalytics;
+
+fn write_fixed_cstr(dst: &mut [c_char; 64], text: &[u8]) {
+    let len = text.len().min(63);
+    for (slot, byte) in dst.iter_mut().zip(text[..len].iter()) {
+        *slot = *byte as c_char;
+    }
+    dst[len] = 0;
+}
+
+impl IXSystemAnalyticsImpl_Impl for XSystemAnalytics_Impl {
+    unsafe fn XSystemGetAnalyticsInfo(
+        &self,
+        result: *mut XSystemAnalyticsInfo,
+    ) -> *mut XSystemAnalyticsInfo {
+        if result.is_null() {
+            return result;
+        }
+        // A plausible, fixed "generic Windows desktop" identity - not sourced from any real
+        // device, since Xodus has no WinRT AnalyticsInfo to query. Matches the family/form split
+        // WineGDK's own implementation produces for real Windows (family "Windows", form
+        // "Desktop").
+        let version = XVersion {
+            major: 10,
+            minor: 0,
+            build: 19045,
+            revision: 0,
+        };
+        unsafe {
+            (*result).os_version = version;
+            (*result).hosting_os_version = version;
+            write_fixed_cstr(&mut (*result).family, b"Windows");
+            write_fixed_cstr(&mut (*result).form, b"Desktop");
+        }
+        result
     }
 }
 
@@ -1226,28 +1791,40 @@ pub unsafe trait IXPackageImpl3: IXPackageImpl2 {}
 
 macro_rules! hresult_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> HRESULT;)*) => {
-        $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT { $(let _ = $arg;)* E_NOTIMPL })*
+        $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT {
+            $(let _ = $arg;)*
+            eprintln!("[stub {:?}] {} -> E_NOTIMPL", std::thread::current().id(), stringify!($name));
+            E_NOTIMPL
+        })*
     };
 }
 
 macro_rules! hresult_stub_panic {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> HRESULT;)*) => {
-        $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT { $(let _ = $arg;)* todo!("$name"); E_NOTIMPL })*
+        $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT { $(let _ = $arg;)* unimplemented!() })*
     };
 }
 
 macro_rules! bool_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> BOOL;)*) => {
-        $(unsafe fn $name(&self $(, $arg: $ty)*) -> BOOL { $(let _ = $arg;)* false.into() })*
+        $(unsafe fn $name(&self $(, $arg: $ty)*) -> BOOL {
+            $(let _ = $arg;)*
+            eprintln!("[stub {:?}] {} -> false", std::thread::current().id(), stringify!($name));
+            false.into()
+        })*
     };
 }
 
 macro_rules! void_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> ();)*) => {
-        $(unsafe fn $name(&self $(, $arg: $ty)*) -> () { $(let _ = $arg;)* })*
+        $(unsafe fn $name(&self $(, $arg: $ty)*) -> () {
+            $(let _ = $arg;)*
+            eprintln!("[stub {:?}] {}", std::thread::current().id(), stringify!($name));
+        })*
     };
 }
 
+#[allow(clippy::too_many_arguments)]
 #[implement(IXPackageImpl, IXPackageImpl2, IXPackageImpl3)]
 pub struct XPackageObject;
 
@@ -1348,6 +1925,7 @@ impl IXPackageImpl2_Impl for XPackageObject_Impl {
 
 impl IXPackageImpl3_Impl for XPackageObject_Impl {}
 
+#[allow(clippy::too_many_arguments)]
 #[implement(IXStore, IXStoreAlias1, IXStoreAlias2)]
 pub struct XStoreObject;
 
@@ -1425,6 +2003,10 @@ impl IXStore_Impl for XStoreObject_Impl {
     }
 
     unsafe fn XStoreCreateContext(&self, _user: u64, storeContextHandle: *mut u64) -> HRESULT {
+        eprintln!(
+            "[diag {:?}] XStoreCreateContext(user={_user}) -> handle=1",
+            std::thread::current().id()
+        );
         unsafe {
             *storeContextHandle = 1;
         };
@@ -1436,6 +2018,10 @@ impl IXStore_Impl for XStoreObject_Impl {
         storeContextHandle: u64,
         async_: *mut c_void,
     ) -> HRESULT {
+        eprintln!(
+            "[diag {:?}] XStoreQueryGameLicenseAsync(context={storeContextHandle})",
+            std::thread::current().id()
+        );
         if storeContextHandle == 0 {
             return E_POINTER;
         }
@@ -1462,7 +2048,7 @@ impl IXStore_Impl for XStoreObject_Impl {
                 }
                 S_OK
             }
-            Err(hr) => return hr,
+            Err(hr) => hr,
         }
     }
 
@@ -1567,7 +2153,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         false.into()
     }
 
-    unsafe fn XStoreCloseProductsQueryHandle(&self, productQueryHandle: u64) -> () {
+    unsafe fn XStoreCloseProductsQueryHandle(&self, productQueryHandle: u64) {
         unsafe { ProductQueryHandleTable::close(productQueryHandle) };
     }
 
@@ -1787,14 +2373,16 @@ impl IXStoreAlias3_Impl for XStoreObject_Impl {}
 pub struct XNetworkingObject;
 
 #[repr(u32)]
-enum XNetworkingConnectivityCostHint {
+#[allow(dead_code)] // Complete set of GDK connectivity hint values; not all are produced by the runtime yet.
+pub enum XNetworkingConnectivityCostHint {
     Unknown = 0,
     Unrestricted = 1,
     Fixed = 2,
     Variable = 3,
 }
 #[repr(u32)]
-enum XNetworkingConnectivityLevelHint {
+#[allow(dead_code)] // Complete set of GDK connectivity hint values; not all are produced by the runtime yet.
+pub enum XNetworkingConnectivityLevelHint {
     Unknown = 0,
     None = 1,
     LocalAccess = 2,
@@ -1861,18 +2449,18 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
 
     unsafe fn XNetworkingVerifyServerCertificate(
         &self,
-        requestHandle: *mut c_void,
-        securityInformation: *mut c_void,
+        _requestHandle: *mut c_void,
+        _securityInformation: *mut c_void,
     ) -> HRESULT {
         S_OK
     }
 
     unsafe fn XNetworkingRegisterConnectivityHintChanged(
         &self,
-        queue: *mut c_void,
+        _queue: *mut c_void,
         context: *mut c_void,
         callback: Option<OnChanged>,
-        token: *mut c_void,
+        _token: *mut c_void,
     ) -> HRESULT {
         if let Some(callback) = callback {
             // println!("XNetworkingRegisterConnectivityHintChanged");
@@ -1899,7 +2487,7 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         url: *mut c_char,
         asyncBlock: *mut c_void,
     ) -> HRESULT {
-        let url = unsafe { CStr::from_ptr(url) };
+        let _url = unsafe { CStr::from_ptr(url) };
         // println!("XNetworkingQuerySecurityInformationForUrlAsync {}", url.to_string_lossy());
         unsafe {
             xasync::run_sync(asyncBlock.cast(), move || {
@@ -1968,7 +2556,7 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
 
     unsafe fn XNetworkingQuerySecurityInformationForUrlUtf16Async(
         &self,
-        url: *mut u16,
+        _url: *mut u16,
         asyncBlock: *mut c_void,
     ) -> HRESULT {
         unsafe {
@@ -2050,6 +2638,43 @@ static XPERSISTENT_LOCAL_STORAGE_SINGLETON: OnceLock<GlobalInterface<IXPersisten
     OnceLock::new();
 static XPACKAGE_SINGLETON: OnceLock<GlobalInterface<IXPackageImpl3>> = OnceLock::new();
 static XASYNC_SINGLETON: OnceLock<GlobalInterface<crate::xasync::IXAsync>> = OnceLock::new();
+static XSYSTEM_SINGLETON: OnceLock<GlobalInterface<IXSystem>> = OnceLock::new();
+static XGAME_SINGLETON: OnceLock<GlobalInterface<IXGameImpl3>> = OnceLock::new();
+static XGAME_INVITE_SINGLETON: OnceLock<GlobalInterface<IXGameInviteImpl2>> = OnceLock::new();
+static XGAME_PROTOCOL_SINGLETON: OnceLock<GlobalInterface<IXGameProtocolImpl>> = OnceLock::new();
+static XERROR_SINGLETON: OnceLock<GlobalInterface<IXErrorImpl>> = OnceLock::new();
+static XSYSTEM_ANALYTICS_SINGLETON: OnceLock<GlobalInterface<IXSystemAnalyticsImpl>> =
+    OnceLock::new();
+
+fn xsystem_singleton() -> &'static IXSystem {
+    &XSYSTEM_SINGLETON.get_or_init(|| GlobalInterface(XSystem.into())).0
+}
+
+fn xgame_singleton() -> &'static IXGameImpl3 {
+    &XGAME_SINGLETON.get_or_init(|| GlobalInterface(XGame.into())).0
+}
+
+fn xgame_invite_singleton() -> &'static IXGameInviteImpl2 {
+    &XGAME_INVITE_SINGLETON
+        .get_or_init(|| GlobalInterface(XGameInvite.into()))
+        .0
+}
+
+fn xgame_protocol_singleton() -> &'static IXGameProtocolImpl {
+    &XGAME_PROTOCOL_SINGLETON
+        .get_or_init(|| GlobalInterface(XGameProtocol.into()))
+        .0
+}
+
+fn xerror_singleton() -> &'static IXErrorImpl {
+    &XERROR_SINGLETON.get_or_init(|| GlobalInterface(XError.into())).0
+}
+
+fn xsystem_analytics_singleton() -> &'static IXSystemAnalyticsImpl {
+    &XSYSTEM_ANALYTICS_SINGLETON
+        .get_or_init(|| GlobalInterface(XSystemAnalytics.into()))
+        .0
+}
 
 /// The async runtime is a process-wide singleton: task queues and in-flight calls have
 /// to be shared between every API that hands out an `XAsyncBlock`.
@@ -2134,13 +2759,16 @@ pub fn query_api_impl(
     if let Some(result) = crate::gdk_extra::query_stubbed(class_id, interface_id, out) {
         return result;
     }
-    let res = match class_id {
+    match class_id {
         IXFeature::IID => {
             // println!("query_api_impl: {:#32x} {:#32x}", class_id.to_u128(), unsafe { *interface_id }.to_u128());
             query(xfeature_singleton(), interface_id, out)
         }
         CLSID_XSTORE => {
-            // println!("query_api_impl: {:#32x} {:#32x}", class_id.to_u128(), unsafe { *interface_id }.to_u128());
+            eprintln!(
+                "[diag {:?}] query_api_impl: CLSID_XSTORE requested",
+                std::thread::current().id()
+            );
             query(xstore_singleton(), interface_id, out)
         }
         CLSID_XNETWORKING => {
@@ -2163,6 +2791,24 @@ pub fn query_api_impl(
         crate::xgamesave::CLSID_XGAMESAVE => {
             query(crate::xgamesave::xgamesave_singleton(), interface_id, out)
         }
+        CLSID_XSYSTEM => {
+            eprintln!(
+                "[diag {:?}] query_api_impl: CLSID_XSYSTEM requested",
+                std::thread::current().id()
+            );
+            query(xsystem_singleton(), interface_id, out)
+        }
+        CLSID_XGAME => query(xgame_singleton(), interface_id, out),
+        CLSID_XGAME_INVITE => query(xgame_invite_singleton(), interface_id, out),
+        CLSID_XGAME_PROTOCOL => query(xgame_protocol_singleton(), interface_id, out),
+        CLSID_XERROR => query(xerror_singleton(), interface_id, out),
+        CLSID_XSYSTEM_ANALYTICS => {
+            eprintln!(
+                "[diag {:?}] query_api_impl: CLSID_XSYSTEM_ANALYTICS requested",
+                std::thread::current().id()
+            );
+            query(xsystem_analytics_singleton(), interface_id, out)
+        }
         _ => {
             // Everything this crate does not implement yet. There is no Microsoft DLL to
             // fall back to - that is the point - so say so rather than crashing the game.
@@ -2175,8 +2821,7 @@ pub fn query_api_impl(
             }
             E_NOTIMPL
         }
-    };
-    res
+    }
 }
 
 #[cfg(test)]
