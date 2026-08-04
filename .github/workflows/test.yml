@@ -12,13 +12,49 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: cargo fmt --check --all
+
+  # The build developers actually use: cross-compile to windows-msvc with clang against
+  # Wine's import libraries, then run the tests under Wine. This is the only job that
+  # runs tests - the crate has no host-native build, so without Wine there is nowhere to
+  # execute them. See .cargo/config.toml.
+  linux-wine:
+    name: Check and test (Linux + Wine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the Wine toolchain
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            wine wine64-tools clang lld
+      - name: Add the target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Run check
+        run: cargo check --workspace
+      - name: Run tests
+        run: cargo test --workspace
+        env:
+          WINEDEBUG: -all
+
+  # Kept as the ground truth that the DLL also links with the real MSVC toolchain, and
+  # as the source of the published artifact.
   check:
+    name: Build (MSVC)
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - target: x86_64-windows-msvc
             os: windows-latest
+    # .cargo/config.toml points the toolchain at Wine, which does not exist here. The
+    # target itself is right on both hosts; only the tools differ, so override those.
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: link.exe
+      CC_x86_64_pc_windows_msvc: cl.exe
+      CXX_x86_64_pc_windows_msvc: cl.exe
+      AR_x86_64_pc_windows_msvc: lib.exe
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_AR: lib.exe
     steps:
       - uses: actions/checkout@v6
       - name: Run check
@@ -29,5 +65,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: xgameruntime
-          path: target/release/*.dll
+          # `[build] target` in .cargo/config.toml moves this out of target/release.
+          path: target/x86_64-pc-windows-msvc/release/*.dll
           if-no-files-found: error

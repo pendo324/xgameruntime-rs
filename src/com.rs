@@ -1389,7 +1389,7 @@ mod tests {
         assert_eq!(hr, HRESULT(0));
 
         let status_hr = unsafe { get_status(&mut async_block, true) };
-        assert_eq!(status_hr, HRESULT(0));
+        assert_eq!(status_hr, Ok(()));
 
         let mut license = XStoreGameLicense::default();
         let result_hr = unsafe {
@@ -1455,7 +1455,7 @@ mod tests {
         assert_eq!(hr, HRESULT(0));
 
         let status_hr = unsafe { get_status(&mut async_block, true) };
-        assert_eq!(status_hr, HRESULT(0));
+        assert_eq!(status_hr, Ok(()));
 
         let mut payload: Payload = Payload {
             v: 0,
@@ -1463,7 +1463,7 @@ mod tests {
             v3: GUID::zeroed(),
         };
         let hr = unsafe { get_result(&mut async_block, null(), &mut payload) };
-        assert_eq!(hr, HRESULT(0));
+        assert_eq!(hr, Ok(()));
 
         println!("res {:?}", payload);
 

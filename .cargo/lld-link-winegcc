@@ -1,0 +1,127 @@
+#!/bin/zsh
+# Stands in for `link.exe` so the `x86_64-pc-windows-msvc` target can be linked on Linux
+# with clang + Wine's import libraries. rustc invokes this with MSVC-style flags; we
+# translate the ones clang does not understand and pass the rest through.
+#
+# Adapted from https://github.com/minecraft-linux/xgameruntime-rs/pull/1. Differences:
+# the Wine library directory is discovered rather than assumed to be under /usr/local,
+# and the `.lib` symlinks it needs are generated here instead of committed, so the repo
+# does not carry one distribution's paths.
+set -euo pipefail
+
+script_dir=${0:A:h}
+repo_root=${script_dir:h}
+shim_dir="$script_dir/wine-shims"
+lib_dir="$script_dir/wine-msvc-libs"
+
+# Optional local overrides, e.g. WINE_MSVC_LIB_DIR for a self-built Wine.
+[[ -f "$repo_root/.env" ]] && source "$repo_root/.env"
+
+# Wine's 64-bit PE import libraries. Distributions disagree about the prefix
+# (/usr on Arch and Debian, /usr/local for a source build), so probe instead of guess.
+if [[ -z ${WINE_MSVC_LIB_DIR-} ]]; then
+  for candidate in /usr/lib/wine/x86_64-windows /usr/local/lib/wine/x86_64-windows \
+                   /usr/lib64/wine/x86_64-windows /opt/wine-stable/lib/wine/x86_64-windows; do
+    if [[ -f "$candidate/libkernel32.a" ]]; then
+      WINE_MSVC_LIB_DIR=$candidate
+      break
+    fi
+  done
+fi
+if [[ -z ${WINE_MSVC_LIB_DIR-} ]]; then
+  print -u2 "lld-link-winegcc: cannot find Wine's x86_64-windows import libraries."
+  print -u2 "Install Wine's development files, or set WINE_MSVC_LIB_DIR in $repo_root/.env"
+  exit 1
+fi
+
+# rustc passes `kernel32.lib`; Wine ships `libkernel32.a`. Bridge the two spellings.
+mkdir -p "$lib_dir"
+for lib in dbghelp kernel32 msvcrt ntdll userenv winecrt0 ws2_32; do
+  ln -sfn "$WINE_MSVC_LIB_DIR/lib${lib}.a" "$lib_dir/${lib}.lib"
+done
+
+# Wine's msvcrt provides neither the TLS directory nor MSVC's `type_info`, both of which
+# the Rust std and the `windows` crates reference. See the two shim sources.
+clang --target=x86_64-windows-msvc -c "$shim_dir/tls_shim.c" -o "$shim_dir/tls_shim.obj"
+clang++ --target=x86_64-windows-msvc -fno-exceptions -fno-rtti -nostdinc++ -nostdlib++ \
+  -c "$shim_dir/typeinfo_shim.cpp" -o "$shim_dir/typeinfo_shim.obj"
+
+typeset -a out_args
+typeset -A skipped_defaultlibs
+
+for arg in "$@"; do
+  case "$arg" in
+    -flavor|link)
+      ;;
+    /OUT:*)
+      out_args+=("-o" "${arg#/OUT:}")
+      ;;
+    /LIBPATH:*|/libpath:*)
+      out_args+=("-L${arg#*:}")
+      ;;
+    /defaultlib:msvcrt)
+      if [[ -z ${skipped_defaultlibs[msvcrt]-} ]]; then
+        out_args+=("-lmsvcrt")
+      fi
+      ;;
+    /NODEFAULTLIB:*|/nodefaultlib:*)
+      lib_name=${arg#*:}
+      lib_name=${lib_name:l}
+      skipped_defaultlibs[$lib_name]=1
+      if [[ "$lib_name" == "msvcrt" ]]; then
+        filtered_args=()
+        for existing in "${out_args[@]}"; do
+          if [[ "$existing" != "-lmsvcrt" ]]; then
+            filtered_args+=("$existing")
+          fi
+        done
+        out_args=("${filtered_args[@]}")
+        out_args+=("-nostartfiles" "-nostdlib")
+      fi
+      out_args+=("-Xlinker" "$arg")
+      ;;
+    /defaultlib:*.lib|/DEFAULTLIB:*.lib)
+      lib_name=${arg#*:}
+      lib_name=${lib_name:t}
+      lib_name=${lib_name%.lib}
+      out_args+=("-l${lib_name}")
+      ;;
+    /defaultlib:*)
+      lib_name=${arg#*:}
+      out_args+=("-l${lib_name}")
+      ;;
+    winecrt0.lib)
+      out_args+=("-lwinecrt0")
+      ;;
+    /DLL)
+      out_args+=("-shared")
+      ;;
+    /DEF:*|/IMPLIB:*|/ENTRY:*|/SUBSYSTEM:*|/FIXED:*|/DYNAMICBASE|/NOLOGO|/NXCOMPAT|/OPT:*|/DEBUG|/PDBALTPATH:*|/NATVIS:*|/linkrepro:*)
+      # These are real lld-link options. Keep them as linker args instead of
+      # translating them ourselves.
+      out_args+=("-Xlinker" "$arg")
+      ;;
+    [A-Za-z0-9_]*.lib)
+      lib_name=${arg%.lib}
+      out_args+=("-l${lib_name}")
+      ;;
+    *.lib|*.o|*.obj|*.rlib)
+      out_args+=("$arg")
+      ;;
+    *)
+      out_args+=("$arg")
+      ;;
+  esac
+done
+
+if [[ -z ${skipped_defaultlibs[msvcrt]-} ]]; then
+  out_args=("$shim_dir/tls_shim.obj" "$shim_dir/typeinfo_shim.obj" "${out_args[@]}")
+fi
+
+# `/NODEFAULTLIB:msvcrt` means rustc is building something that brings its own runtime
+# (a build script's probe, typically); winegcc would link Wine's crt0 back in.
+if [[ -n ${skipped_defaultlibs[msvcrt]-} ]]; then
+  exec clang --target=x86_64-windows-msvc -fuse-ld=lld-link "${out_args[@]}"
+fi
+
+exec winegcc --target=x86_64-windows-msvc "${out_args[@]}"

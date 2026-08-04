@@ -1,0 +1,34 @@
+# This crate only ever builds for Windows - it is a drop-in replacement for
+# `xgameruntime.dll` loaded by GDK games under Wine. There is no host-native build to
+# fall back on, so `cargo check` on a Linux workstation has to cross-compile, and
+# `x86_64-pc-windows-msvc` is the only target the `windows-*` crates support.
+#
+# The MSVC target normally needs `link.exe` and Microsoft's import libraries. Instead we
+# link with `lld-link-winegcc` (a wrapper next to this file) against Wine's own import
+# libraries, which are already installed wherever Wine is. See that script for the flag
+# translation and `.cargo/wine-shims/` for the two pieces of the MSVC runtime it has to
+# supply by hand.
+#
+# Adapted from https://github.com/minecraft-linux/xgameruntime-rs/pull/1, with the
+# toolchain resolved from PATH rather than pinned to /usr/local.
+
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+linker = "./.cargo/lld-link-winegcc"
+# Test binaries are PE executables, so `cargo test` has to hand them to Wine. This is
+# not just a convenience: the code under test calls Win32 directly, and Wine is the
+# environment it actually ships into.
+runner = "wine"
+rustflags = [
+    # Populated by the linker wrapper on first run; holds `<name>.lib` symlinks to
+    # Wine's `lib<name>.a`, because the MSVC target asks for the former spelling.
+    "-Lnative=./.cargo/wine-msvc-libs",
+]
+
+[env]
+CC_x86_64_pc_windows_msvc = "winegcc --target=x86_64-windows-msvc"
+CXX_x86_64_pc_windows_msvc = "wineg++ --target=x86_64-windows-msvc"
+AR_x86_64_pc_windows_msvc = "llvm-lib"
+CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_AR = "llvm-lib"
