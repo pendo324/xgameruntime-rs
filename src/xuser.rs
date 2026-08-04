@@ -180,6 +180,43 @@ fn parse_age_group(agg: &str) -> u32 {
     }
 }
 
+/// Shared by `XUserAddAsync`'s silent and interactive paths (and `XUserAddByIdWithUiAsync`):
+/// finds or creates the registered [`UserState`] for a `(xuid, gamertag, gamertag_modern,
+/// age_group)` tuple, firing the sign-in change event only for a genuinely new user, and
+/// returns a fresh handle onto it.
+fn user_handle_from_info(info: (String, String, String, String)) -> Result<u64, HRESULT> {
+    let (xuid, gamertag, gamertag_modern, age_group) = info;
+    let user_id: u64 = xuid.parse().map_err(|_| E_FAIL)?;
+
+    let existing = {
+        let registry = USER_REGISTRY.lock().expect("user registry poisoned");
+        registry
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|user| user.user_id == user_id)
+    };
+
+    let user = match existing {
+        Some(user) => user,
+        None => {
+            let user = Arc::new(UserState {
+                local_id: XUserLocalId { value: user_id },
+                user_id,
+                is_guest: false,
+                state: Mutex::new(XUserStateValue::SignedIn),
+                gamertag,
+                gamertag_modern,
+                age_group: parse_age_group(&age_group),
+            });
+            register_user(&user);
+            fire_change_event(user.local_id, CHANGE_EVENT_SIGNED_IN_AGAIN);
+            user
+        }
+    };
+
+    Ok(UserHandleTable::create(user))
+}
+
 /// A handle table keyed by leaked `Box<Arc<UserState>>` pointers - the same scheme as
 /// `task_queue::QueueHandle`. `XUserDuplicateHandle`/`XUserCloseHandle` are the game's
 /// refcounting, distinct from (and in addition to) the `Arc`'s own.
@@ -538,6 +575,14 @@ static TOKEN_AND_SIGNATURE_UTF16_RESULTS: Mutex<
     Option<HashMap<usize, Result<(String, String), HRESULT>>>,
 > = Mutex::new(None);
 
+/// Keyed by the caller's `XAsyncBlock` pointer, same rationale as `TOKEN_AND_SIGNATURE_RESULTS`
+/// - the picture is a variable-length raw byte buffer with no size known until after the IPC
+/// round trip. An account with no gamer picture set stores `Ok(vec![])` here, not an `Err` -
+/// `ipc::get_gamer_picture`'s `Ok(None)` is an honest absence, and an empty buffer is the
+/// equivalent honest answer at this layer.
+static GAMER_PICTURE_RESULTS: Mutex<Option<HashMap<usize, Result<Vec<u8>, HRESULT>>>> =
+    Mutex::new(None);
+
 impl IXUserImpl_Impl for XUserObject_Impl {
     unsafe fn XUserDuplicateHandle(&self, handle: u64, duplicated_handle: *mut u64) -> HRESULT {
         if duplicated_handle.is_null() {
@@ -576,48 +621,27 @@ impl IXUserImpl_Impl for XUserObject_Impl {
 
     unsafe fn XUserAddAsync(&self, options: u32, async_: *mut XAsyncBlock) -> HRESULT {
         // XUserAddOptions: None=0, AddDefaultUserSilently=1, AllowGuests=2,
-        // AddDefaultUserAllowingUI=4 (wine/include/xuser.h). WineGDK's own XUserAddAsync
-        // handles Silently and AllowingUI identically (both just load stored credentials);
-        // we do the same, since there is no webview/UI architecture in xodus-service to
-        // drive an AllowingUI-only interactive sign-in yet - it degrades to the same
-        // "fail if nothing is stored" behavior as Silently, rather than fabricating a UI
-        // flow that doesn't exist.
+        // AddDefaultUserAllowingUI=4 (wine/include/xuser.h).
         if options & 0b101 == 0 {
             return E_ABORT;
         }
+        let allow_ui = options & 0x04 != 0;
 
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<u64, HRESULT> {
-                let (xuid, gamertag, gamertag_modern, age_group) = crate::ipc::get_user_info()?;
-                let user_id: u64 = xuid.parse().map_err(|_| E_FAIL)?;
-
-                let existing = {
-                    let registry = USER_REGISTRY.lock().expect("user registry poisoned");
-                    registry
-                        .iter()
-                        .filter_map(Weak::upgrade)
-                        .find(|user| user.user_id == user_id)
-                };
-
-                let user = match existing {
-                    Some(user) => user,
-                    None => {
-                        let user = Arc::new(UserState {
-                            local_id: XUserLocalId { value: user_id },
-                            user_id,
-                            is_guest: false,
-                            state: Mutex::new(XUserStateValue::SignedIn),
-                            gamertag,
-                            gamertag_modern,
-                            age_group: parse_age_group(&age_group),
-                        });
-                        register_user(&user);
-                        fire_change_event(user.local_id, CHANGE_EVENT_SIGNED_IN_AGAIN);
-                        user
-                    }
-                };
-
-                Ok(UserHandleTable::create(user))
+                match crate::ipc::get_user_info() {
+                    Ok(info) => user_handle_from_info(info),
+                    // A game that only asked for Silently should behave as if nobody is
+                    // signed in, not pop a window it didn't ask for.
+                    Err(err) if !allow_ui => Err(err),
+                    Err(_) => match crate::ipc::interactive_sign_in()? {
+                        Some(info) => user_handle_from_info(info),
+                        // The human closed the sign-in window without completing it - an
+                        // honest "declined", matching real GDK's behavior when the user
+                        // backs out of the account picker.
+                        None => Err(E_ABORT),
+                    },
+                }
             })
         }
     }
@@ -719,10 +743,102 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         E_NOTIMPL
     }
 
+    unsafe fn XUserGetGamerPictureAsync(
+        &self,
+        user: u64,
+        picture_size: u32,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT {
+        if (unsafe { UserHandleTable::get(user) }).is_none() {
+            return E_INVALIDARG;
+        }
+        // XUserGamerPictureSize (Small/Medium/Large/ExtraLarge) is accepted but not
+        // forwarded - xodus-service returns the one canonical GameDisplayPicRaw image for
+        // every size (see xodus::api::xbox::profile::get_gamer_picture's docs in the xodus
+        // repo for why: no static-analysis evidence of which CDN query variant the real
+        // client requests per size).
+        let _ = picture_size;
+
+        let key = async_ as usize;
+        unsafe {
+            xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
+                let result =
+                    crate::ipc::get_gamer_picture().map(|picture| picture.unwrap_or_default());
+                let outcome = match &result {
+                    Ok(_) => Ok(()),
+                    Err(hr) => Err(*hr),
+                };
+                GAMER_PICTURE_RESULTS
+                    .lock()
+                    .expect("gamer picture results poisoned")
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key, result);
+                outcome
+            })
+        }
+    }
+
+    unsafe fn XUserGetGamerPictureResultSize(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: *mut usize,
+    ) -> HRESULT {
+        if buffer_size.is_null() {
+            return E_POINTER;
+        }
+        let key = async_ as usize;
+        let results = GAMER_PICTURE_RESULTS
+            .lock()
+            .expect("gamer picture results poisoned");
+        match results.as_ref().and_then(|results| results.get(&key)) {
+            Some(Ok(picture)) => {
+                unsafe { *buffer_size = picture.len() };
+                S_OK
+            }
+            Some(Err(hr)) => *hr,
+            None => E_ILLEGAL_METHOD_CALL,
+        }
+    }
+
+    unsafe fn XUserGetGamerPictureResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: usize,
+        buffer: *mut c_void,
+        buffer_used: *mut usize,
+    ) -> HRESULT {
+        let key = async_ as usize;
+        let results = GAMER_PICTURE_RESULTS
+            .lock()
+            .expect("gamer picture results poisoned");
+        match results.as_ref().and_then(|results| results.get(&key)) {
+            Some(Ok(picture)) => {
+                if picture.len() > buffer_size {
+                    return E_NOT_SUFFICIENT_BUFFER;
+                }
+                if buffer.is_null() && !picture.is_empty() {
+                    return E_POINTER;
+                }
+                unsafe {
+                    if !picture.is_empty() {
+                        std::ptr::copy_nonoverlapping(
+                            picture.as_ptr(),
+                            buffer.cast::<u8>(),
+                            picture.len(),
+                        );
+                    }
+                    if !buffer_used.is_null() {
+                        *buffer_used = picture.len();
+                    }
+                }
+                S_OK
+            }
+            Some(Err(hr)) => *hr,
+            None => E_ILLEGAL_METHOD_CALL,
+        }
+    }
+
     hresult_stub! {
-        unsafe fn XUserGetGamerPictureAsync(&self, user: u64, picture_size: u32, async_: *mut XAsyncBlock) -> HRESULT;
-        unsafe fn XUserGetGamerPictureResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
-        unsafe fn XUserGetGamerPictureResult(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, buffer_used: *mut usize) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiAsync(&self, user: u64, url: *const c_char, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT;
         unsafe fn XUserResolveIssueWithUiUtf16Async(&self, user: u64, url: *const u16, async_: *mut XAsyncBlock) -> HRESULT;
@@ -1095,9 +1211,40 @@ impl IXUserImpl_Impl for XUserObject_Impl {
 }
 
 impl IXUserImpl2_Impl for XUserObject_Impl {
-    hresult_stub! {
-        unsafe fn XUserAddByIdWithUiAsync(&self, user_id: u64, async_: *mut XAsyncBlock) -> HRESULT;
-        unsafe fn XUserAddByIdWithUiResult(&self, async_: *mut XAsyncBlock, new_user: *mut u64) -> HRESULT;
+    unsafe fn XUserAddByIdWithUiAsync(&self, user_id: u64, async_: *mut XAsyncBlock) -> HRESULT {
+        // `user_id` is a hint for which account to preselect - real GDK uses it to skip the
+        // account picker when that account's credentials are already cached. There is no
+        // way to preselect an account in an MSA login page opened fresh (it always starts
+        // at "choose an account"/"sign in"), so this crate ignores the hint and always
+        // drives the same interactive flow XUserAddAsync(AddDefaultUserAllowingUI) does,
+        // rather than fabricating an account-preselection feature that doesn't exist here.
+        let _ = user_id;
+
+        unsafe {
+            xasync::run_sync(async_.cast(), move || -> Result<u64, HRESULT> {
+                match crate::ipc::interactive_sign_in()? {
+                    Some(info) => user_handle_from_info(info),
+                    // The human closed the sign-in window without completing it - an
+                    // honest "declined", matching real GDK's behavior when the user backs
+                    // out of the account picker.
+                    None => Err(E_ABORT),
+                }
+            })
+        }
+    }
+
+    unsafe fn XUserAddByIdWithUiResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        new_user: *mut u64,
+    ) -> HRESULT {
+        if new_user.is_null() {
+            return E_POINTER;
+        }
+        match unsafe { xasync::get_result(async_, std::ptr::null(), new_user) } {
+            Ok(()) => S_OK,
+            Err(hr) => hr,
+        }
     }
 }
 
@@ -1213,8 +1360,17 @@ impl IXUserImpl3_Impl for XUserObject_Impl {
 }
 
 impl IXUserImpl4_Impl for XUserObject_Impl {
-    boolean_stub! {
-        unsafe fn XUserIsStoreUser(&self, user: u64) -> Boolean;
+    unsafe fn XUserIsStoreUser(&self, user: u64) -> Boolean {
+        // Every XUserHandle in this codebase comes from a genuine Xbox Live/MSA sign-in
+        // (XUserAddAsync's silent or interactive path, or XUserFindForDevice) - there is no
+        // second, non-store identity provider modeled here for this to distinguish against.
+        // An unknown handle honestly reports FALSE rather than WineGDK's own stub, which
+        // returns TRUE unconditionally without checking the handle at all.
+        if (unsafe { UserHandleTable::get(user) }).is_some() {
+            TRUE
+        } else {
+            FALSE
+        }
     }
 }
 
@@ -1409,11 +1565,21 @@ impl IXUserDeviceImpl_Impl for XUserDeviceObject_Impl {
         if device_id.is_null() || handle.is_null() {
             return E_POINTER;
         }
-        // No controller-to-user association is modeled (Linux/Wine has no
-        // XInputGetControllerCapabilities-style user binding), so no device is ever
-        // associated with a user yet.
-        unsafe { *handle = 0 };
-        E_NOTIMPL
+        // This crate caps at one signed-in local user (see `max_users_is_one`), so there
+        // is no real controller-to-user routing decision to make: any device belongs to
+        // the sole signed-in user, or to nobody if none is signed in. Real per-device
+        // identity (evdev enumeration, hotplug tracking) would only matter for
+        // disambiguating between multiple users, which can't happen here - so
+        // `device_id` is intentionally not inspected.
+        let registry = USER_REGISTRY.lock().expect("user registry poisoned");
+        let Some(user) = registry.iter().filter_map(Weak::upgrade).find(|user| {
+            *user.state.lock().expect("user state poisoned") == XUserStateValue::SignedIn
+        }) else {
+            unsafe { *handle = 0 };
+            return E_INVALIDARG;
+        };
+        unsafe { *handle = UserHandleTable::create(user) };
+        S_OK
     }
 
     unsafe fn XUserRegisterForDeviceAssociationChanged(
@@ -1550,6 +1716,17 @@ mod tests {
         assert_eq!(id, 100);
 
         unsafe { xuser_singleton().XUserCloseHandle(dup) };
+    }
+
+    #[test]
+    fn is_store_user_is_true_for_a_valid_handle_and_false_otherwise() {
+        let user = make_user(2, 200);
+        let handle = UserHandleTable::create(user);
+
+        assert_eq!(unsafe { xuser_singleton().XUserIsStoreUser(handle) }, TRUE);
+        assert_eq!(unsafe { xuser_singleton().XUserIsStoreUser(0) }, FALSE);
+
+        unsafe { xuser_singleton().XUserCloseHandle(handle) };
     }
 
     #[test]
@@ -1804,11 +1981,121 @@ mod tests {
     }
 
     #[test]
-    fn max_devices_lookup_reports_not_implemented_without_a_binding() {
-        let device_id = AppLocalDeviceId { value: [0u8; 32] };
+    fn gamer_picture_result_round_trips_via_the_side_table() {
+        let async_block = XAsyncBlock {
+            queue: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; std::mem::size_of::<*mut c_void>() * 4],
+        };
+        let key = &async_block as *const XAsyncBlock as usize;
+        GAMER_PICTURE_RESULTS
+            .lock()
+            .expect("gamer picture results poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(key, Ok(b"not-really-a-png".to_vec()));
+
+        let async_ptr = &async_block as *const XAsyncBlock as *mut XAsyncBlock;
+
+        let mut needed = 0usize;
+        let hr =
+            unsafe { xuser_singleton().XUserGetGamerPictureResultSize(async_ptr, &mut needed) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(needed, b"not-really-a-png".len());
+
+        let mut buf = vec![0u8; needed];
+        let mut used = 0usize;
+        let hr = unsafe {
+            xuser_singleton().XUserGetGamerPictureResult(
+                async_ptr,
+                buf.len(),
+                buf.as_mut_ptr().cast(),
+                &mut used,
+            )
+        };
+        assert_eq!(hr, S_OK);
+        assert_eq!(used, needed);
+        assert_eq!(buf, b"not-really-a-png");
+
+        // A too-small buffer reports the error rather than writing a truncated picture.
+        let mut tiny = vec![0u8; needed - 1];
+        let hr = unsafe {
+            xuser_singleton().XUserGetGamerPictureResult(
+                async_ptr,
+                tiny.len(),
+                tiny.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, E_NOT_SUFFICIENT_BUFFER);
+
+        GAMER_PICTURE_RESULTS
+            .lock()
+            .expect("gamer picture results poisoned")
+            .get_or_insert_with(HashMap::new)
+            .remove(&key);
+    }
+
+    #[test]
+    fn gamer_picture_result_reports_an_empty_buffer_when_no_picture_is_set() {
+        let async_block = XAsyncBlock {
+            queue: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; std::mem::size_of::<*mut c_void>() * 4],
+        };
+        let key = &async_block as *const XAsyncBlock as usize;
+        GAMER_PICTURE_RESULTS
+            .lock()
+            .expect("gamer picture results poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(key, Ok(Vec::new()));
+
+        let async_ptr = &async_block as *const XAsyncBlock as *mut XAsyncBlock;
+
+        let mut needed = 1usize;
+        let hr =
+            unsafe { xuser_singleton().XUserGetGamerPictureResultSize(async_ptr, &mut needed) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(needed, 0);
+
+        let mut used = 1usize;
+        let hr = unsafe {
+            xuser_singleton().XUserGetGamerPictureResult(
+                async_ptr,
+                0,
+                std::ptr::null_mut(),
+                &mut used,
+            )
+        };
+        assert_eq!(hr, S_OK);
+        assert_eq!(used, 0);
+
+        GAMER_PICTURE_RESULTS
+            .lock()
+            .expect("gamer picture results poisoned")
+            .get_or_insert_with(HashMap::new)
+            .remove(&key);
+    }
+
+    #[test]
+    fn find_for_device_returns_a_signed_in_user_regardless_of_device_id() {
+        // `USER_REGISTRY` is process-global, so (unlike most tests here) this can't
+        // assert against a specific id if the suite runs multi-threaded and another
+        // test's signed-in user happens to be alive at the same moment - only that
+        // *some* signed-in user is found, which is the whole of what single-user mode
+        // promises (there is no second user to disambiguate against).
+        let user = make_user(43, 4343);
+        register_user(&user);
+        let keep_alive = UserHandleTable::create(user);
+
+        let device_id = AppLocalDeviceId { value: [0xab; 32] };
         let mut handle = 0u64;
         let hr = unsafe { xuser_device_singleton().XUserFindForDevice(&device_id, &mut handle) };
-        assert_eq!(hr, E_NOTIMPL);
-        assert_eq!(handle, 0);
+        assert_eq!(hr, S_OK);
+        assert_ne!(handle, 0);
+
+        unsafe { xuser_singleton().XUserCloseHandle(handle) };
+        unsafe { xuser_singleton().XUserCloseHandle(keep_alive) };
     }
 }

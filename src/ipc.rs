@@ -19,6 +19,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use windows_core::HRESULT;
@@ -48,6 +49,12 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Interactive sign-in blocks on a human finishing (or abandoning) a webview login, which
+/// runs on human timescale, not the sub-second round trips [`IO_TIMEOUT`] is sized for. Ten
+/// minutes is generous enough not to cut off a real attempt while still eventually giving
+/// up if the webview process wedges.
+const INTERACTIVE_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// `XodusMessageType::MSA_TOKEN_REQUEST` / `MSA_TOKEN_RESPONSE` (`proto/xodus/common.proto`).
 /// Reused purely as a numeric message-type tag on the XML transport - the payload is XML,
 /// not protobuf, `xml.rs::parse_message` just dispatches on this enum's discriminants.
@@ -69,6 +76,16 @@ const MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST: u16 = 19;
 const MSG_TYPE_ASSOCIATED_PRODUCTS_RESPONSE: u16 = 20;
 const MSG_TYPE_RESOLVE_PRODUCT_ID_REQUEST: u16 = 21;
 const MSG_TYPE_RESOLVE_PRODUCT_ID_RESPONSE: u16 = 22;
+const MSG_TYPE_INTERACTIVE_SIGN_IN_REQUEST: u16 = 23;
+const MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE: u16 = 24;
+const MSG_TYPE_GAMER_PICTURE_REQUEST: u16 = 25;
+const MSG_TYPE_GAMER_PICTURE_RESPONSE: u16 = 26;
+/// Mirrors `xodus_service::connection::xml::ERROR_REPLY_TYPE`: sent instead of
+/// `msg_type + 1` when the service hit an internal error handling the request (e.g. a
+/// transient failure talking to a real Microsoft endpoint), with the error's `Display`
+/// text as the body. Distinguishes "the service failed" from "legitimately empty success",
+/// which used to both show up on the wire as an empty body at `msg_type + 1`.
+const MSG_TYPE_ERROR: u16 = 0xFFFF;
 
 /// `xodus-cli run` publishes the launched package's `ContentId` here (`xodus::ipc::ENV_CONTENT_ID`
 /// on the `xodus` side - this crate can't depend on that crate, so the literal is hand-mirrored,
@@ -102,9 +119,60 @@ const ENV_RELATED_PRODUCTS: &str = "XODUS_RELATED_PRODUCTS";
 const ENV_GAME_SAVE_ROOT: &str = "XODUS_GAME_SAVE_ROOT";
 
 /// Xbox Live's own MSA app registration id, used throughout `xodus`'s auth flow
-/// (`xodus::auth::TitleIdentity::default`) - not a per-title/per-game id, so hardcoding it
-/// here is not the "don't hardcode the title identity" case PLAN.md warns about.
+/// (`xodus::auth::TitleIdentity::xodus`) - not a per-title/per-game id. Used only as a
+/// fallback by [`title_client_id`] when the launched title has no `MicrosoftGame.config`
+/// (or no `<MSAAppId>` in it) to read a real one from - not itself the "don't hardcode the
+/// title identity" case PLAN.md warns about, since it's shared Xbox Live infrastructure,
+/// not any particular game's identity.
 const XBOX_LIVE_CLIENT_ID: &str = "000000004424da1f";
+
+/// Parses the real `<MSAAppId>` out of the launched title's `MicrosoftGame.config`, walking
+/// up from the game executable the same way `com.rs`'s `read_game_title_id` does for
+/// `<TitleId>` (the file lives next to the exe, occasionally a parent directory) - not
+/// hardcoded, per PLAN.md's standing rule against baking in title identity. `None` when no
+/// `MicrosoftGame.config`/`<MSAAppId>` was found, so callers fall back to
+/// [`XBOX_LIVE_CLIENT_ID`].
+fn read_game_msa_app_id() -> Option<String> {
+    static MSA_APP_ID: OnceLock<Option<String>> = OnceLock::new();
+    MSA_APP_ID
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let mut dir = exe.parent()?.to_path_buf();
+            loop {
+                for name in ["MicrosoftGame.Config", "MicrosoftGame.config"] {
+                    let candidate = dir.join(name);
+                    if let Ok(contents) = std::fs::read_to_string(&candidate)
+                        && let Some(id) = parse_msa_app_id_from_config(&contents)
+                    {
+                        return Some(id);
+                    }
+                }
+                if !dir.pop() {
+                    return None;
+                }
+            }
+        })
+        .clone()
+}
+
+fn parse_msa_app_id_from_config(contents: &str) -> Option<String> {
+    let start = contents.find("<MSAAppId")?;
+    let open_end = contents[start..].find('>')? + start + 1;
+    let close = contents[open_end..].find("</MSAAppId>")? + open_end;
+    let text = contents[open_end..close].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// The `client_id` to use for MSA/Xbox Live token exchanges: the launched title's own real
+/// `<MSAAppId>` when one could be read, falling back to the shared [`XBOX_LIVE_CLIENT_ID`]
+/// otherwise - never a hardcoded per-title value.
+fn title_client_id() -> String {
+    read_game_msa_app_id().unwrap_or_else(|| XBOX_LIVE_CLIENT_ID.to_string())
+}
 
 /// The literal scope GDK games pass to request a full-trust (`MBI_SSL`) token, per
 /// `xodus-service/src/connection/xml.rs`'s handling of `MSATokenRequest::msa_full_trust`.
@@ -139,7 +207,11 @@ struct MsaTokenResponse {
 /// `xodus-service`'s `XstsTokenRequest` handler derives the relying party itself from
 /// `url` (Xbox Live's title-management endpoint table), the same way the real title-managed
 /// SDK would - the caller never supplies one, matching `XUserGetTokenAndSignatureAsync`'s
-/// real signature.
+/// real signature. `client_id` is [`title_client_id`]'s real per-title `MSAAppId` when one
+/// is available, so the MSA/user-token exchange the service performs on our behalf is scoped
+/// to this title rather than the shared Xbox Live client - `#[serde(default)]` so an older
+/// service that doesn't know the field yet still parses the request (and falls back to its
+/// own hardcoded client id).
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct XstsTokenRequest {
@@ -149,6 +221,8 @@ struct XstsTokenRequest {
     body: String,
     #[serde(default)]
     force_refresh: bool,
+    #[serde(default)]
+    client_id: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -163,11 +237,16 @@ struct XstsTokenResponse {
     expiry: i64,
 }
 
-/// No request fields - `xodus-service` always answers for whichever user's credentials
-/// are on this connection.
+/// `xodus-service` always answers for whichever user's credentials are on this connection -
+/// `client_id` is the only request field, [`title_client_id`]'s real per-title `MSAAppId`
+/// when available, scoping the MSA/user-token exchange to this title (see
+/// `XstsTokenRequest`'s docs).
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct UserInfoRequest {}
+struct UserInfoRequest {
+    #[serde(default)]
+    client_id: String,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -312,6 +391,51 @@ struct ResolveProductIdResponse {
     product_id: String,
 }
 
+/// Like `UserInfoRequest`, whichever Microsoft account the human signs into completes it;
+/// there is no per-request account selection at the GDK layer to forward - `client_id` is
+/// the only field, same per-title scoping as `UserInfoRequest`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InteractiveSignInRequest {
+    #[serde(default)]
+    client_id: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InteractiveSignInResponse {
+    success: bool,
+    #[serde(default)]
+    xuid: String,
+    #[serde(default)]
+    gamertag: String,
+    #[serde(default)]
+    gamertag_modern: String,
+    #[serde(default)]
+    age_group: String,
+}
+
+/// `XUserGetGamerPictureAsync`'s real backing. Like `UserInfoRequest`, `xodus-service`
+/// always answers for whichever account's credentials are on this connection - `client_id`
+/// is the only field, same per-title scoping as `UserInfoRequest`. `XUserGamerPictureSize`
+/// is not forwarded - see `xodus::api::xbox::profile::get_gamer_picture`'s docs (in the
+/// `xodus` repo) for why.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GamerPictureRequest {
+    #[serde(default)]
+    client_id: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GamerPictureResponse {
+    /// Base64 (raw bytes can't ride inside XML text unescaped). Empty when the account has
+    /// no gamer picture set - honest absence, not an error.
+    #[serde(default)]
+    picture: String,
+}
+
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -342,8 +466,37 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Inverse of [`base64_encode`] - standard (padded) alphabet only, matching what
+/// `xodus-service` sends back. Returns `None` on malformed input rather than a partial
+/// buffer.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn value(c: u8) -> Option<u32> {
+        BASE64_ALPHABET
+            .iter()
+            .position(|&b| b == c)
+            .map(|i| i as u32)
+    }
+
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let chars: Vec<u8> = s.bytes().collect();
+    for chunk in chars.chunks(4) {
+        if chunk.len() < 2 {
+            return None;
+        }
+        let mut n: u32 = 0;
+        for &c in chunk {
+            n = (n << 6) | value(c)?;
+        }
+        n <<= 6 * (4 - chunk.len() as u32);
+        let bytes = n.to_be_bytes();
+        out.extend_from_slice(&bytes[1..chunk.len()]);
+    }
+    Some(out)
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -387,41 +540,87 @@ fn perform_handshake(stream: &mut TcpStream, secret: &[u8]) -> Result<(), HRESUL
 /// iteration but happily keeps reading more on the same connection, so a fresh connection
 /// per call is not required by the protocol - it is just simpler, and loopback connection
 /// setup is cheap next to the token exchange this exists to make.
+///
+/// Reply bodies carry live Xbox Live credentials (XSTS `XBL3.0` headers, MSA compact
+/// tokens, request signatures). Never log one: log sizes and outcomes instead, the way
+/// the callers below do.
 fn request(msg_type: u16, payload: &[u8]) -> Result<(u16, Vec<u8>), HRESULT> {
-    let (port, secret) = endpoint()?;
+    request_with_timeout(msg_type, payload, IO_TIMEOUT)
+}
+
+/// Same round trip as [`request`], but with a caller-chosen read/write timeout - for calls
+/// like [`interactive_sign_in`] that wait on human timescale, not [`IO_TIMEOUT`]'s
+/// sub-second round-trip assumption.
+fn request_with_timeout(
+    msg_type: u16,
+    payload: &[u8],
+    io_timeout: Duration,
+) -> Result<(u16, Vec<u8>), HRESULT> {
+    eprintln!("[diag] request msg_type={msg_type} starting");
+    let (port, secret) = endpoint().inspect_err(|e| {
+        eprintln!("[diag] request msg_type={msg_type} endpoint() failed: {e:?}")
+    })?;
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|_| E_FAIL)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
-    stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| {
+        eprintln!("[diag] request msg_type={msg_type} connect to {addr} failed: {e}");
+        E_FAIL
+    })?;
+    stream.set_read_timeout(Some(io_timeout)).ok();
+    stream.set_write_timeout(Some(io_timeout)).ok();
     stream.set_nodelay(true).ok();
 
-    perform_handshake(&mut stream, &secret)?;
+    perform_handshake(&mut stream, &secret).inspect_err(|e| {
+        eprintln!("[diag] request msg_type={msg_type} handshake failed: {e:?}")
+    })?;
 
     let mut request = Vec::with_capacity(payload.len() + 10);
     request.extend(XML_MAGIC_V2.to_le_bytes());
     request.extend(msg_type.to_le_bytes());
     request.extend((payload.len() as u32).to_le_bytes());
     request.extend_from_slice(payload);
-    stream.write_all(&request).map_err(|_| E_FAIL)?;
+    stream.write_all(&request).map_err(|e| {
+        eprintln!("[diag] request msg_type={msg_type} write failed: {e}");
+        E_FAIL
+    })?;
 
     let mut magic = [0u8; 4];
-    stream.read_exact(&mut magic).map_err(|_| E_FAIL)?;
+    stream.read_exact(&mut magic).map_err(|e| {
+        eprintln!("[diag] request msg_type={msg_type} read magic failed: {e}");
+        E_FAIL
+    })?;
     if u32::from_le_bytes(magic) != XML_MAGIC_V2 {
+        eprintln!("[diag] request msg_type={msg_type} bad reply magic: {magic:?}");
         return Err(E_FAIL);
     }
 
     let mut header = [0u8; 6];
-    stream.read_exact(&mut header).map_err(|_| E_FAIL)?;
+    stream.read_exact(&mut header).map_err(|e| {
+        eprintln!("[diag] request msg_type={msg_type} read header failed: {e}");
+        E_FAIL
+    })?;
     let reply_type = u16::from_le_bytes([header[0], header[1]]);
     let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
     if size > MAX_MESSAGE_SIZE {
+        eprintln!("[diag] request msg_type={msg_type} reply size {size} too large");
         return Err(E_FAIL);
     }
 
     let mut body = vec![0u8; size];
-    stream.read_exact(&mut body).map_err(|_| E_FAIL)?;
+    stream.read_exact(&mut body).map_err(|e| {
+        eprintln!("[diag] request msg_type={msg_type} read body failed: {e}");
+        E_FAIL
+    })?;
 
+    eprintln!(
+        "[diag] request msg_type={msg_type} succeeded, reply_type={reply_type} size={size}"
+    );
+    if reply_type == MSG_TYPE_ERROR {
+        eprintln!(
+            "[diag] request msg_type={msg_type} server reported an error: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     Ok((reply_type, body))
 }
 
@@ -430,7 +629,7 @@ fn request(msg_type: u16, payload: &[u8]) -> Result<(u16, Vec<u8>), HRESULT> {
 /// scope request. Returns `(token, expiry_unix_seconds)`.
 pub fn get_msa_token_silently(scope: Option<&str>) -> Result<(String, i64), HRESULT> {
     let request_body = MsaTokenRequest {
-        client_id: XBOX_LIVE_CLIENT_ID.to_string(),
+        client_id: title_client_id(),
         allow_ui: false,
         msa_full_trust: scope == Some(FULL_TRUST_SCOPE),
     };
@@ -445,9 +644,30 @@ pub fn get_msa_token_silently(scope: Option<&str>) -> Result<(String, i64), HRES
     }
 
     let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: MsaTokenResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: MsaTokenResponse = match quick_xml::de::from_str(text) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[diag] get_msa_token_silently deserialize error: {err}");
+            return Err(E_FAIL);
+        }
+    };
+    eprintln!(
+        "[diag] get_msa_token_silently -> token ({} bytes) expiry={}",
+        response.token.len(),
+        response.expiry
+    );
     Ok((response.token, response.expiry))
 }
+
+/// How many times [`get_token_and_signature`] retries a failed round trip before giving up.
+/// Observed in practice: the very first XSTS token-and-signature fetch for a relying party
+/// can fail transiently (a retry moments later against the same relying party succeeds with
+/// a normal token), and Bedrock does not tolerate that failure gracefully - it falls back to
+/// showing the sign-in prompt even though a valid signed-in user handle already exists. This
+/// mirrors how real Xbox Live clients (e.g. `xbox-live-api`) treat token-and-signature
+/// fetches as retryable rather than fatal on the first failure.
+const TOKEN_AND_SIGNATURE_RETRIES: u32 = 3;
+const TOKEN_AND_SIGNATURE_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// `XUserGetTokenAndSignatureAsync`'s real backing. Returns `(authorization_header,
 /// signature_header)` - `signature_header` is empty when no signature policy covers `url`
@@ -458,11 +678,35 @@ pub fn get_token_and_signature(
     url: &str,
     body: &[u8],
 ) -> Result<(String, String), HRESULT> {
+    let mut last_err = E_FAIL;
+    for attempt in 1..=TOKEN_AND_SIGNATURE_RETRIES {
+        match get_token_and_signature_once(method, url, body) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                eprintln!(
+                    "[diag] get_token_and_signature({url}) attempt {attempt}/{TOKEN_AND_SIGNATURE_RETRIES} failed: {err:?}"
+                );
+                last_err = err;
+                if attempt < TOKEN_AND_SIGNATURE_RETRIES {
+                    std::thread::sleep(TOKEN_AND_SIGNATURE_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn get_token_and_signature_once(
+    method: &str,
+    url: &str,
+    body: &[u8],
+) -> Result<(String, String), HRESULT> {
     let request_body = XstsTokenRequest {
         method: method.to_string(),
         url: url.to_string(),
         body: base64_encode(body),
         force_refresh: false,
+        client_id: title_client_id(),
     };
     let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
 
@@ -472,7 +716,18 @@ pub fn get_token_and_signature(
     }
 
     let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: XstsTokenResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: XstsTokenResponse = match quick_xml::de::from_str(text) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[diag] get_token_and_signature deserialize error: {err}");
+            return Err(E_FAIL);
+        }
+    };
+    eprintln!(
+        "[diag] get_token_and_signature({url}) -> authorization ({} bytes) signature ({} bytes)",
+        response.authorization.len(),
+        response.signature.len()
+    );
     Ok((response.authorization, response.signature))
 }
 
@@ -481,7 +736,10 @@ pub fn get_token_and_signature(
 /// callers should do the same. Returns `(xuid, gamertag, gamertag_modern, age_group)`; `age_group`
 /// is Xbox Live's raw claim (`"Adult"`/`"Teen"`/`"Child"`), not yet mapped to `XUserAgeGroup`.
 pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
-    let body = quick_xml::se::to_string(&UserInfoRequest {}).map_err(|_| E_FAIL)?;
+    let body = quick_xml::se::to_string(&UserInfoRequest {
+        client_id: title_client_id(),
+    })
+    .map_err(|_| E_FAIL)?;
 
     let (reply_type, reply_body) = request(MSG_TYPE_USER_INFO_REQUEST, body.as_bytes())?;
     if reply_type != MSG_TYPE_USER_INFO_RESPONSE {
@@ -489,13 +747,67 @@ pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
     }
 
     let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: UserInfoResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: UserInfoResponse = match quick_xml::de::from_str(text) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[diag] get_user_info deserialize error: {err}");
+            return Err(E_FAIL);
+        }
+    };
+    eprintln!(
+        "[diag] get_user_info parsed: xuid={:?} gamertag={:?} gamertag_modern={:?} age_group={:?}",
+        response.xuid, response.gamertag, response.gamertag_modern, response.age_group
+    );
     Ok((
         response.xuid,
         response.gamertag,
         response.gamertag_modern,
         response.age_group,
     ))
+}
+
+/// `XUserAddAsync(AddDefaultUserAllowingUI)` / `XUserAddByIdWithUiAsync`'s real backing when
+/// there is nobody signed in for [`get_user_info`] to answer silently. Blocks for as long as
+/// `xodus-service`'s spawned `xodus-cli login` webview takes - a human deciding whether to
+/// sign in, not a network round trip, hence [`INTERACTIVE_SIGN_IN_TIMEOUT`] rather than the
+/// default. Returns `Ok(None)` when the human closed the window without completing sign-in
+/// (an honest "declined", not an error); `Ok(Some(..))` on the same
+/// `(xuid, gamertag, gamertag_modern, age_group)` shape as [`get_user_info`] on success.
+pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>, HRESULT> {
+    eprintln!("[diag] interactive_sign_in called");
+    let body = quick_xml::se::to_string(&InteractiveSignInRequest {
+        client_id: title_client_id(),
+    })
+    .map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) = request_with_timeout(
+        MSG_TYPE_INTERACTIVE_SIGN_IN_REQUEST,
+        body.as_bytes(),
+        INTERACTIVE_SIGN_IN_TIMEOUT,
+    )?;
+    if reply_type != MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE {
+        eprintln!("[diag] interactive_sign_in unexpected reply_type={reply_type}");
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: InteractiveSignInResponse = match quick_xml::de::from_str(text) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[diag] interactive_sign_in deserialize error: {err}");
+            return Err(E_FAIL);
+        }
+    };
+    if !response.success {
+        eprintln!("[diag] interactive_sign_in: server reported declined/failed sign-in");
+        return Ok(None);
+    }
+    Ok(Some((
+        response.xuid,
+        response.gamertag,
+        response.gamertag_modern,
+        response.age_group,
+    )))
 }
 
 /// `XStoreQueryGameLicenseAsync`'s real backing. Returns `(is_active, expiration_date)` for
@@ -643,6 +955,28 @@ pub(crate) fn resolve_product_id(package_family_name: &str) -> Result<Option<Str
     } else {
         Ok(Some(response.product_id))
     }
+}
+
+/// `XUserGetGamerPictureAsync`'s real backing. No user field - like [`get_entitled_products`],
+/// `xodus-service` always answers for whichever account's credentials are on this connection.
+/// `Ok(None)` when the account has no gamer picture set - an honest absence, not an error.
+pub(crate) fn get_gamer_picture() -> Result<Option<Vec<u8>>, HRESULT> {
+    let body = quick_xml::se::to_string(&GamerPictureRequest {
+        client_id: title_client_id(),
+    })
+    .map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) = request(MSG_TYPE_GAMER_PICTURE_REQUEST, body.as_bytes())?;
+    if reply_type != MSG_TYPE_GAMER_PICTURE_RESPONSE {
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: GamerPictureResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    if response.picture.is_empty() {
+        return Ok(None);
+    }
+    base64_decode(&response.picture).map(Some).ok_or(E_FAIL)
 }
 
 /// The launched package's declared `PersistentLocalStorage` size, in bytes, from
@@ -894,6 +1228,76 @@ mod tests {
         assert_eq!(signature, "fake-signature");
     }
 
+    /// Regression test for the "Sign in with Microsoft" bug: a transient failure on the
+    /// first token-and-signature fetch (surfaced here as `MSG_TYPE_ERROR`, mirroring
+    /// `xodus_service::connection::xml::ERROR_REPLY_TYPE`) must not be fatal - a retry
+    /// against a fresh connection that succeeds should be enough to get a real token.
+    #[test]
+    fn xsts_token_request_retries_past_a_transient_server_error() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x99u8; SECRET_LEN];
+
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().expect("accept");
+
+                let mut magic = [0u8; 4];
+                socket.read_exact(&mut magic).expect("read handshake magic");
+                assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+                let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+                assert_eq!(presented, secret);
+                socket
+                    .write_all(&[HANDSHAKE_ACCEPTED])
+                    .expect("write accepted");
+
+                let mut msg_magic = [0u8; 4];
+                socket
+                    .read_exact(&mut msg_magic)
+                    .expect("read message magic");
+                assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+                let mut header = [0u8; 6];
+                socket.read_exact(&mut header).expect("read header");
+                let msg_type = u16::from_le_bytes([header[0], header[1]]);
+                assert_eq!(msg_type, MSG_TYPE_XSTS_TOKEN_REQUEST);
+                let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+                let _body = read_exact_blocking(&mut socket, size);
+
+                let (reply_type, payload) = if attempt == 0 {
+                    (MSG_TYPE_ERROR, b"transient token exchange failure".to_vec())
+                } else {
+                    let response = XstsTokenResponse {
+                        token: "fake-xsts-token".to_string(),
+                        authorization: "XBL3.0 x=fake-uhs;fake-xsts-token".to_string(),
+                        signature: "fake-signature".to_string(),
+                        expiry: 1_700_000_000,
+                    };
+                    (
+                        MSG_TYPE_XSTS_TOKEN_RESPONSE,
+                        quick_xml::se::to_string(&response).unwrap().into_bytes(),
+                    )
+                };
+                let mut reply = Vec::new();
+                reply.extend(XML_MAGIC_V2.to_le_bytes());
+                reply.extend(reply_type.to_le_bytes());
+                reply.extend((payload.len() as u32).to_le_bytes());
+                reply.extend(payload);
+                socket.write_all(&reply).expect("write reply");
+            }
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result =
+            get_token_and_signature("GET", "https://profile.xboxlive.com/users/me", b"payload");
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        let (authorization, signature) = result.expect("retry recovers from the transient error");
+        assert_eq!(authorization, "XBL3.0 x=fake-uhs;fake-xsts-token");
+        assert_eq!(signature, "fake-signature");
+    }
+
     #[test]
     fn user_info_request_round_trips_against_a_fake_service() {
         let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -953,6 +1357,127 @@ mod tests {
         assert_eq!(gamertag, "FakeGamer");
         assert_eq!(gamertag_modern, "FakeGamer");
         assert_eq!(age_group, "Adult");
+    }
+
+    #[test]
+    fn interactive_sign_in_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0xaau8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            assert_eq!(
+                u16::from_le_bytes([header[0], header[1]]),
+                MSG_TYPE_INTERACTIVE_SIGN_IN_REQUEST
+            );
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let _body = read_exact_blocking(&mut socket, size);
+
+            let response = InteractiveSignInResponse {
+                success: true,
+                xuid: "2533274999999999".to_string(),
+                gamertag: "FakeGamer".to_string(),
+                gamertag_modern: "FakeGamer".to_string(),
+                age_group: "Adult".to_string(),
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = interactive_sign_in();
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        let (xuid, gamertag, gamertag_modern, age_group) =
+            result.expect("round trip succeeds").expect("signed in");
+        assert_eq!(xuid, "2533274999999999");
+        assert_eq!(gamertag, "FakeGamer");
+        assert_eq!(gamertag_modern, "FakeGamer");
+        assert_eq!(age_group, "Adult");
+    }
+
+    #[test]
+    fn interactive_sign_in_reports_none_when_declined() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0xbbu8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            assert_eq!(
+                u16::from_le_bytes([header[0], header[1]]),
+                MSG_TYPE_INTERACTIVE_SIGN_IN_REQUEST
+            );
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let _body = read_exact_blocking(&mut socket, size);
+
+            let response = InteractiveSignInResponse {
+                success: false,
+                xuid: String::new(),
+                gamertag: String::new(),
+                gamertag_modern: String::new(),
+                age_group: String::new(),
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = interactive_sign_in();
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert_eq!(result.expect("round trip succeeds"), None);
     }
 
     #[test]
@@ -1321,6 +1846,125 @@ mod tests {
             result.expect("round trip succeeds"),
             Some("9NABC1234567".to_string())
         );
+    }
+
+    #[test]
+    fn gamer_picture_request_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x55u8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            let msg_type = u16::from_le_bytes([header[0], header[1]]);
+            assert_eq!(msg_type, MSG_TYPE_GAMER_PICTURE_REQUEST);
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let _body = read_exact_blocking(&mut socket, size);
+
+            let response = GamerPictureResponse {
+                picture: base64_encode(b"not-really-a-png"),
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_GAMER_PICTURE_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = get_gamer_picture();
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert_eq!(
+            result.expect("round trip succeeds"),
+            Some(b"not-really-a-png".to_vec())
+        );
+    }
+
+    #[test]
+    fn gamer_picture_request_reports_none_when_account_has_no_picture() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x33u8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            assert_eq!(
+                u16::from_le_bytes([header[0], header[1]]),
+                MSG_TYPE_GAMER_PICTURE_REQUEST
+            );
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let _body = read_exact_blocking(&mut socket, size);
+
+            let response = GamerPictureResponse {
+                picture: String::new(),
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_GAMER_PICTURE_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = get_gamer_picture();
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert_eq!(result.expect("round trip succeeds"), None);
+    }
+
+    #[test]
+    fn base64_decode_matches_known_vectors() {
+        assert_eq!(base64_decode(""), Some(Vec::new()));
+        assert_eq!(base64_decode("Zg=="), Some(b"f".to_vec()));
+        assert_eq!(base64_decode("Zm8="), Some(b"fo".to_vec()));
+        assert_eq!(base64_decode("Zm9v"), Some(b"foo".to_vec()));
+        assert_eq!(base64_decode("Zm9vYmFy"), Some(b"foobar".to_vec()));
+        assert_eq!(base64_decode("not valid base64!"), None);
     }
 
     #[test]
