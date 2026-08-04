@@ -67,6 +67,8 @@ const MSG_TYPE_LICENSE_TOKEN_REQUEST: u16 = 17;
 const MSG_TYPE_LICENSE_TOKEN_RESPONSE: u16 = 18;
 const MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST: u16 = 19;
 const MSG_TYPE_ASSOCIATED_PRODUCTS_RESPONSE: u16 = 20;
+const MSG_TYPE_RESOLVE_PRODUCT_ID_REQUEST: u16 = 21;
+const MSG_TYPE_RESOLVE_PRODUCT_ID_RESPONSE: u16 = 22;
 
 /// `xodus-cli run` publishes the launched package's `ContentId` here (`xodus::ipc::ENV_CONTENT_ID`
 /// on the `xodus` side - this crate can't depend on that crate, so the literal is hand-mirrored,
@@ -77,7 +79,27 @@ const ENV_CONTENT_ID: &str = "XODUS_CONTENT_ID";
 /// (`xodus::ipc::ENV_PACKAGE_FAMILY_NAME` on the `xodus` side, hand-mirrored for the same
 /// reason as [`ENV_CONTENT_ID`]). Unset when not running under `xodus-cli run`, or when
 /// `xodus-cli run` couldn't find/parse an `AppxManifest.xml`.
-const ENV_PACKAGE_FAMILY_NAME: &str = "XODUS_PACKAGE_FAMILY_NAME";
+pub(crate) const ENV_PACKAGE_FAMILY_NAME: &str = "XODUS_PACKAGE_FAMILY_NAME";
+
+/// `xodus-cli run`'s parse of the launched package's `<PersistentLocalStorage>` element from
+/// `MicrosoftGame.config` (`xodus::ipc::ENV_PLS_*` on the `xodus` side, hand-mirrored for the
+/// same reason as [`ENV_CONTENT_ID`]). `ENV_PLS_SHAREABLE` unset means no such element was
+/// found - `XPersistentLocalStorageGetSpaceInfo` falls back to a placeholder in that case.
+const ENV_PLS_SIZE_MB: &str = "XODUS_PLS_SIZE_MB";
+const ENV_PLS_GROWABLE_TO_MB: &str = "XODUS_PLS_GROWABLE_TO_MB";
+const ENV_PLS_SHAREABLE: &str = "XODUS_PLS_SHAREABLE";
+
+/// Comma-separated `StoreId`s from the launched package's `<RelatedProducts>` declaration
+/// (`xodus::ipc::ENV_RELATED_PRODUCTS` on the `xodus` side) - the products this title allows
+/// `XPersistentLocalStorageMountForPackage` to mount storage for.
+const ENV_RELATED_PRODUCTS: &str = "XODUS_RELATED_PRODUCTS";
+
+/// A `Z:\...`-rooted path to a real, persistent (survives reboots) per-title directory
+/// `xodus-cli run` created under a host XDG data dir (`xodus::ipc::ENV_GAME_SAVE_ROOT` on the
+/// `xodus` side, hand-mirrored for the same reason as [`ENV_CONTENT_ID`]) - `XGameSave`'s local
+/// container store lives under here. Unset when not running under `xodus-cli run`, or when it
+/// couldn't resolve a `PackageFamilyName`/create the directory.
+const ENV_GAME_SAVE_ROOT: &str = "XODUS_GAME_SAVE_ROOT";
 
 /// Xbox Live's own MSA app registration id, used throughout `xodus`'s auth flow
 /// (`xodus::auth::TitleIdentity::default`) - not a per-title/per-game id, so hardcoding it
@@ -272,6 +294,22 @@ pub(crate) struct AssociatedProduct {
     pub(crate) store_id: String,
     pub(crate) title: String,
     pub(crate) product_kind: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ResolveProductIdRequest {
+    #[serde(default)]
+    package_family_name: String,
+    #[serde(default)]
+    market: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ResolveProductIdResponse {
+    #[serde(default)]
+    product_id: String,
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -561,9 +599,7 @@ pub(crate) fn get_license_token(
 /// unset (not running under `xodus-cli run`, or `xodus-cli run` couldn't find/parse an
 /// `AppxManifest.xml`) - same honest "nothing to resolve" stance as [`get_game_license`]'s
 /// gate on [`ENV_CONTENT_ID`].
-pub(crate) fn get_associated_products(
-    max_items: u32,
-) -> Result<Vec<AssociatedProduct>, HRESULT> {
+pub(crate) fn get_associated_products(max_items: u32) -> Result<Vec<AssociatedProduct>, HRESULT> {
     let package_family_name = std::env::var(ENV_PACKAGE_FAMILY_NAME).map_err(|_| E_NOTIMPL)?;
     let request_body = AssociatedProductsRequest {
         package_family_name,
@@ -572,16 +608,71 @@ pub(crate) fn get_associated_products(
     };
     let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
 
-    let (reply_type, reply_body) =
-        request(MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST, body.as_bytes())?;
+    let (reply_type, reply_body) = request(MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST, body.as_bytes())?;
     if reply_type != MSG_TYPE_ASSOCIATED_PRODUCTS_RESPONSE {
         return Err(E_FAIL);
     }
 
     let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: AssociatedProductsResponse =
-        quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: AssociatedProductsResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
     Ok(response.products)
+}
+
+/// `XPersistentLocalStorageMountForPackage`'s real backing: resolves a `PackageFamilyName`
+/// (the real interface's `packageIdentifier` - confirmed via strings recovered from the real
+/// `xgameruntime.dll`, which implements `XPackageGetCurrentProcessPackageIdentifier` on top of
+/// Win32's own `GetCurrentPackageFamilyName`) to a `StoreId`, via the same
+/// `alternateid=PackageFamilyName` catalog lookup [`get_associated_products`] uses. `Ok(None)`
+/// is an honest "no such product", not an error - the caller decides what that means.
+pub(crate) fn resolve_product_id(package_family_name: &str) -> Result<Option<String>, HRESULT> {
+    let request_body = ResolveProductIdRequest {
+        package_family_name: package_family_name.to_string(),
+        market: String::new(),
+    };
+    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
+
+    let (reply_type, reply_body) = request(MSG_TYPE_RESOLVE_PRODUCT_ID_REQUEST, body.as_bytes())?;
+    if reply_type != MSG_TYPE_RESOLVE_PRODUCT_ID_RESPONSE {
+        return Err(E_FAIL);
+    }
+
+    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
+    let response: ResolveProductIdResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    if response.product_id.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(response.product_id))
+    }
+}
+
+/// The launched package's declared `PersistentLocalStorage` size, in bytes, from
+/// [`ENV_PLS_SIZE_MB`]/[`ENV_PLS_GROWABLE_TO_MB`]. `None` when unset - no `PersistentLocalStorage`
+/// element was found in `MicrosoftGame.config`, and the caller should fall back to a placeholder.
+pub(crate) fn persistent_local_storage_space() -> Option<(u64, u64)> {
+    let shareable = std::env::var(ENV_PLS_SHAREABLE).ok()?;
+    let _ = shareable; // presence, not value, is what marks the element as found
+    let size_mb: u64 = std::env::var(ENV_PLS_SIZE_MB).ok()?.parse().ok()?;
+    let growable_to_mb: u64 = std::env::var(ENV_PLS_GROWABLE_TO_MB)
+        .ok()?
+        .parse()
+        .unwrap_or(size_mb);
+    Some((
+        size_mb * 1024 * 1024,
+        growable_to_mb.max(size_mb) * 1024 * 1024,
+    ))
+}
+
+/// Whether `store_id` is one of the launched package's declared `RelatedProducts`
+/// (`XPersistentLocalStorageMountForPackage`'s eligibility check).
+pub(crate) fn is_related_product(store_id: &str) -> bool {
+    std::env::var(ENV_RELATED_PRODUCTS)
+        .map(|list| list.split(',').any(|id| id == store_id))
+        .unwrap_or(false)
+}
+
+/// The real, persistent game-save root `xodus-cli run` published, if any.
+pub(crate) fn game_save_root() -> Option<String> {
+    std::env::var(ENV_GAME_SAVE_ROOT).ok()
 }
 
 #[cfg(test)]
@@ -1172,5 +1263,103 @@ mod tests {
         server.join().expect("server thread");
 
         assert_eq!(result.expect("round trip succeeds"), "fake-license-token");
+    }
+
+    #[test]
+    fn resolve_product_id_request_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0x77u8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            let msg_type = u16::from_le_bytes([header[0], header[1]]);
+            assert_eq!(msg_type, MSG_TYPE_RESOLVE_PRODUCT_ID_REQUEST);
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let body = read_exact_blocking(&mut socket, size);
+            let request: ResolveProductIdRequest =
+                quick_xml::de::from_str(std::str::from_utf8(&body).unwrap()).expect("parses");
+            assert_eq!(request.package_family_name, "Example.Game_8wekyb3d8bbwe");
+
+            let response = ResolveProductIdResponse {
+                product_id: "9NABC1234567".to_string(),
+            };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_RESOLVE_PRODUCT_ID_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = resolve_product_id("Example.Game_8wekyb3d8bbwe");
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert_eq!(
+            result.expect("round trip succeeds"),
+            Some("9NABC1234567".to_string())
+        );
+    }
+
+    #[test]
+    fn persistent_local_storage_space_reads_env_vars_and_falls_back_when_unset() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(ENV_PLS_SIZE_MB);
+            std::env::remove_var(ENV_PLS_GROWABLE_TO_MB);
+            std::env::remove_var(ENV_PLS_SHAREABLE);
+        }
+        assert_eq!(persistent_local_storage_space(), None);
+
+        unsafe {
+            std::env::set_var(ENV_PLS_SIZE_MB, "128");
+            std::env::set_var(ENV_PLS_GROWABLE_TO_MB, "512");
+            std::env::set_var(ENV_PLS_SHAREABLE, "true");
+        }
+        assert_eq!(
+            persistent_local_storage_space(),
+            Some((128 * 1024 * 1024, 512 * 1024 * 1024))
+        );
+        unsafe {
+            std::env::remove_var(ENV_PLS_SIZE_MB);
+            std::env::remove_var(ENV_PLS_GROWABLE_TO_MB);
+            std::env::remove_var(ENV_PLS_SHAREABLE);
+        }
+    }
+
+    #[test]
+    fn is_related_product_checks_the_declared_list() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var(ENV_RELATED_PRODUCTS, "9NABC1234567,9NDEF7654321");
+        }
+        assert!(is_related_product("9NABC1234567"));
+        assert!(!is_related_product("9NOTLISTED0000"));
+        unsafe {
+            std::env::remove_var(ENV_RELATED_PRODUCTS);
+        }
+        assert!(!is_related_product("9NABC1234567"));
     }
 }

@@ -15,6 +15,7 @@ use windows_sys::core::BOOL;
 
 const CLSID_XSTORE: GUID = GUID::from_u128(0x0dd112ac_7c24_448c_b92b_3960fb5bd30c);
 const CLSID_XNETWORKING: GUID = GUID::from_u128(0x37e56907_2f10_41e8_b72f_36edb185331a);
+const CLSID_XPACKAGE: GUID = GUID::from_u128(0xaf406016_e850_4aa8_a88d_2f3dcb9dac7e);
 const CLSID_XPERSISTENT_LOCAL_STORAGE: GUID =
     GUID::from_u128(0xf4faf4d4_2d04_4fce_b3e0_474a713a3e84);
 const STORE_SKU_ID_SIZE: usize = 18;
@@ -209,6 +210,35 @@ impl ProductQueryHandleTable {
     }
 }
 
+/// Handle table for `XPersistentLocalStorageMountForPackage`/`XPackageGetMountPath`/
+/// `XPackageCloseMountHandle` - same leaked-`Box` scheme as `ProductQueryHandleTable`, storing
+/// the mounted directory's path.
+struct XPackageMountHandleTable;
+
+impl XPackageMountHandleTable {
+    fn create(path: String) -> u64 {
+        Box::into_raw(Box::new(path)) as u64
+    }
+
+    /// # Safety
+    /// `handle` must be zero or a handle from [`Self::create`] that has not been closed.
+    unsafe fn get<'a>(handle: u64) -> Option<&'a String> {
+        if handle == 0 {
+            return None;
+        }
+        Some(unsafe { &*(handle as *const String) })
+    }
+
+    /// # Safety
+    /// `handle` must be an open handle from [`Self::create`]; it is invalid afterwards.
+    unsafe fn close(handle: u64) {
+        if handle == 0 {
+            return;
+        }
+        drop(unsafe { Box::from_raw(handle as *mut String) });
+    }
+}
+
 /// Maps `EntitledProduct`/`AssociatedProduct`'s freeform `product_kind` string onto
 /// `XStoreProductKind`'s bitmask (`wine/include/xstore.idl`). Only "Game" is derivable from
 /// what `xodus-service` actually returns - anything else honestly reports as none rather
@@ -371,11 +401,15 @@ pub unsafe trait IXPersistentLocalStorage: IUnknown {
         self: &Self,
         async_block: *mut XAsyncBlock,
     );
+    /// Unlike this trait's other methods (kept `()`-returning as a pre-existing, out-of-scope
+    /// quirk), this one returns `HRESULT` for real: the caller needs to be able to observe
+    /// `E_INVALIDARG` for a `packageIdentifier` that isn't this title's own or a declared
+    /// `RelatedProducts` entry, matching the real GDK signature.
     pub unsafe fn x_persistent_local_storage_mount_for_package(
         self: &Self,
         package_identifier: *const c_char,
         mount_handle: *mut XPackageMountHandle,
-    );
+    ) -> HRESULT;
 }
 
 #[implement(IXPersistentLocalStorage)]
@@ -413,41 +447,98 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
         }
     }
 
+    /// Real numbers when `xodus-cli run` found a `<PersistentLocalStorage>` element in
+    /// `MicrosoftGame.config` (`ipc::persistent_local_storage_space`); the old placeholder
+    /// otherwise (not running under `xodus-cli run`, or the title didn't declare one) - an
+    /// honest "can't tell" fallback, not a claim this title has no storage need.
     unsafe fn x_persistent_local_storage_get_space_info(
         &self,
         info: *mut XPersistentLocalStorageSpaceInfo,
     ) {
+        let (total_bytes, growable_to_bytes) = crate::ipc::persistent_local_storage_space()
+            .unwrap_or((1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024));
         unsafe {
             *info = XPersistentLocalStorageSpaceInfo {
-                availableFreeBytes: 1024 * 1024 * 1024,
-                totalFreeBytes: 1024 * 1024 * 1024,
-                usedBytes: 512 * 1024 * 1024,
-                totalBytes: 2 * 1024 * 1024 * 1024,
+                availableFreeBytes: growable_to_bytes.saturating_sub(total_bytes / 2),
+                totalFreeBytes: growable_to_bytes,
+                usedBytes: total_bytes / 2,
+                totalBytes: total_bytes,
             };
         }
     }
 
+    /// No real UI surface exists to show a space-request prompt, so this completes
+    /// immediately as an approval - the honest alternative (failing every call) would break
+    /// titles that gate on this succeeding before writing to persistent local storage, for a
+    /// prompt Xodus has no way to present anyway.
     unsafe fn x_persistent_local_storage_prompt_user_for_space_async(
         &self,
-        requested_bytes: u64,
+        _requested_bytes: u64,
         async_block: *mut XAsyncBlock,
     ) {
-        todo!()
+        let _ = unsafe { xasync::run_sync(async_block, || Ok(())) };
     }
 
     unsafe fn x_persistent_local_storage_prompt_user_for_space_result(
         &self,
         async_block: *mut XAsyncBlock,
     ) {
-        todo!()
+        let _ = unsafe { get_result::<()>(async_block, null_mut(), &mut ()) };
     }
 
+    /// `packageIdentifier` is a `PackageFamilyName` (confirmed via strings recovered from the
+    /// real `xgameruntime.dll` - `XPackageGetCurrentProcessPackageIdentifier` is implemented on
+    /// top of Win32's own `GetCurrentPackageFamilyName`). Two cases are honestly answerable:
+    /// self-mount (the running title's own PFN, `ENV_PACKAGE_FAMILY_NAME`) maps to this
+    /// title's own persistent-storage root, and any other PFN is resolved to a `StoreId` via
+    /// `xodus-service` and checked against this title's own declared `RelatedProducts`
+    /// (`MicrosoftGame.config`, published through `ENV_RELATED_PRODUCTS`). Mounting storage
+    /// for a product that's neither has no real meaning to grant, so that case honestly fails
+    /// (`E_INVALIDARG`) rather than mounting anyway. On success, the handle resolves via
+    /// `IXPackageImpl::XPackageGetMountPath` to a directory under this title's own
+    /// persistent-storage root, created on first mount.
     unsafe fn x_persistent_local_storage_mount_for_package(
         &self,
         package_identifier: *const c_char,
         mount_handle: *mut XPackageMountHandle,
-    ) {
-        todo!()
+    ) -> HRESULT {
+        if package_identifier.is_null() || mount_handle.is_null() {
+            return E_POINTER;
+        }
+        let Ok(package_identifier) = unsafe { CStr::from_ptr(package_identifier) }.to_str() else {
+            return E_INVALIDARG;
+        };
+
+        let is_self = std::env::var(crate::ipc::ENV_PACKAGE_FAMILY_NAME)
+            .map(|pfn| pfn == package_identifier)
+            .unwrap_or(false);
+
+        let path = if is_self {
+            std::path::PathBuf::from(&self.tmp_path)
+        } else {
+            let store_id = crate::ipc::resolve_product_id(package_identifier)
+                .ok()
+                .flatten();
+            let Some(store_id) = store_id else {
+                return E_INVALIDARG;
+            };
+            if !crate::ipc::is_related_product(&store_id) {
+                return E_INVALIDARG;
+            }
+            std::path::Path::new(&self.tmp_path)
+                .join("related")
+                .join(&store_id)
+        };
+
+        if std::fs::create_dir_all(&path).is_err() {
+            return E_FAIL;
+        }
+
+        let handle = XPackageMountHandleTable::create(path.to_string_lossy().into_owned());
+        unsafe {
+            *mount_handle = handle;
+        }
+        S_OK
     }
 }
 
@@ -961,6 +1052,178 @@ pub unsafe trait IXNetworking: IUnknown {
 #[interface("37e56907-2f10-41e8-b72f-36edb185331a")]
 pub unsafe trait IXNetworking2: IXNetworking {}
 
+/// `wine/include/xpackage.idl`'s `IXPackageImpl`, `__PADDING__`/`__PADDING_2__`/.../`__PADDING_5__`
+/// slots included in their exact positions since these are real (unnamed-in-practice) vtable
+/// slots, not something to compact away. Only `XPackageGetMountPathSize`/`XPackageGetMountPath`/
+/// `XPackageCloseMountHandle` have real bodies (see [`XPackageMountHandleTable`], populated by
+/// `IXPersistentLocalStorage::mount_for_package`) - everything else here has no real backing
+/// (package install/chunk-download management, which Xodus doesn't model) and honestly reports
+/// `E_NOTIMPL`/`FALSE` rather than a guess.
+#[interface("3720de07-e8e4-44a3-ad32-b359e8adbe55")]
+pub unsafe trait IXPackageImpl: IUnknown {
+    unsafe fn XPackageGetCurrentProcessPackageIdentifier(
+        &self,
+        bufferSize: usize,
+        buffer: *mut c_char,
+    ) -> HRESULT;
+    unsafe fn XPackageIsPackagedProcess(&self) -> BOOL;
+    unsafe fn XPackageCreateInstallationMonitor(
+        &self,
+        packageIdentifier: *const c_char,
+        selectorCount: u32,
+        selectors: *mut c_void,
+        minimumUpdateIntervalMs: u32,
+        queue: *mut c_void,
+        installationMonitor: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageCloseInstallationMonitorHandle(&self, installationMonitor: u64) -> ();
+    unsafe fn XPackageGetInstallationProgress(
+        &self,
+        installationMonitor: u64,
+        progress: *mut c_void,
+    ) -> ();
+    unsafe fn XPackageUpdateInstallationMonitor(&self, installationMonitor: u64) -> BOOL;
+    unsafe fn XPackageRegisterInstallationProgressChanged(
+        &self,
+        installationMonitor: u64,
+        context: *mut c_void,
+        callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageUnregisterInstallationProgressChanged(
+        &self,
+        installationMonitor: u64,
+        token: u64,
+        wait: BOOL,
+    ) -> BOOL;
+    unsafe fn XPackageGetUserLocale(&self, localeSize: usize, locale: *mut c_char) -> HRESULT;
+    unsafe fn XPackageFindChunkAvailability(
+        &self,
+        packageIdentifier: *const c_char,
+        selectorCount: u32,
+        selectors: *mut c_void,
+        availability: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageEnumerateChunkAvailability(
+        &self,
+        packageIdentifier: *const c_char,
+        selectorType: u32,
+        context: *mut c_void,
+        callback: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageChangeChunkInstallOrder(
+        &self,
+        packageIdentifier: *const c_char,
+        selectorCount: u32,
+        selectors: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageInstallChunks(
+        &self,
+        packageIdentifier: *const c_char,
+        selectorCount: u32,
+        selectors: *mut c_void,
+        minimumUpdateIntervalMs: u32,
+        suppressUserConfirmation: BOOL,
+        queue: *mut c_void,
+        installationMonitor: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageInstallChunksAsync(
+        &self,
+        packageIdentifier: *const c_char,
+        selectorCount: u32,
+        selectors: *mut c_void,
+        minimumUpdateIntervalMs: u32,
+        suppressUserConfirmation: BOOL,
+        asyncBlock: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageInstallChunksResult(
+        &self,
+        asyncBlock: *mut c_void,
+        installationMonitor: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageEstimateDownloadSize(
+        &self,
+        packageIdentifier: *const c_char,
+        selectorCount: u32,
+        selectors: *mut c_void,
+        downloadSize: *mut u64,
+        shouldPresentUserConfirmation: *mut BOOL,
+    ) -> HRESULT;
+    unsafe fn XPackageUninstallChunks(
+        &self,
+        packageIdentifier: *const c_char,
+        selectorCount: u32,
+        selectors: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn __PADDING__(&self) -> HRESULT;
+    unsafe fn __PADDING_2__(&self) -> HRESULT;
+    unsafe fn XPackageUnregisterPackageInstalled(&self, token: u64, wait: BOOL) -> BOOL;
+    unsafe fn __PADDING_3__(&self) -> HRESULT;
+    unsafe fn XPackageGetMountPathSize(
+        &self,
+        mount: XPackageMountHandle,
+        pathSize: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XPackageGetMountPath(
+        &self,
+        mount: XPackageMountHandle,
+        pathSize: usize,
+        path: *mut c_char,
+    ) -> HRESULT;
+    unsafe fn XPackageCloseMountHandle(&self, mount: XPackageMountHandle) -> ();
+    unsafe fn __PADDING_4__(&self) -> HRESULT;
+    unsafe fn XPackageEnumeratePackages(
+        &self,
+        kind: u32,
+        scope: u32,
+        context: *mut c_void,
+        callback: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageRegisterPackageInstalled(
+        &self,
+        queue: u64,
+        context: *mut c_void,
+        callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageGetWriteStats(&self, writeStats: *mut c_void) -> HRESULT;
+    unsafe fn __PADDING_5__(&self) -> HRESULT;
+    unsafe fn XPackageUninstallUWPInstance(&self, packageName: *const c_char) -> HRESULT;
+    unsafe fn XPackageEnumerateFeatures(
+        &self,
+        packageIdentifier: *const c_char,
+        context: *mut c_void,
+        callback: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageUninstallPackage(&self, packageIdentifier: *const c_char) -> BOOL;
+}
+
+/// Adds `XPackageMountWithUiAsync`/`Result` over [`IXPackageImpl`] - not implemented, since
+/// Xodus has no UI surface to show (same rationale as
+/// `IXPersistentLocalStorage::prompt_user_for_space_async`, but this one has no honest
+/// always-succeed answer: mounting requires actually resolving a package, unlike a storage-space
+/// prompt).
+#[interface("f92d8712-2b27-4d8a-bf01-11a6f8e3eb42")]
+pub unsafe trait IXPackageImpl2: IXPackageImpl {
+    unsafe fn XPackageMountWithUiAsync(
+        &self,
+        packageIdentifier: *const c_char,
+        async_: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XPackageMountWithUiResult(
+        &self,
+        async_: *mut c_void,
+        mount: *mut XPackageMountHandle,
+    ) -> HRESULT;
+}
+
+/// No new methods over [`IXPackageImpl2`] (`XPackageEnumeratePackages`/
+/// `XPackageRegisterPackageInstalled` are re-declared in the real IDL only to mark them
+/// overridden, not to add new vtable slots - same alias pattern as `IXNetworking2`/
+/// `IXStoreAlias1`). This is the coclass `XPackageImpl`'s default interface.
+#[interface("e2a4734b-2f4a-456d-aa8f-d065e04fb209")]
+pub unsafe trait IXPackageImpl3: IXPackageImpl2 {}
+
 macro_rules! hresult_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> HRESULT;)*) => {
         $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT { $(let _ = $arg;)* E_NOTIMPL })*
@@ -984,6 +1247,106 @@ macro_rules! void_stub {
         $(unsafe fn $name(&self $(, $arg: $ty)*) -> () { $(let _ = $arg;)* })*
     };
 }
+
+#[implement(IXPackageImpl, IXPackageImpl2, IXPackageImpl3)]
+pub struct XPackageObject;
+
+impl IXPackageImpl_Impl for XPackageObject_Impl {
+    hresult_stub! {
+        unsafe fn XPackageGetCurrentProcessPackageIdentifier(&self, bufferSize: usize, buffer: *mut c_char) -> HRESULT;
+        unsafe fn XPackageCreateInstallationMonitor(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, minimumUpdateIntervalMs: u32, queue: *mut c_void, installationMonitor: *mut c_void) -> HRESULT;
+        unsafe fn XPackageRegisterInstallationProgressChanged(&self, installationMonitor: u64, context: *mut c_void, callback: *mut c_void, token: *mut c_void) -> HRESULT;
+        unsafe fn XPackageGetUserLocale(&self, localeSize: usize, locale: *mut c_char) -> HRESULT;
+        unsafe fn XPackageFindChunkAvailability(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, availability: *mut c_void) -> HRESULT;
+        unsafe fn XPackageEnumerateChunkAvailability(&self, packageIdentifier: *const c_char, selectorType: u32, context: *mut c_void, callback: *mut c_void) -> HRESULT;
+        unsafe fn XPackageChangeChunkInstallOrder(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void) -> HRESULT;
+        unsafe fn XPackageInstallChunks(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, minimumUpdateIntervalMs: u32, suppressUserConfirmation: BOOL, queue: *mut c_void, installationMonitor: *mut c_void) -> HRESULT;
+        unsafe fn XPackageInstallChunksAsync(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, minimumUpdateIntervalMs: u32, suppressUserConfirmation: BOOL, asyncBlock: *mut c_void) -> HRESULT;
+        unsafe fn XPackageInstallChunksResult(&self, asyncBlock: *mut c_void, installationMonitor: *mut c_void) -> HRESULT;
+        unsafe fn XPackageEstimateDownloadSize(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, downloadSize: *mut u64, shouldPresentUserConfirmation: *mut BOOL) -> HRESULT;
+        unsafe fn XPackageUninstallChunks(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void) -> HRESULT;
+        unsafe fn __PADDING__(&self) -> HRESULT;
+        unsafe fn __PADDING_2__(&self) -> HRESULT;
+        unsafe fn __PADDING_3__(&self) -> HRESULT;
+        unsafe fn __PADDING_4__(&self) -> HRESULT;
+        unsafe fn XPackageEnumeratePackages(&self, kind: u32, scope: u32, context: *mut c_void, callback: *mut c_void) -> HRESULT;
+        unsafe fn XPackageRegisterPackageInstalled(&self, queue: u64, context: *mut c_void, callback: *mut c_void, token: *mut c_void) -> HRESULT;
+        unsafe fn XPackageGetWriteStats(&self, writeStats: *mut c_void) -> HRESULT;
+        unsafe fn __PADDING_5__(&self) -> HRESULT;
+        unsafe fn XPackageUninstallUWPInstance(&self, packageName: *const c_char) -> HRESULT;
+        unsafe fn XPackageEnumerateFeatures(&self, packageIdentifier: *const c_char, context: *mut c_void, callback: *mut c_void) -> HRESULT;
+    }
+
+    bool_stub! {
+        unsafe fn XPackageIsPackagedProcess(&self) -> BOOL;
+        unsafe fn XPackageUpdateInstallationMonitor(&self, installationMonitor: u64) -> BOOL;
+        unsafe fn XPackageUnregisterInstallationProgressChanged(&self, installationMonitor: u64, token: u64, wait: BOOL) -> BOOL;
+        unsafe fn XPackageUnregisterPackageInstalled(&self, token: u64, wait: BOOL) -> BOOL;
+        unsafe fn XPackageUninstallPackage(&self, packageIdentifier: *const c_char) -> BOOL;
+    }
+
+    void_stub! {
+        unsafe fn XPackageCloseInstallationMonitorHandle(&self, installationMonitor: u64) -> ();
+        unsafe fn XPackageGetInstallationProgress(&self, installationMonitor: u64, progress: *mut c_void) -> ();
+    }
+
+    unsafe fn XPackageGetMountPathSize(
+        &self,
+        mount: XPackageMountHandle,
+        pathSize: *mut usize,
+    ) -> HRESULT {
+        let Some(path) = (unsafe { XPackageMountHandleTable::get(mount) }) else {
+            return E_INVALIDARG;
+        };
+        if pathSize.is_null() {
+            return E_POINTER;
+        }
+        unsafe {
+            *pathSize = path.len() + 1;
+        }
+        S_OK
+    }
+
+    unsafe fn XPackageGetMountPath(
+        &self,
+        mount: XPackageMountHandle,
+        pathSize: usize,
+        path: *mut c_char,
+    ) -> HRESULT {
+        let Some(mount_path) = (unsafe { XPackageMountHandleTable::get(mount) }) else {
+            return E_INVALIDARG;
+        };
+        if path.is_null() {
+            return E_POINTER;
+        }
+        let bytes = mount_path.as_bytes();
+        let len = bytes.len().min(pathSize.saturating_sub(1));
+        for (index, byte) in bytes.iter().copied().take(len).enumerate() {
+            unsafe {
+                *path.add(index) = byte as c_char;
+            }
+        }
+        if pathSize != 0 {
+            unsafe {
+                *path.add(len) = 0;
+            }
+        }
+        S_OK
+    }
+
+    unsafe fn XPackageCloseMountHandle(&self, mount: XPackageMountHandle) {
+        unsafe { XPackageMountHandleTable::close(mount) };
+    }
+}
+
+impl IXPackageImpl2_Impl for XPackageObject_Impl {
+    hresult_stub! {
+        unsafe fn XPackageMountWithUiAsync(&self, packageIdentifier: *const c_char, async_: *mut c_void) -> HRESULT;
+        unsafe fn XPackageMountWithUiResult(&self, async_: *mut c_void, mount: *mut XPackageMountHandle) -> HRESULT;
+    }
+}
+
+impl IXPackageImpl3_Impl for XPackageObject_Impl {}
 
 #[implement(IXStore, IXStoreAlias1, IXStoreAlias2)]
 pub struct XStoreObject;
@@ -1685,6 +2048,7 @@ static XSTORE_SINGLETON: OnceLock<GlobalInterface<IXStore>> = OnceLock::new();
 static XNETWORKING_SINGLETON: OnceLock<GlobalInterface<IXNetworking>> = OnceLock::new();
 static XPERSISTENT_LOCAL_STORAGE_SINGLETON: OnceLock<GlobalInterface<IXPersistentLocalStorage>> =
     OnceLock::new();
+static XPACKAGE_SINGLETON: OnceLock<GlobalInterface<IXPackageImpl3>> = OnceLock::new();
 static XASYNC_SINGLETON: OnceLock<GlobalInterface<crate::xasync::IXAsync>> = OnceLock::new();
 
 /// The async runtime is a process-wide singleton: task queues and in-flight calls have
@@ -1723,6 +2087,14 @@ fn xpersistent_local_storage_singleton() -> &'static IXPersistentLocalStorage {
                 .into(),
             )
         })
+        .0
+}
+
+/// Only backs `XPackageGetMountPathSize`/`XPackageGetMountPath`/`XPackageCloseMountHandle` for
+/// real - see [`IXPackageImpl`]'s docs.
+fn xpackage_singleton() -> &'static IXPackageImpl3 {
+    &XPACKAGE_SINGLETON
+        .get_or_init(|| GlobalInterface(XPackageObject.into()))
         .0
 }
 
@@ -1782,10 +2154,14 @@ pub fn query_api_impl(
         CLSID_XPERSISTENT_LOCAL_STORAGE => {
             query(xpersistent_local_storage_singleton(), interface_id, out)
         }
+        CLSID_XPACKAGE => query(xpackage_singleton(), interface_id, out),
         crate::xasync::CLSID_XASYNC => query(xasync_singleton(), interface_id, out),
         crate::xuser::CLSID_XUSER => query(crate::xuser::xuser_singleton(), interface_id, out),
         crate::xuser::CLSID_XUSER_DEVICE => {
             query(crate::xuser::xuser_device_singleton(), interface_id, out)
+        }
+        crate::xgamesave::CLSID_XGAMESAVE => {
+            query(crate::xgamesave::xgamesave_singleton(), interface_id, out)
         }
         _ => {
             // Everything this crate does not implement yet. There is no Microsoft DLL to
@@ -2022,7 +2398,7 @@ mod tests {
 
         assert_eq!(
             unsafe { store.XStoreProductsQueryHasMorePages(handle) },
-            false.into()
+            0i32
         );
 
         unsafe extern "system" fn collect(

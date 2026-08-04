@@ -1478,6 +1478,33 @@ pub fn xuser_device_singleton() -> &'static IXUserDeviceImpl2 {
         .0
 }
 
+/// Resolves an `XUserHandle` to the xuid it was signed in with, for callers outside this
+/// module (`XGameSave`'s provider initialization namespaces save containers per user).
+/// `None` for a null or unrecognized handle.
+///
+/// # Safety
+/// `handle` must be zero or a handle from [`UserHandleTable::create`] that has not been closed.
+pub unsafe fn user_id_for_handle(handle: u64) -> Option<u64> {
+    unsafe { UserHandleTable::get(handle) }.map(|user| user.user_id)
+}
+
+/// A real, `UserHandleTable`-backed handle for `xgamesave`'s cross-module tests to pass to
+/// [`user_id_for_handle`] - unlike this crate's own tests, `xgamesave`'s can't build a
+/// `UserState` directly since both the struct and `UserHandleTable::create` are private here.
+#[cfg(test)]
+pub(crate) fn create_test_user_handle(user_id: u64) -> u64 {
+    let user = Arc::new(UserState {
+        local_id: XUserLocalId { value: user_id },
+        user_id,
+        is_guest: false,
+        state: Mutex::new(XUserStateValue::SignedIn),
+        gamertag: "TestGamer".to_string(),
+        gamertag_modern: String::new(),
+        age_group: 3,
+    });
+    UserHandleTable::create(user)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
