@@ -1,0 +1,1098 @@
+//! Native `IXUserImpl1-6` / `IXUserGamertagImpl` / `IXUserDeviceImpl1-2`, ported from
+//! WineGDK's `XUser.c` vtable shape (`wine/include/xuser.idl` has the authoritative slot
+//! order, including the `__PADDING__` at slot 12 of the base interface).
+//!
+//! This lands the handle table and every slot that can be answered honestly with no
+//! external state: duplicate/close/compare, local-id and global-id lookup, guest/state
+//! queries, the RemoteConnect plumbing `lib.rs` already wires up. Everything that needs a
+//! real signed-in identity - `XUserAddAsync`, `XUserGetTokenAndSignatureAsync`,
+//! `XUserGetMsaTokenSilentlyAsync`, `XUserGetGamertag` - returns `E_NOTIMPL` until
+//! `xgameruntime-rs/src/ipc.rs` exists to ask `xodus-service` for an answer (PLAN.md Phase
+//! 1 remainder). Faking a signed-in user here would be actively wrong, unlike the XStore
+//! license placeholder: a game that thinks nobody is signed in behaves correctly, a game
+//! that thinks the wrong person is signed in does not.
+
+use std::collections::HashMap;
+use std::ffi::{c_char, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
+
+use crate::E_NOTIMPL;
+use crate::results::*;
+use crate::xasync::{self, XAsyncBlock};
+
+/// Also `IXUserImpl`'s own IID - Wine's idl reuses it as the coclass id.
+pub const CLSID_XUSER: GUID = GUID::from_u128(0x01acd177_91f9_4763_a38e_ccbb55ce32e0);
+/// Also `IXUserDeviceImpl`'s own IID, for the same reason.
+pub const CLSID_XUSER_DEVICE: GUID = GUID::from_u128(0x7d824997_10dc_45ab_86b7_2737767c0bf1);
+
+/// Win32 `BOOLEAN` - one byte. Distinct from the four-byte `BOOL` used elsewhere in this
+/// crate; `xuser.idl` uses `BOOLEAN` throughout, so getting the width wrong would corrupt
+/// whatever field follows it across the FFI boundary.
+type Boolean = u8;
+
+const TRUE: Boolean = 1;
+const FALSE: Boolean = 0;
+
+pub type XTaskQueueHandle = u64;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct XTaskQueueRegistrationToken {
+    pub token: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct XUserLocalId {
+    pub value: u64,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum XUserStateValue {
+    SignedIn = 0,
+    SigningOut = 1,
+    SignedOut = 2,
+}
+
+#[repr(C)]
+pub struct AppLocalDeviceId {
+    pub value: [u8; 32],
+}
+
+#[repr(C)]
+pub struct XUserDeviceAssociationChange {
+    pub device_id: AppLocalDeviceId,
+    pub old_user: XUserLocalId,
+    pub new_user: XUserLocalId,
+}
+
+#[repr(C)]
+pub struct XUserGetTokenAndSignatureData {
+    pub token_size: usize,
+    pub signature_size: usize,
+    pub token: *const c_char,
+    pub signature: *const c_char,
+}
+
+#[repr(C)]
+pub struct XUserGetTokenAndSignatureHttpHeader {
+    pub name: *const c_char,
+    pub value: *const c_char,
+}
+
+#[repr(C)]
+pub struct XUserGetTokenAndSignatureUtf16Data {
+    pub token_count: usize,
+    pub signature_count: usize,
+    pub token: *const u16,
+    pub signature: *const u16,
+}
+
+#[repr(C)]
+pub struct XUserGetTokenAndSignatureUtf16HttpHeader {
+    pub name: *const u16,
+    pub value: *const u16,
+}
+
+pub type XUserChangeEventCallback =
+    unsafe extern "system" fn(context: *mut c_void, user_local_id: XUserLocalId, event: u32);
+pub type XUserDeviceAssociationChangedCallback =
+    unsafe extern "system" fn(context: *mut c_void, change: *const XUserDeviceAssociationChange);
+pub type XUserDefaultAudioEndpointUtf16ChangedCallback = unsafe extern "system" fn(
+    context: *mut c_void,
+    user: XUserLocalId,
+    kind: u32,
+    endpoint_id_utf16: *const u16,
+);
+pub type XUserPlatformRemoteConnectShowPromptEventHandler = unsafe extern "system" fn(
+    context: *const c_void,
+    user_identifier: u32,
+    operation: u32,
+    url: *const c_char,
+    code: *const c_char,
+    qr_code_size: usize,
+    qr_code: *const c_char,
+);
+pub type XUserPlatformRemoteConnectClosePromptEventHandler = unsafe extern "system" fn();
+pub type XUserPlatformSpopPromptEventHandler = unsafe extern "system" fn(
+    context: *mut c_void,
+    user_identifier: u32,
+    operation: u32,
+    modern_gamertag: *const c_char,
+    modern_gamertag_suffix: *const c_char,
+);
+
+#[repr(C)]
+pub struct XUserPlatformRemoteConnectEventHandlers {
+    pub show: Option<XUserPlatformRemoteConnectShowPromptEventHandler>,
+    pub close: Option<XUserPlatformRemoteConnectClosePromptEventHandler>,
+    pub context: *mut c_void,
+}
+
+// ---------------------------------------------------------------------------------------
+// Handle table
+// ---------------------------------------------------------------------------------------
+
+struct UserState {
+    local_id: XUserLocalId,
+    user_id: u64,
+    is_guest: bool,
+    state: Mutex<XUserStateValue>,
+}
+
+/// Users known well enough to answer `XUserFindUserByLocalId`/`XUserFindUserById`.
+/// Populated when a sign-in actually produces a user - currently never, since
+/// `XUserAddAsync` is not wired to `xodus-service` yet. `Weak` so a fully-closed user
+/// (every handle dropped) falls out of the registry on its own rather than needing an
+/// explicit sign-out path to clean it up.
+static USER_REGISTRY: Mutex<Vec<Weak<UserState>>> = Mutex::new(Vec::new());
+
+/// Not yet called - wire this up alongside `XUserAddAsync` once it produces real users.
+#[allow(dead_code)]
+fn register_user(user: &Arc<UserState>) {
+    let mut registry = USER_REGISTRY.lock().expect("user registry poisoned");
+    registry.retain(|entry| entry.strong_count() > 0);
+    registry.push(Arc::downgrade(user));
+}
+
+/// A handle table keyed by leaked `Box<Arc<UserState>>` pointers - the same scheme as
+/// `task_queue::QueueHandle`. `XUserDuplicateHandle`/`XUserCloseHandle` are the game's
+/// refcounting, distinct from (and in addition to) the `Arc`'s own.
+struct UserHandleTable;
+
+impl UserHandleTable {
+    fn create(user: Arc<UserState>) -> u64 {
+        Box::into_raw(Box::new(user)) as u64
+    }
+
+    /// # Safety
+    /// `handle` must be zero or a handle from [`Self::create`] that has not been closed.
+    unsafe fn get(handle: u64) -> Option<Arc<UserState>> {
+        if handle == 0 {
+            return None;
+        }
+        Some(unsafe { (*(handle as *const Arc<UserState>)).clone() })
+    }
+
+    /// # Safety
+    /// `handle` must be an open handle from [`Self::create`]; it is invalid afterwards.
+    unsafe fn close(handle: u64) {
+        if handle == 0 {
+            return;
+        }
+        drop(unsafe { Box::from_raw(handle as *mut Arc<UserState>) });
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Change-event registration
+// ---------------------------------------------------------------------------------------
+
+struct ChangeEventRegistration {
+    context: *mut c_void,
+    callback: XUserChangeEventCallback,
+}
+
+// The context and callback are only ever read back and invoked on whatever thread fires
+// the event, exactly like `XAsyncWaker` elsewhere in this crate - the game is the one
+// asserting these are safe to move by handing them to a registration API in the first
+// place.
+unsafe impl Send for ChangeEventRegistration {}
+unsafe impl Sync for ChangeEventRegistration {}
+
+/// Accepted registrations for `XUserChangeEvent` notifications.
+///
+/// Nothing fires these yet: sign-in state changes only once `XUserAddAsync` talks to
+/// `xodus-service`. Registering and unregistering still behave correctly in the
+/// meantime - a game that registers, runs, and unregisters without ever seeing a callback
+/// is observing "no changes happened", which today is true.
+static CHANGE_EVENT_REGISTRY: Mutex<Option<HashMap<u64, ChangeEventRegistration>>> =
+    Mutex::new(None);
+static NEXT_CHANGE_EVENT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn register_change_event(context: *mut c_void, callback: XUserChangeEventCallback) -> u64 {
+    let token = NEXT_CHANGE_EVENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let mut registry = CHANGE_EVENT_REGISTRY
+        .lock()
+        .expect("change registry poisoned");
+    registry
+        .get_or_insert_with(HashMap::new)
+        .insert(token, ChangeEventRegistration { context, callback });
+    token
+}
+
+fn unregister_change_event(token: u64) -> bool {
+    let mut registry = CHANGE_EVENT_REGISTRY
+        .lock()
+        .expect("change registry poisoned");
+    registry
+        .get_or_insert_with(HashMap::new)
+        .remove(&token)
+        .is_some()
+}
+
+// ---------------------------------------------------------------------------------------
+// Stub macros - same shape as com.rs's, but for BOOLEAN (u8) rather than BOOL (i32).
+// ---------------------------------------------------------------------------------------
+
+macro_rules! hresult_stub {
+    ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> HRESULT;)*) => {
+        $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT { $(let _ = $arg;)* E_NOTIMPL })*
+    };
+}
+
+macro_rules! boolean_stub {
+    ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> Boolean;)*) => {
+        $(unsafe fn $name(&self $(, $arg: $ty)*) -> Boolean { $(let _ = $arg;)* FALSE })*
+    };
+}
+
+// ---------------------------------------------------------------------------------------
+// IXUserImpl1-6
+// ---------------------------------------------------------------------------------------
+
+#[interface("01acd177-91f9-4763-a38e-ccbb55ce32e0")]
+pub unsafe trait IXUserImpl: IUnknown {
+    unsafe fn XUserDuplicateHandle(&self, handle: u64, duplicated_handle: *mut u64) -> HRESULT;
+    unsafe fn XUserCloseHandle(&self, user: u64) -> ();
+    unsafe fn XUserCompare(&self, user1: u64, user2: u64) -> i32;
+    unsafe fn XUserGetMaxUsers(&self, max_users: *mut u32) -> HRESULT;
+    unsafe fn XUserAddAsync(&self, options: u32, async_: *mut XAsyncBlock) -> HRESULT;
+    unsafe fn XUserAddResult(&self, async_: *mut XAsyncBlock, new_user: *mut u64) -> HRESULT;
+    unsafe fn XUserGetLocalId(&self, user: u64, user_local_id: *mut XUserLocalId) -> HRESULT;
+    unsafe fn XUserFindUserByLocalId(
+        &self,
+        user_local_id: XUserLocalId,
+        handle: *mut u64,
+    ) -> HRESULT;
+    unsafe fn XUserGetId(&self, user: u64, user_id: *mut u64) -> HRESULT;
+    unsafe fn XUserFindUserById(&self, user_id: u64, handle: *mut u64) -> HRESULT;
+    unsafe fn XUserGetIsGuest(&self, user: u64, is_guest: *mut Boolean) -> HRESULT;
+    unsafe fn XUserGetState(&self, user: u64, state: *mut u32) -> HRESULT;
+    unsafe fn __padding__(&self) -> HRESULT;
+    unsafe fn XUserGetGamerPictureAsync(
+        &self,
+        user: u64,
+        picture_size: u32,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT;
+    unsafe fn XUserGetGamerPictureResultSize(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XUserGetGamerPictureResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: usize,
+        buffer: *mut c_void,
+        buffer_used: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XUserGetAgeGroup(&self, user: u64, age_group: *mut u32) -> HRESULT;
+    unsafe fn XUserCheckPrivilege(
+        &self,
+        user: u64,
+        options: u32,
+        privilege: u32,
+        has_privilege: *mut Boolean,
+        reason: *mut u32,
+    ) -> HRESULT;
+    unsafe fn XUserResolvePrivilegeWithUiAsync(
+        &self,
+        user: u64,
+        options: u32,
+        privilege: u32,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT;
+    unsafe fn XUserResolvePrivilegeWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT;
+    unsafe fn XUserGetTokenAndSignatureAsync(
+        &self,
+        user: u64,
+        options: u32,
+        method: *const c_char,
+        url: *const c_char,
+        header_count: usize,
+        headers: *const XUserGetTokenAndSignatureHttpHeader,
+        body_size: usize,
+        body_buffer: *const c_void,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT;
+    unsafe fn XUserGetTokenAndSignatureResultSize(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XUserGetTokenAndSignatureResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: usize,
+        buffer: *mut c_void,
+        ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureData,
+        buffer_used: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XUserGetTokenAndSignatureUtf16Async(
+        &self,
+        user: u64,
+        options: u32,
+        method: *const u16,
+        url: *const u16,
+        header_count: usize,
+        headers: *const XUserGetTokenAndSignatureUtf16HttpHeader,
+        body_size: usize,
+        body_buffer: *const c_void,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT;
+    unsafe fn XUserGetTokenAndSignatureUtf16ResultSize(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XUserGetTokenAndSignatureUtf16Result(
+        &self,
+        async_: *mut XAsyncBlock,
+        buffer_size: usize,
+        buffer: *mut c_void,
+        ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureUtf16Data,
+        buffer_used: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XUserResolveIssueWithUiAsync(
+        &self,
+        user: u64,
+        url: *const c_char,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT;
+    unsafe fn XUserResolveIssueWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT;
+    unsafe fn XUserResolveIssueWithUiUtf16Async(
+        &self,
+        user: u64,
+        url: *const u16,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT;
+    unsafe fn XUserResolveIssueWithUiUtf16Result(&self, async_: *mut XAsyncBlock) -> HRESULT;
+    unsafe fn XUserRegisterForChangeEvent(
+        &self,
+        queue: XTaskQueueHandle,
+        context: *mut c_void,
+        callback: Option<XUserChangeEventCallback>,
+        token: *mut XTaskQueueRegistrationToken,
+    ) -> HRESULT;
+    unsafe fn XUserUnregisterForChangeEvent(
+        &self,
+        token: XTaskQueueRegistrationToken,
+        wait: Boolean,
+    ) -> Boolean;
+    unsafe fn XUserGetSignOutDeferral(&self, deferral: *mut u64) -> HRESULT;
+    unsafe fn XUserCloseSignOutDeferralHandle(&self, deferral: u64) -> ();
+}
+
+#[interface("eb9bf948-18dc-4d82-bbcc-40e0a809c4c0")]
+pub unsafe trait IXUserImpl2: IXUserImpl {
+    unsafe fn XUserAddByIdWithUiAsync(&self, user_id: u64, async_: *mut XAsyncBlock) -> HRESULT;
+    unsafe fn XUserAddByIdWithUiResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        new_user: *mut u64,
+    ) -> HRESULT;
+}
+
+#[interface("1bf2f8c5-d507-4e52-bb05-f726d0e71161")]
+pub unsafe trait IXUserImpl3: IXUserImpl2 {
+    unsafe fn XUserGetMsaTokenSilentlyAsync(
+        &self,
+        user: u64,
+        options: u32,
+        scope: *const c_char,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT;
+    unsafe fn XUserGetMsaTokenSilentlyResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        result_token_size: usize,
+        result_token: *mut c_char,
+        result_token_used: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XUserGetMsaTokenSilentlyResultSize(
+        &self,
+        async_: *mut XAsyncBlock,
+        token_size: *mut usize,
+    ) -> HRESULT;
+}
+
+#[interface("079415e3-6727-437f-8e9d-8f8f9b2439f7")]
+pub unsafe trait IXUserImpl4: IXUserImpl3 {
+    unsafe fn XUserIsStoreUser(&self, user: u64) -> Boolean;
+}
+
+#[interface("26f3c674-a2fe-44fa-b6c4-a323bc94ff53")]
+pub unsafe trait IXUserImpl5: IXUserImpl4 {
+    pub unsafe fn XUserPlatformRemoteConnectSetEventHandlers(
+        &self,
+        queue: XTaskQueueHandle,
+        handlers: *const XUserPlatformRemoteConnectEventHandlers,
+    ) -> HRESULT;
+    unsafe fn XUserPlatformRemoteConnectCancelPrompt(&self, operation: u64) -> HRESULT;
+    unsafe fn XUserPlatformSpopPromptSetEventHandlers(
+        &self,
+        queue: XTaskQueueHandle,
+        handler: Option<XUserPlatformSpopPromptEventHandler>,
+        context: *mut c_void,
+    ) -> HRESULT;
+    unsafe fn XUserPlatformSpopPromptComplete(&self, operation: u64, result: u32) -> HRESULT;
+}
+
+#[interface("5131d685-4394-4ee6-8c18-bfb5d4aef1ff")]
+pub unsafe trait IXUserImpl6: IXUserImpl5 {
+    unsafe fn XUserIsSignOutPresent(&self) -> Boolean;
+    unsafe fn XUserSignOutAsync(&self, user: u64, async_: *mut XAsyncBlock) -> HRESULT;
+    unsafe fn XUserSignOutResult(&self, async_: *mut XAsyncBlock) -> HRESULT;
+}
+
+#[interface("cef4fac0-7676-4a94-a119-4c43f9eb5b74")]
+pub unsafe trait IXUserGamertagImpl: IUnknown {
+    unsafe fn XUserGetGamertag(
+        &self,
+        user: u64,
+        component: u32,
+        gamertag_size: usize,
+        gamertag: *mut c_char,
+        gamertag_used: *mut usize,
+    ) -> HRESULT;
+}
+
+#[implement(
+    IXUserImpl,
+    IXUserImpl2,
+    IXUserImpl3,
+    IXUserImpl4,
+    IXUserImpl5,
+    IXUserImpl6,
+    IXUserGamertagImpl
+)]
+pub struct XUserObject;
+
+impl IXUserImpl_Impl for XUserObject_Impl {
+    unsafe fn XUserDuplicateHandle(&self, handle: u64, duplicated_handle: *mut u64) -> HRESULT {
+        if duplicated_handle.is_null() {
+            return E_POINTER;
+        }
+        let Some(user) = (unsafe { UserHandleTable::get(handle) }) else {
+            return E_INVALIDARG;
+        };
+        unsafe { *duplicated_handle = UserHandleTable::create(user) };
+        S_OK
+    }
+
+    unsafe fn XUserCloseHandle(&self, user: u64) {
+        unsafe { UserHandleTable::close(user) };
+    }
+
+    unsafe fn XUserCompare(&self, user1: u64, user2: u64) -> i32 {
+        let a = unsafe { UserHandleTable::get(user1) };
+        let b = unsafe { UserHandleTable::get(user2) };
+        match (a, b) {
+            (None, None) => 0,
+            (Some(a), Some(b)) if Arc::ptr_eq(&a, &b) => 0,
+            _ => 1,
+        }
+    }
+
+    unsafe fn XUserGetMaxUsers(&self, max_users: *mut u32) -> HRESULT {
+        if max_users.is_null() {
+            return E_POINTER;
+        }
+        // WineGDK's XUser.c hardcodes the same value: one local, non-guest user at a
+        // time. Matches the "single local user" scope this milestone targets.
+        unsafe { *max_users = 1 };
+        S_OK
+    }
+
+    unsafe fn XUserAddAsync(&self, _options: u32, async_: *mut XAsyncBlock) -> HRESULT {
+        // TODO(Phase 1 remainder / Phase 3): silent sign-in from xodus-service's stored
+        // credentials via xgameruntime-rs/src/ipc.rs, then UI-driven sign-in if the
+        // options allow it and nothing is stored. Neither exists yet.
+        unsafe {
+            xasync::run_sync(async_.cast(), move || -> Result<u64, HRESULT> {
+                Err(E_NOTIMPL)
+            })
+        }
+    }
+
+    unsafe fn XUserAddResult(&self, async_: *mut XAsyncBlock, new_user: *mut u64) -> HRESULT {
+        if new_user.is_null() {
+            return E_POINTER;
+        }
+        match unsafe { xasync::get_result(async_, std::ptr::null(), new_user) } {
+            Ok(()) => S_OK,
+            Err(hr) => hr,
+        }
+    }
+
+    unsafe fn XUserGetLocalId(&self, user: u64, user_local_id: *mut XUserLocalId) -> HRESULT {
+        if user_local_id.is_null() {
+            return E_POINTER;
+        }
+        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+            return E_INVALIDARG;
+        };
+        unsafe { *user_local_id = user.local_id };
+        S_OK
+    }
+
+    unsafe fn XUserFindUserByLocalId(
+        &self,
+        user_local_id: XUserLocalId,
+        handle: *mut u64,
+    ) -> HRESULT {
+        if handle.is_null() {
+            return E_POINTER;
+        }
+        let registry = USER_REGISTRY.lock().expect("user registry poisoned");
+        let Some(user) = registry
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|user| user.local_id == user_local_id)
+        else {
+            unsafe { *handle = 0 };
+            return E_INVALIDARG;
+        };
+        unsafe { *handle = UserHandleTable::create(user) };
+        S_OK
+    }
+
+    unsafe fn XUserGetId(&self, user: u64, user_id: *mut u64) -> HRESULT {
+        if user_id.is_null() {
+            return E_POINTER;
+        }
+        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+            return E_INVALIDARG;
+        };
+        unsafe { *user_id = user.user_id };
+        S_OK
+    }
+
+    unsafe fn XUserFindUserById(&self, user_id: u64, handle: *mut u64) -> HRESULT {
+        if handle.is_null() {
+            return E_POINTER;
+        }
+        let registry = USER_REGISTRY.lock().expect("user registry poisoned");
+        let Some(user) = registry
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|user| user.user_id == user_id)
+        else {
+            unsafe { *handle = 0 };
+            return E_INVALIDARG;
+        };
+        unsafe { *handle = UserHandleTable::create(user) };
+        S_OK
+    }
+
+    unsafe fn XUserGetIsGuest(&self, user: u64, is_guest: *mut Boolean) -> HRESULT {
+        if is_guest.is_null() {
+            return E_POINTER;
+        }
+        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+            return E_INVALIDARG;
+        };
+        unsafe { *is_guest = if user.is_guest { TRUE } else { FALSE } };
+        S_OK
+    }
+
+    unsafe fn XUserGetState(&self, user: u64, state: *mut u32) -> HRESULT {
+        if state.is_null() {
+            return E_POINTER;
+        }
+        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+            return E_INVALIDARG;
+        };
+        let value = *user.state.lock().expect("user state poisoned");
+        unsafe { *state = value as u32 };
+        S_OK
+    }
+
+    unsafe fn __padding__(&self) -> HRESULT {
+        E_NOTIMPL
+    }
+
+    hresult_stub! {
+        unsafe fn XUserGetGamerPictureAsync(&self, user: u64, picture_size: u32, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserGetGamerPictureResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
+        unsafe fn XUserGetGamerPictureResult(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, buffer_used: *mut usize) -> HRESULT;
+        unsafe fn XUserGetAgeGroup(&self, user: u64, age_group: *mut u32) -> HRESULT;
+        unsafe fn XUserGetTokenAndSignatureAsync(&self, user: u64, options: u32, method: *const c_char, url: *const c_char, header_count: usize, headers: *const XUserGetTokenAndSignatureHttpHeader, body_size: usize, body_buffer: *const c_void, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserGetTokenAndSignatureResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
+        unsafe fn XUserGetTokenAndSignatureResult(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureData, buffer_used: *mut usize) -> HRESULT;
+        unsafe fn XUserGetTokenAndSignatureUtf16Async(&self, user: u64, options: u32, method: *const u16, url: *const u16, header_count: usize, headers: *const XUserGetTokenAndSignatureUtf16HttpHeader, body_size: usize, body_buffer: *const c_void, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserGetTokenAndSignatureUtf16ResultSize(&self, async_: *mut XAsyncBlock, buffer_size: *mut usize) -> HRESULT;
+        unsafe fn XUserGetTokenAndSignatureUtf16Result(&self, async_: *mut XAsyncBlock, buffer_size: usize, buffer: *mut c_void, ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureUtf16Data, buffer_used: *mut usize) -> HRESULT;
+        unsafe fn XUserResolveIssueWithUiAsync(&self, user: u64, url: *const c_char, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserResolveIssueWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserResolveIssueWithUiUtf16Async(&self, user: u64, url: *const u16, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserResolveIssueWithUiUtf16Result(&self, async_: *mut XAsyncBlock) -> HRESULT;
+    }
+
+    unsafe fn XUserCheckPrivilege(
+        &self,
+        user: u64,
+        _options: u32,
+        _privilege: u32,
+        has_privilege: *mut Boolean,
+        reason: *mut u32,
+    ) -> HRESULT {
+        if has_privilege.is_null() {
+            return E_POINTER;
+        }
+        if (unsafe { UserHandleTable::get(user) }).is_none() {
+            return E_INVALIDARG;
+        }
+        // PLAN.md Phase 3: "grant the common privileges initially". Real per-privilege
+        // answers need XSTS display claims, which need the IPC client.
+        unsafe { *has_privilege = TRUE };
+        if !reason.is_null() {
+            unsafe { *reason = 0 }; // XUserPrivilegeDenyReason_None
+        }
+        S_OK
+    }
+
+    unsafe fn XUserResolvePrivilegeWithUiAsync(
+        &self,
+        _user: u64,
+        _options: u32,
+        _privilege: u32,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT {
+        // Every privilege is already granted, so there is nothing to resolve.
+        unsafe { xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> { Ok(()) }) }
+    }
+
+    unsafe fn XUserResolvePrivilegeWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
+        match unsafe { xasync::get_result::<()>(async_, std::ptr::null(), &mut () as *mut ()) } {
+            Ok(()) => S_OK,
+            Err(hr) => hr,
+        }
+    }
+
+    unsafe fn XUserRegisterForChangeEvent(
+        &self,
+        _queue: XTaskQueueHandle,
+        context: *mut c_void,
+        callback: Option<XUserChangeEventCallback>,
+        token: *mut XTaskQueueRegistrationToken,
+    ) -> HRESULT {
+        let Some(callback) = callback else {
+            return E_POINTER;
+        };
+        if token.is_null() {
+            return E_POINTER;
+        }
+        let raw = register_change_event(context, callback);
+        unsafe { *token = XTaskQueueRegistrationToken { token: raw } };
+        S_OK
+    }
+
+    unsafe fn XUserUnregisterForChangeEvent(
+        &self,
+        token: XTaskQueueRegistrationToken,
+        _wait: Boolean,
+    ) -> Boolean {
+        if unregister_change_event(token.token) {
+            TRUE
+        } else {
+            FALSE
+        }
+    }
+
+    unsafe fn XUserGetSignOutDeferral(&self, deferral: *mut u64) -> HRESULT {
+        if deferral.is_null() {
+            return E_POINTER;
+        }
+        // No sign-out is ever in flight yet (XUserSignOutAsync is a no-op below), so a
+        // deferral has nothing to defer. A distinct nonzero handle, not zero, so a caller
+        // that checks the handle for validity before closing it isn't misled.
+        unsafe { *deferral = 1 };
+        S_OK
+    }
+
+    unsafe fn XUserCloseSignOutDeferralHandle(&self, _deferral: u64) {}
+}
+
+impl IXUserImpl2_Impl for XUserObject_Impl {
+    hresult_stub! {
+        unsafe fn XUserAddByIdWithUiAsync(&self, user_id: u64, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserAddByIdWithUiResult(&self, async_: *mut XAsyncBlock, new_user: *mut u64) -> HRESULT;
+    }
+}
+
+impl IXUserImpl3_Impl for XUserObject_Impl {
+    hresult_stub! {
+        unsafe fn XUserGetMsaTokenSilentlyAsync(&self, user: u64, options: u32, scope: *const c_char, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserGetMsaTokenSilentlyResult(&self, async_: *mut XAsyncBlock, result_token_size: usize, result_token: *mut c_char, result_token_used: *mut usize) -> HRESULT;
+        unsafe fn XUserGetMsaTokenSilentlyResultSize(&self, async_: *mut XAsyncBlock, token_size: *mut usize) -> HRESULT;
+    }
+}
+
+impl IXUserImpl4_Impl for XUserObject_Impl {
+    boolean_stub! {
+        unsafe fn XUserIsStoreUser(&self, user: u64) -> Boolean;
+    }
+}
+
+impl IXUserImpl5_Impl for XUserObject_Impl {
+    unsafe fn XUserPlatformRemoteConnectSetEventHandlers(
+        &self,
+        _queue: XTaskQueueHandle,
+        handlers: *const XUserPlatformRemoteConnectEventHandlers,
+    ) -> HRESULT {
+        if handlers.is_null() {
+            return E_POINTER;
+        }
+        let mut registry = REMOTE_CONNECT_HANDLERS
+            .lock()
+            .expect("remote connect handlers poisoned");
+        *registry = Some(unsafe {
+            RemoteConnectHandlers {
+                show: (*handlers).show,
+                close: (*handlers).close,
+                context: (*handlers).context,
+            }
+        });
+        S_OK
+    }
+
+    unsafe fn XUserPlatformRemoteConnectCancelPrompt(&self, _operation: u64) -> HRESULT {
+        if let Some(handlers) = REMOTE_CONNECT_HANDLERS
+            .lock()
+            .expect("remote connect handlers poisoned")
+            .as_ref()
+            && let Some(close) = handlers.close
+        {
+            unsafe { close() };
+        }
+        S_OK
+    }
+
+    hresult_stub! {
+        unsafe fn XUserPlatformSpopPromptSetEventHandlers(&self, queue: XTaskQueueHandle, handler: Option<XUserPlatformSpopPromptEventHandler>, context: *mut c_void) -> HRESULT;
+        unsafe fn XUserPlatformSpopPromptComplete(&self, operation: u64, result: u32) -> HRESULT;
+    }
+}
+
+impl IXUserImpl6_Impl for XUserObject_Impl {
+    unsafe fn XUserIsSignOutPresent(&self) -> Boolean {
+        FALSE
+    }
+
+    unsafe fn XUserSignOutAsync(&self, user: u64, async_: *mut XAsyncBlock) -> HRESULT {
+        // Nothing is really signed in yet (see XUserAddAsync), so there is nothing to
+        // tear down - but a stale/invalid handle is still a real error, not a no-op.
+        if (unsafe { UserHandleTable::get(user) }).is_none() {
+            return E_INVALIDARG;
+        }
+        unsafe { xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> { Ok(()) }) }
+    }
+
+    unsafe fn XUserSignOutResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
+        match unsafe { xasync::get_result::<()>(async_, std::ptr::null(), &mut () as *mut ()) } {
+            Ok(()) => S_OK,
+            Err(hr) => hr,
+        }
+    }
+}
+
+impl IXUserGamertagImpl_Impl for XUserObject_Impl {
+    hresult_stub! {
+        unsafe fn XUserGetGamertag(&self, user: u64, component: u32, gamertag_size: usize, gamertag: *mut c_char, gamertag_used: *mut usize) -> HRESULT;
+    }
+}
+
+struct RemoteConnectHandlers {
+    show: Option<XUserPlatformRemoteConnectShowPromptEventHandler>,
+    close: Option<XUserPlatformRemoteConnectClosePromptEventHandler>,
+    context: *mut c_void,
+}
+
+unsafe impl Send for RemoteConnectHandlers {}
+unsafe impl Sync for RemoteConnectHandlers {}
+
+static REMOTE_CONNECT_HANDLERS: Mutex<Option<RemoteConnectHandlers>> = Mutex::new(None);
+
+// ---------------------------------------------------------------------------------------
+// IXUserDeviceImpl / IXUserDeviceImpl2
+// ---------------------------------------------------------------------------------------
+
+#[interface("7d824997-10dc-45ab-86b7-2737767c0bf1")]
+pub unsafe trait IXUserDeviceImpl: IUnknown {
+    unsafe fn XUserFindForDevice(
+        &self,
+        device_id: *const AppLocalDeviceId,
+        handle: *mut u64,
+    ) -> HRESULT;
+    unsafe fn XUserRegisterForDeviceAssociationChanged(
+        &self,
+        queue: XTaskQueueHandle,
+        context: *mut c_void,
+        callback: Option<XUserDeviceAssociationChangedCallback>,
+        token: *mut XTaskQueueRegistrationToken,
+    ) -> HRESULT;
+    unsafe fn XUserUnregisterForDeviceAssociationChanged(
+        &self,
+        token: XTaskQueueRegistrationToken,
+        wait: Boolean,
+    ) -> Boolean;
+    unsafe fn XUserGetDefaultAudioEndpointUtf16(
+        &self,
+        user: XUserLocalId,
+        kind: u32,
+        endpoint_id_utf16_count: usize,
+        endpoint_id_utf16: *mut u16,
+        endpoint_id_utf16_used: *mut usize,
+    ) -> HRESULT;
+    unsafe fn XUserRegisterForDefaultAudioEndpointUtf16Changed(
+        &self,
+        queue: XTaskQueueHandle,
+        context: *mut c_void,
+        callback: Option<XUserDefaultAudioEndpointUtf16ChangedCallback>,
+        token: *mut XTaskQueueRegistrationToken,
+    ) -> HRESULT;
+    unsafe fn XUserUnregisterForDefaultAudioEndpointUtf16Changed(
+        &self,
+        token: XTaskQueueRegistrationToken,
+        wait: Boolean,
+    ) -> Boolean;
+    unsafe fn XUserFindControllerForUserWithUiAsync(
+        &self,
+        user: u64,
+        async_: *mut XAsyncBlock,
+    ) -> HRESULT;
+    unsafe fn XUserFindControllerForUserWithUiResult(
+        &self,
+        async_: *mut XAsyncBlock,
+        device_id: *mut AppLocalDeviceId,
+    ) -> HRESULT;
+}
+
+#[interface("0cc6a956-e7e1-4fdf-9341-9d5da649ebc8")]
+pub unsafe trait IXUserDeviceImpl2: IXUserDeviceImpl {}
+
+#[implement(IXUserDeviceImpl, IXUserDeviceImpl2)]
+pub struct XUserDeviceObject;
+
+impl IXUserDeviceImpl_Impl for XUserDeviceObject_Impl {
+    unsafe fn XUserFindForDevice(
+        &self,
+        device_id: *const AppLocalDeviceId,
+        handle: *mut u64,
+    ) -> HRESULT {
+        if device_id.is_null() || handle.is_null() {
+            return E_POINTER;
+        }
+        // No controller-to-user association is modeled (Linux/Wine has no
+        // XInputGetControllerCapabilities-style user binding), so no device is ever
+        // associated with a user yet.
+        unsafe { *handle = 0 };
+        E_NOTIMPL
+    }
+
+    unsafe fn XUserRegisterForDeviceAssociationChanged(
+        &self,
+        _queue: XTaskQueueHandle,
+        _context: *mut c_void,
+        callback: Option<XUserDeviceAssociationChangedCallback>,
+        token: *mut XTaskQueueRegistrationToken,
+    ) -> HRESULT {
+        if callback.is_none() || token.is_null() {
+            return E_POINTER;
+        }
+        unsafe {
+            *token = XTaskQueueRegistrationToken {
+                token: NEXT_CHANGE_EVENT_TOKEN.fetch_add(1, Ordering::Relaxed),
+            }
+        };
+        S_OK
+    }
+
+    boolean_stub! {
+        unsafe fn XUserUnregisterForDeviceAssociationChanged(&self, token: XTaskQueueRegistrationToken, wait: Boolean) -> Boolean;
+    }
+
+    // Deliberately not implemented: WineGDK's own NOTES forbid stubbing audio-endpoint
+    // functionality (NDA'd), and these are the audio-device-selection slots.
+    hresult_stub! {
+        unsafe fn XUserGetDefaultAudioEndpointUtf16(&self, user: XUserLocalId, kind: u32, endpoint_id_utf16_count: usize, endpoint_id_utf16: *mut u16, endpoint_id_utf16_used: *mut usize) -> HRESULT;
+        unsafe fn XUserRegisterForDefaultAudioEndpointUtf16Changed(&self, queue: XTaskQueueHandle, context: *mut c_void, callback: Option<XUserDefaultAudioEndpointUtf16ChangedCallback>, token: *mut XTaskQueueRegistrationToken) -> HRESULT;
+        unsafe fn XUserFindControllerForUserWithUiAsync(&self, user: u64, async_: *mut XAsyncBlock) -> HRESULT;
+        unsafe fn XUserFindControllerForUserWithUiResult(&self, async_: *mut XAsyncBlock, device_id: *mut AppLocalDeviceId) -> HRESULT;
+    }
+
+    boolean_stub! {
+        unsafe fn XUserUnregisterForDefaultAudioEndpointUtf16Changed(&self, token: XTaskQueueRegistrationToken, wait: Boolean) -> Boolean;
+    }
+}
+
+impl IXUserDeviceImpl2_Impl for XUserDeviceObject_Impl {}
+
+// ---------------------------------------------------------------------------------------
+// Singletons
+// ---------------------------------------------------------------------------------------
+
+struct GlobalInterface<T>(T);
+
+unsafe impl<T> Send for GlobalInterface<T> {}
+unsafe impl<T> Sync for GlobalInterface<T> {}
+
+static XUSER_SINGLETON: OnceLock<GlobalInterface<IXUserImpl6>> = OnceLock::new();
+static XUSER_DEVICE_SINGLETON: OnceLock<GlobalInterface<IXUserDeviceImpl2>> = OnceLock::new();
+
+pub fn xuser_singleton() -> &'static IXUserImpl6 {
+    &XUSER_SINGLETON
+        .get_or_init(|| GlobalInterface(XUserObject.into()))
+        .0
+}
+
+pub fn xuser_device_singleton() -> &'static IXUserDeviceImpl2 {
+    &XUSER_DEVICE_SINGLETON
+        .get_or_init(|| GlobalInterface(XUserDeviceObject.into()))
+        .0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_user(local_id: u64, user_id: u64) -> Arc<UserState> {
+        Arc::new(UserState {
+            local_id: XUserLocalId { value: local_id },
+            user_id,
+            is_guest: false,
+            state: Mutex::new(XUserStateValue::SignedIn),
+        })
+    }
+
+    #[test]
+    fn max_users_is_one() {
+        let mut max = 0u32;
+        let hr = unsafe { xuser_singleton().XUserGetMaxUsers(&mut max) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(max, 1);
+    }
+
+    #[test]
+    fn duplicate_and_close_share_the_same_underlying_user() {
+        let user = make_user(1, 100);
+        let handle = UserHandleTable::create(user);
+
+        let mut dup = 0u64;
+        let hr = unsafe { xuser_singleton().XUserDuplicateHandle(handle, &mut dup) };
+        assert_eq!(hr, S_OK);
+        assert_ne!(dup, 0);
+        assert_ne!(dup, handle);
+        assert_eq!(unsafe { xuser_singleton().XUserCompare(handle, dup) }, 0);
+
+        unsafe { xuser_singleton().XUserCloseHandle(handle) };
+
+        // Closing one duplicate must not invalidate the other.
+        let mut id = 0u64;
+        let hr = unsafe { xuser_singleton().XUserGetId(dup, &mut id) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(id, 100);
+
+        unsafe { xuser_singleton().XUserCloseHandle(dup) };
+    }
+
+    #[test]
+    fn find_by_local_id_and_by_id_return_a_registered_user() {
+        let user = make_user(42, 4242);
+        register_user(&user);
+        let handle = UserHandleTable::create(user);
+
+        let mut found = 0u64;
+        let hr = unsafe {
+            xuser_singleton().XUserFindUserByLocalId(XUserLocalId { value: 42 }, &mut found)
+        };
+        assert_eq!(hr, S_OK);
+        assert_ne!(found, 0);
+        unsafe { xuser_singleton().XUserCloseHandle(found) };
+
+        let mut found_by_id = 0u64;
+        let hr = unsafe { xuser_singleton().XUserFindUserById(4242, &mut found_by_id) };
+        assert_eq!(hr, S_OK);
+        assert_ne!(found_by_id, 0);
+        unsafe { xuser_singleton().XUserCloseHandle(found_by_id) };
+
+        unsafe { xuser_singleton().XUserCloseHandle(handle) };
+    }
+
+    #[test]
+    fn is_guest_and_state_reflect_the_backing_user() {
+        let user = Arc::new(UserState {
+            local_id: XUserLocalId { value: 7 },
+            user_id: 700,
+            is_guest: true,
+            state: Mutex::new(XUserStateValue::SigningOut),
+        });
+        let handle = UserHandleTable::create(user);
+
+        let mut is_guest = 0u8;
+        let hr = unsafe { xuser_singleton().XUserGetIsGuest(handle, &mut is_guest) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(is_guest, TRUE);
+
+        let mut state = 0u32;
+        let hr = unsafe { xuser_singleton().XUserGetState(handle, &mut state) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(state, XUserStateValue::SigningOut as u32);
+
+        unsafe { xuser_singleton().XUserCloseHandle(handle) };
+    }
+
+    #[test]
+    fn change_event_registration_round_trips() {
+        unsafe extern "system" fn cb(_context: *mut c_void, _local_id: XUserLocalId, _event: u32) {}
+
+        let mut token = XTaskQueueRegistrationToken::default();
+        let hr = unsafe {
+            xuser_singleton().XUserRegisterForChangeEvent(
+                0,
+                std::ptr::null_mut(),
+                Some(cb),
+                &mut token,
+            )
+        };
+        assert_eq!(hr, S_OK);
+        assert_ne!(token.token, 0);
+
+        assert_eq!(
+            unsafe { xuser_singleton().XUserUnregisterForChangeEvent(token, FALSE) },
+            TRUE
+        );
+        // Unregistering an already-removed token reports failure, not a duplicate success.
+        assert_eq!(
+            unsafe { xuser_singleton().XUserUnregisterForChangeEvent(token, FALSE) },
+            FALSE
+        );
+    }
+
+    #[test]
+    fn a_zero_handle_is_rejected_not_silently_accepted() {
+        // Matches task_queue::QueueHandle: a nonzero handle is trusted as one the game
+        // actually got back from us, but zero ("no handle") must not be treated as valid.
+        let mut id = 0u64;
+        assert_eq!(
+            unsafe { xuser_singleton().XUserGetId(0, &mut id) },
+            E_INVALIDARG
+        );
+    }
+
+    #[test]
+    fn max_devices_lookup_reports_not_implemented_without_a_binding() {
+        let device_id = AppLocalDeviceId { value: [0u8; 32] };
+        let mut handle = 0u64;
+        let hr = unsafe { xuser_device_singleton().XUserFindForDevice(&device_id, &mut handle) };
+        assert_eq!(hr, E_NOTIMPL);
+        assert_eq!(handle, 0);
+    }
+}
