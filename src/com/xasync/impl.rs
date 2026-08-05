@@ -11,8 +11,8 @@
 //! The runtime's job is the bookkeeping around that: parking the per-call state, running
 //! `DoWork` on the queue's work port, delivering the caller's completion callback on its
 //! completion port, and handing back the result exactly once. `DoWork` returning
-//! `E_PENDING` means "not finished, I will schedule myself again", which is what lets a
-//! blocking call be resumed across several `DoWork` passes (see [`run_sync`]).
+//! `E_PENDING` means "not finished, I will schedule myself again", which is how a provider
+//! that cannot answer in one pass keeps its place in the queue.
 //!
 //! ## Where the state lives
 //!
@@ -22,7 +22,18 @@
 //! the heap-allocated [`AsyncState`]. The signature is what lets a stale or
 //! never-started block be rejected instead of dereferenced.
 
-use std::collections::{HashMap, HashSet};
+use super::core as async_core;
+use super::task_queue::{
+    self, DispatchMode, MonitorCallback, PortHandle, PortKind, Queue, QueueHandle, TaskCallback,
+    TerminatedCallback,
+};
+use super::{IXAsync, IXAsync_Impl, XAsyncBlock, XAsyncOp, XAsyncProviderData};
+use crate::results::*;
+use async_core::{
+    AsyncState, Inner, block_name, cleanup, complete_state, current_identity, is_lhc_internal,
+    name_block, queue_for, state_of, work_callback, write_internal,
+};
+
 use std::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -31,305 +42,10 @@ use std::time::Duration;
 use windows_core::{HRESULT, implement};
 use windows_sys::core::BOOL;
 
-use crate::results::*;
-use crate::task_queue::{
-    self, DispatchMode, MonitorCallback, PortHandle, PortKind, Queue, QueueHandle, TaskCallback,
-    TerminatedCallback,
-};
-use crate::xasync::{
-    IXAsync, IXAsync_Impl, XAsyncBlock, XAsyncCompletionRoutine, XAsyncOp, XAsyncProviderData,
-};
-
 type XAsyncProvider =
     unsafe extern "system" fn(op: XAsyncOp, data: *const XAsyncProviderData) -> HRESULT;
 /// `HRESULT CALLBACK (*)(XAsyncBlock*)`, the simplified provider `XAsyncRun` takes.
 type XAsyncWork = unsafe extern "system" fn(async_block: *mut XAsyncBlock) -> HRESULT;
-
-/// Marks `XAsyncBlock::internal` as belonging to a live call of ours.
-const SIGNATURE: u64 = 0x584153594e435f31; // "XASYNC_1"
-
-struct Inner {
-    /// `E_PENDING` until `XAsyncComplete`.
-    status: HRESULT,
-    result_size: usize,
-    canceled: bool,
-    /// Set once the provider has been sent `Cleanup`, so it happens exactly once.
-    cleaned_up: bool,
-}
-
-struct AsyncState {
-    provider: XAsyncProvider,
-    context: *mut c_void,
-    /// An opaque tag the caller passes to `XAsyncGetResult` to prove it is asking the
-    /// API that actually started the call.
-    identity: *mut c_void,
-    queue: Arc<Queue>,
-    block: *mut XAsyncBlock,
-    inner: Mutex<Inner>,
-    /// Signalled on completion, for `XAsyncGetStatus(wait: true)`.
-    completed: Condvar,
-}
-
-// The block and the provider context belong to the caller, who is responsible for
-// keeping them alive for the duration of the call; the GDK contract explicitly allows
-// the runtime to touch them from its own threads.
-unsafe impl Send for AsyncState {}
-unsafe impl Sync for AsyncState {}
-
-impl AsyncState {
-    fn provider_data(&self, buffer: *mut c_void, buffer_size: usize) -> XAsyncProviderData {
-        XAsyncProviderData {
-            async_: self.block,
-            bufferSize: buffer_size,
-            buffer,
-            context: self.context,
-        }
-    }
-
-    fn invoke(&self, op: XAsyncOp, buffer: *mut c_void, buffer_size: usize) -> HRESULT {
-        let data = self.provider_data(buffer, buffer_size);
-        unsafe { (self.provider)(op, &data) }
-    }
-}
-
-/// Read the state pointer out of a block without taking ownership of it.
-///
-/// # Safety
-/// `block` must be null or point at a valid `XAsyncBlock`.
-unsafe fn state_of(block: *mut XAsyncBlock) -> Option<Arc<AsyncState>> {
-    let block = unsafe { block.as_mut() }?;
-    let (signature, pointer) = read_internal(block);
-    if signature != SIGNATURE || pointer.is_null() {
-        return None;
-    }
-    let state = unsafe { Arc::from_raw(pointer) };
-    // The block keeps its reference; hand the caller a new one.
-    let clone = state.clone();
-    std::mem::forget(state);
-    Some(clone)
-}
-
-/// Diagnostic-only: block pointer -> the `identityName` the caller supplied to
-/// `XAsyncBegin`, so completion/DoWork diag can say *which* API an async belonged to.
-static BLOCK_NAMES: Mutex<Option<HashMap<usize, &'static str>>> = Mutex::new(None);
-/// Interns an `identityName` so the registry above can hold a `&'static str` without
-/// leaking a fresh allocation per `XAsyncBegin`. Titles reuse a small fixed set of names
-/// (one per XSAPI entry point), and a busy session calls `XAsyncBegin` tens of thousands of
-/// times, so interning turns an unbounded leak into a bounded one.
-fn intern(name: &str) -> &'static str {
-    static NAMES: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
-    let mut names = NAMES.lock().expect("name interner poisoned");
-    let names = names.get_or_insert_with(HashSet::new);
-    if let Some(interned) = names.get(name) {
-        return interned;
-    }
-    let interned: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    names.insert(interned);
-    interned
-}
-
-fn name_block(block: *mut XAsyncBlock, name: &'static str) {
-    BLOCK_NAMES
-        .lock()
-        .expect("block-name registry poisoned")
-        .get_or_insert_with(HashMap::new)
-        .insert(block as usize, name);
-}
-fn block_name(block: *mut XAsyncBlock) -> Option<String> {
-    BLOCK_NAMES
-        .lock()
-        .expect("block-name registry poisoned")
-        .as_ref()?
-        .get(&(block as usize))
-        .map(|s| s.to_string())
-}
-
-// Per-thread "which XSAPI/game async is currently running on this thread" — set while a
-// completion callback or DoWork is executing, so a libHttpClient sub-call created inside
-// it can be attributed to the exact parent XSAPI API that triggered it.
-thread_local! {
-    static CURRENT_IDENTITY: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-fn current_identity() -> Option<String> {
-    CURRENT_IDENTITY.with(|c| c.borrow().clone())
-}
-fn set_current_identity(name: Option<String>) {
-    CURRENT_IDENTITY.with(|c| *c.borrow_mut() = name);
-}
-/// libHttpClient-internal asyncs (the sub-calls we want to attribute to a parent XSAPI API).
-fn is_lhc_internal(name: &str) -> bool {
-    name.starts_with("HC_") || name.contains("httpclient") || name == "run_async"
-}
-
-/// Detach the state from the block, taking the block's reference with it.
-unsafe fn take_state(block: *mut XAsyncBlock) -> Option<Arc<AsyncState>> {
-    let block = unsafe { block.as_mut() }?;
-    let (signature, pointer) = read_internal(block);
-    if signature != SIGNATURE || pointer.is_null() {
-        return None;
-    }
-    block.internal.fill(0);
-    Some(unsafe { Arc::from_raw(pointer) })
-}
-
-fn read_internal(block: &XAsyncBlock) -> (u64, *const AsyncState) {
-    let mut signature = [0u8; 8];
-    let mut pointer = [0u8; 8];
-    signature.copy_from_slice(&block.internal[0..8]);
-    pointer.copy_from_slice(&block.internal[8..16]);
-    (
-        u64::from_ne_bytes(signature),
-        usize::from_ne_bytes(pointer) as *const AsyncState,
-    )
-}
-
-fn write_internal(block: &mut XAsyncBlock, state: *const AsyncState) {
-    block.internal.fill(0);
-    block.internal[0..8].copy_from_slice(&SIGNATURE.to_ne_bytes());
-    block.internal[8..16].copy_from_slice(&(state as usize).to_ne_bytes());
-}
-
-/// Send the provider `Cleanup` and release the state. Idempotent, because both
-/// `XAsyncGetResult` and the void-result path in `XAsyncGetStatus` can reach it.
-fn cleanup(state: &Arc<AsyncState>) {
-    {
-        let mut inner = state.inner.lock().expect("async state poisoned");
-        if inner.cleaned_up {
-            return;
-        }
-        inner.cleaned_up = true;
-    }
-    let _ = state.invoke(XAsyncOp::Cleanup, std::ptr::null_mut(), 0);
-    // Drops the block's reference; any callback still holding one keeps the allocation
-    // alive until it returns.
-    unsafe { take_state(state.block) };
-}
-
-/// Runs on the work port. One `DoWork` pass.
-unsafe extern "system" fn work_callback(context: *mut c_void, canceled: bool) {
-    let state = unsafe { Arc::from_raw(context as *const AsyncState) };
-    let name = block_name(state.block);
-    eprintln!(
-        "[diag] work_callback (DoWork dispatch) name={name:?} block={:p} canceled={canceled}",
-        state.block
-    );
-
-    if canceled {
-        complete_state(&state, E_ABORT, 0);
-        return;
-    }
-
-    let prev = current_identity();
-    set_current_identity(name.clone());
-    let hr = state.invoke(XAsyncOp::DoWork, std::ptr::null_mut(), 0);
-    set_current_identity(prev);
-    if hr == E_PENDING {
-        // The provider will schedule itself again; this is the future-polling path.
-        return;
-    }
-    if hr != S_OK {
-        eprintln!(
-            "[diag] provider DoWork returned non-pending {hr:?} for block={:p} (completing with it)",
-            state.block
-        );
-    }
-    // Anything else means the provider is done. Well-behaved ones have already called
-    // XAsyncComplete, in which case this is a no-op; the rest get completed for them so
-    // a failing provider cannot leave the call hanging forever.
-    complete_state(&state, hr, 0);
-}
-
-/// Runs on the completion port: hand the call back to the game.
-struct Completion {
-    state: Arc<AsyncState>,
-    callback: XAsyncCompletionRoutine,
-}
-
-unsafe extern "system" fn completion_callback(context: *mut c_void, _canceled: bool) {
-    let completion = unsafe { Box::from_raw(context as *mut Completion) };
-    eprintln!(
-        "[diag] completion_callback invoking game callback for block={:p}",
-        completion.state.block
-    );
-    let name = block_name(completion.state.block);
-    let prev = current_identity();
-    set_current_identity(name);
-    unsafe { (completion.callback)(completion.state.block) };
-    set_current_identity(prev);
-}
-
-fn complete_state(state: &Arc<AsyncState>, result: HRESULT, required_buffer_size: usize) {
-    eprintln!(
-        "[diag] complete_state block={:p} result={result:?} size={required_buffer_size}",
-        state.block
-    );
-    {
-        let mut inner = state.inner.lock().expect("async state poisoned");
-        if result == E_ABORT {
-            eprintln!(
-                "[diag] E_ABORT completion block={:p} canceled_flag={}",
-                state.block, inner.canceled
-            );
-        }
-        if inner.status != E_PENDING {
-            // Already completed. Providers routinely both call XAsyncComplete and return
-            // a status from DoWork, so this is the normal path, not an error.
-            eprintln!(
-                "[diag] complete_state block={:p} already completed with status={:?}, ignoring",
-                state.block, inner.status
-            );
-            return;
-        }
-        inner.status = result;
-        inner.result_size = required_buffer_size;
-    }
-    // Read the callback out now, while the block is certainly still alive. Deferring
-    // the read to the completion port would be a use-after-free for the common case of
-    // a block with no callback: its owner is entitled to wait on XAsyncGetStatus and
-    // then drop the block, and with nothing to invoke there is no reason to touch it
-    // again at all.
-    let callback = unsafe { state.block.as_ref() }.and_then(|block| block.callback);
-    state.completed.notify_all();
-
-    let Some(callback) = callback else {
-        eprintln!(
-            "[diag] complete_state block={:p} has no callback set, relying on polling",
-            state.block
-        );
-        return;
-    };
-    let context = Box::into_raw(Box::new(Completion {
-        state: state.clone(),
-        callback,
-    })) as *mut c_void;
-    let submitted = state.queue.submit(
-        PortKind::Completion,
-        context,
-        completion_callback,
-        Duration::ZERO,
-    );
-    eprintln!(
-        "[diag] complete_state block={:p} submitted completion callback to queue: {submitted} completion_port_mode={:?} queue_ptr={:p}",
-        state.block,
-        state.queue.port(PortKind::Completion).mode(),
-        Arc::as_ptr(&state.queue)
-    );
-    if !submitted {
-        // The completion port is gone. The game still has to hear about the call, so
-        // deliver it here rather than dropping it on the floor.
-        unsafe { completion_callback(context, true) };
-    }
-}
-
-fn queue_for(block: &XAsyncBlock) -> Option<Arc<Queue>> {
-    if block.queue.is_null() {
-        // A block that names no queue uses the process queue, which is what makes the
-        // common `XAsyncBlock { queue: null, .. }` in sample code work.
-        return Some(task_queue::default_process_queue());
-    }
-    QueueHandle::get(block.queue as u64)
-}
 
 #[implement(IXAsync)]
 pub struct XAsyncObject;
@@ -346,7 +62,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let block = async_block as *mut XAsyncBlock;
         if !identity_name.is_null() {
             let name = unsafe { std::ffi::CStr::from_ptr(identity_name) }.to_string_lossy();
-            let name = intern(&name);
+            let name = async_core::intern(&name);
             name_block(block, name);
             if task_queue::diag() {
                 eprintln!("[diag] XAsyncBegin name={name:?} block={block:p}");
@@ -397,15 +113,13 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             // same effect the wrapper's temporary FIXQ injection had, but natively.
             let handle = task_queue::process_queue_handle();
             block_ref.queue = handle as *mut c_void;
-            eprintln!(
-                "[diag] XAsyncBegin BACKFILL block={block:p} queue=0 -> handle={handle:#x}"
-            );
+            eprintln!("[diag] XAsyncBegin BACKFILL block={block:p} queue=0 -> handle={handle:#x}");
         } else if queue.port(PortKind::Work).mode() == DispatchMode::Manual
             && !task_queue::is_process_queue(&queue)
         {
             // The game only ever dispatches the process task queue (its render/UI thread
             // pumps exactly one queue). Any other queue with a Manual work port is never
-            // pumped under WineGDK, so a block parked there would never run its DoWork
+            // pumped under Wine, so a block parked there would never run its DoWork
             // (e.g. libHttpClient's SocialManager decoration HTTP call hangs, leaving the
             // friends list empty). Route it through the pumped process queue instead,
             // exactly like the NULL-queue BACKFILL above.
@@ -714,7 +428,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let Some(out) = (unsafe { queue.as_mut() }) else {
             return E_POINTER;
         };
-        let (Some(work), Some(completion)) = (PortHandle::get(work_port), PortHandle::get(completion_port))
+        let (Some(work), Some(completion)) =
+            (PortHandle::get(work_port), PortHandle::get(completion_port))
         else {
             return E_INVALIDARG;
         };
@@ -734,9 +449,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let Some(out) = (unsafe { port_handle.as_mut() }) else {
             return E_POINTER;
         };
-        let (Some(queue), Some(kind)) =
-            (QueueHandle::get(queue), PortKind::from_raw(port))
-        else {
+        let (Some(queue), Some(kind)) = (QueueHandle::get(queue), PortKind::from_raw(port)) else {
             return E_INVALIDARG;
         };
         *out = PortHandle::create(queue.port(kind).clone());
@@ -787,9 +500,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             queue,
             port
         );
-        let (Some(queue), Some(kind)) =
-            (QueueHandle::get(queue), PortKind::from_raw(port))
-        else {
+        let (Some(queue), Some(kind)) = (QueueHandle::get(queue), PortKind::from_raw(port)) else {
             eprintln!(
                 "[diag {:?}] XTaskQueueDispatch bad handle/port, bailing",
                 std::thread::current().id()
@@ -827,9 +538,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         if callback.is_null() {
             return E_POINTER;
         }
-        let (Some(queue), Some(kind)) =
-            (QueueHandle::get(queue), PortKind::from_raw(port))
-        else {
+        let (Some(queue), Some(kind)) = (QueueHandle::get(queue), PortKind::from_raw(port)) else {
             return E_INVALIDARG;
         };
         let callback: TaskCallback = unsafe { std::mem::transmute(callback) };
@@ -867,9 +576,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         if callback.is_null() {
             return E_POINTER;
         }
-        let (Some(queue), Some(kind)) =
-            (QueueHandle::get(queue), PortKind::from_raw(port))
-        else {
+        let (Some(queue), Some(kind)) = (QueueHandle::get(queue), PortKind::from_raw(port)) else {
             return E_INVALIDARG;
         };
         let callback: TaskCallback = unsafe { std::mem::transmute(callback) };
@@ -1040,7 +747,6 @@ unsafe extern "system" fn run_provider(op: XAsyncOp, data: *const XAsyncProvider
     }
 }
 
-/// `XTaskQueueRegisterWaiter`: bridge a Win32 wait handle to a queued callback.
 mod waiter {
     use super::*;
     use windows::handleapi::CloseHandle;
@@ -1122,9 +828,9 @@ mod waiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_core::Interface;
-    use crate::xasync::{self, XAsyncBlock, get_result, get_result_size, get_status, run_sync};
+    use crate::com::xasync::{XAsyncBlock, get_result, get_result_size, get_status, run_sync};
     use std::sync::atomic::AtomicUsize;
+    use windows_core::Interface;
 
     fn empty_block() -> XAsyncBlock {
         XAsyncBlock {
@@ -1139,7 +845,8 @@ mod tests {
     /// these tests also cover the registration under `CLSID_XASYNC`.
     fn xasync() -> IXAsync {
         let mut out = std::ptr::null_mut();
-        let hr = crate::com::query_api_impl(&xasync::CLSID_XASYNC, &IXAsync::IID, &mut out);
+        let hr =
+            crate::com::query_api_impl(&crate::com::xasync::CLSID_XASYNC, &IXAsync::IID, &mut out);
         assert_eq!(
             hr, S_OK,
             "CLSID_XASYNC should resolve without a delegate DLL"

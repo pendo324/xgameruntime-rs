@@ -15,18 +15,13 @@ use windows::minwindef::LPARAM;
 use windows::windef::HWND;
 use windows::winuser::{EnumWindows, MB_OK, MessageBoxW};
 
-use crate::xuser::{IXUserImpl5, XUserPlatformRemoteConnectEventHandlers};
+use crate::com::xasync::task_queue;
+use crate::com::xuser::{IXUserImpl5, XUserPlatformRemoteConnectEventHandlers};
 use windows_core::{GUID, HRESULT, Interface};
 
 mod com;
-mod gdk_extra;
 mod ipc;
 mod results;
-mod task_queue;
-mod xasync;
-mod xasync_impl;
-mod xgamesave;
-mod xuser;
 
 type Ulong = u32;
 type Char = i8;
@@ -104,11 +99,11 @@ fn initialize(
     }
 
     // Real GDK hosts install a process task queue (XTaskQueueSetCurrentProcessTaskQueue)
-    // before any async API runs. WineGDK's host never does, so libHttpClient - which falls
+    // before any async API runs. The host here never does, so libHttpClient - which falls
     // back to XTaskQueueGetCurrentProcessTaskQueue whenever an async block's queue is NULL,
     // as XSAPI's service calls are - would resolve a NULL queue and abort its own operations
     // with E_INVALIDARG/E_ABORT. Install one here so those NULL-queue asyncs always have a
-    // valid ThreadPool queue to run on. See PLAN.md milestone 29 / open risk entry 8.
+    // valid ThreadPool queue to run on.
     if !task_queue::has_process_queue() {
         let queue = task_queue::Queue::new(
             task_queue::DispatchMode::ThreadPool,
@@ -125,7 +120,7 @@ fn initialize(
     // Wine has no CloudExperienceHost, so the remote-connect prompt that would normally
     // be shown by the shell has to come from us.
     let mut out: *mut c_void = null_mut();
-    if com::query_api_impl(&xuser::CLSID_XUSER, &IXUserImpl5::IID, &mut out) == S_OK
+    if com::query_api_impl(&crate::com::xuser::CLSID_XUSER, &IXUserImpl5::IID, &mut out) == S_OK
         && let Some(platform) = unsafe { IXUserImpl5::from_raw_borrowed(&out) }
     {
         let handlers = XUserPlatformRemoteConnectEventHandlers {
@@ -216,10 +211,10 @@ const CLASS_E_CLASSNOTAVAILABLE: HRESULT = HRESULT(0x80040111u32 as i32);
 
 /// Diagnostic-only for now: this crate has never exported `DllGetClassObject`, so classic COM
 /// `CoCreateInstance` against any CLSID this DLL should serve (e.g. XSAPI's Xbox Live context,
-/// `CLSID_XsapiContext` in WineGDK's `main.c`) fails silently rather than reaching us at all.
-/// Logging which CLSIDs are actually requested here - before committing to porting WineGDK's
-/// large reverse-engineered service-broker vtable - tells us whether that path is even used by
-/// this title, rather than guessing.
+/// `CLSID_XsapiContext`) fails silently rather than reaching us at all. Logging which CLSIDs
+/// are actually requested here - before committing to porting the large reverse-engineered
+/// service-broker vtable - tells us whether that path is even used by this title, rather than
+/// guessing.
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "system" fn DllGetClassObject(

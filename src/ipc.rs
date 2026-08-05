@@ -1,5 +1,5 @@
 //! Blocking loopback TCP client to `xodus-service`, for the `XUser` methods that need a
-//! real signed-in identity instead of an honest `E_NOTIMPL`.
+//! real signed-in identity instead of an `E_NOTIMPL`.
 //!
 //! Blocking is deliberate, not a shortcut: `xasync.rs`'s `run_sync` executes its closure
 //! synchronously on whatever thread called the `*Async` entry point (`XAsyncOp::Begin` in
@@ -121,15 +121,14 @@ const ENV_GAME_SAVE_ROOT: &str = "XODUS_GAME_SAVE_ROOT";
 /// Xbox Live's own MSA app registration id, used throughout `xodus`'s auth flow
 /// (`xodus::auth::TitleIdentity::xodus`) - not a per-title/per-game id. Used only as a
 /// fallback by [`title_client_id`] when the launched title has no `MicrosoftGame.config`
-/// (or no `<MSAAppId>` in it) to read a real one from - not itself the "don't hardcode the
-/// title identity" case PLAN.md warns about, since it's shared Xbox Live infrastructure,
-/// not any particular game's identity.
+/// (or no `<MSAAppId>` in it) to read a real one from - safe to hardcode because it's
+/// shared Xbox Live infrastructure, not any particular game's identity.
 const XBOX_LIVE_CLIENT_ID: &str = "000000004424da1f";
 
 /// Parses the real `<MSAAppId>` out of the launched title's `MicrosoftGame.config`, walking
 /// up from the game executable the same way `com.rs`'s `read_game_title_id` does for
 /// `<TitleId>` (the file lives next to the exe, occasionally a parent directory) - not
-/// hardcoded, per PLAN.md's standing rule against baking in title identity. `None` when no
+/// hardcoded, so the app id is the launched title's own rather than baked in. `None` when no
 /// `MicrosoftGame.config`/`<MSAAppId>` was found, so callers fall back to
 /// [`XBOX_LIVE_CLIENT_ID`].
 fn read_game_msa_app_id() -> Option<String> {
@@ -195,7 +194,6 @@ use xodus_ipc_models::xuser::{
     MSATokenRequest, MSATokenResponse, UserInfoRequest, UserInfoResponse, XstsTokenRequest,
     XstsTokenResponse,
 };
-
 
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -268,7 +266,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Where to find `xodus-service`, as published to the game process's environment by
 /// `xodus-cli run`. `Err(E_NOTIMPL)` here means "not running under `xodus-cli run`" - a
-/// distinct, honest condition from a service that is reachable but refused the connection.
+/// distinct condition from a service that is reachable but refused the connection.
 fn endpoint() -> Result<(u16, Vec<u8>), HRESULT> {
     let port: u16 = std::env::var(ENV_TCP_PORT)
         .ok()
@@ -331,9 +329,8 @@ fn request_with_timeout(
     stream.set_write_timeout(Some(io_timeout)).ok();
     stream.set_nodelay(true).ok();
 
-    perform_handshake(&mut stream, &secret).inspect_err(|e| {
-        eprintln!("[diag] request msg_type={msg_type} handshake failed: {e:?}")
-    })?;
+    perform_handshake(&mut stream, &secret)
+        .inspect_err(|e| eprintln!("[diag] request msg_type={msg_type} handshake failed: {e:?}"))?;
 
     let mut request = Vec::with_capacity(payload.len() + 10);
     request.extend(XML_MAGIC_V2.to_le_bytes());
@@ -373,9 +370,7 @@ fn request_with_timeout(
         E_FAIL
     })?;
 
-    eprintln!(
-        "[diag] request msg_type={msg_type} succeeded, reply_type={reply_type} size={size}"
-    );
+    eprintln!("[diag] request msg_type={msg_type} succeeded, reply_type={reply_type} size={size}");
     if reply_type == MSG_TYPE_ERROR {
         eprintln!(
             "[diag] request msg_type={msg_type} server reported an error: {}",
@@ -532,7 +527,7 @@ pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
 /// `xodus-service`'s spawned `xodus-cli login` webview takes - a human deciding whether to
 /// sign in, not a network round trip, hence [`INTERACTIVE_SIGN_IN_TIMEOUT`] rather than the
 /// default. Returns `Ok(None)` when the human closed the window without completing sign-in
-/// (an honest "declined", not an error); `Ok(Some(..))` on the same
+/// (a "declined", not an error); `Ok(Some(..))` on the same
 /// `(xuid, gamertag, gamertag_modern, age_group)` shape as [`get_user_info`] on success.
 pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>, HRESULT> {
     eprintln!("[diag] interactive_sign_in called");
@@ -670,9 +665,11 @@ pub(crate) fn get_license_token(
 /// `AssociatedProductsRequest` handler - products "sellable by" (DLC/add-ons for) the
 /// running game's own catalog entry. `Err(E_NOTIMPL)` when [`ENV_PACKAGE_FAMILY_NAME`] is
 /// unset (not running under `xodus-cli run`, or `xodus-cli run` couldn't find/parse an
-/// `AppxManifest.xml`) - same honest "nothing to resolve" stance as [`get_game_license`]'s
-/// gate on [`ENV_CONTENT_ID`].
-pub(crate) fn get_associated_products(max_items: u32) -> Result<Vec<AssociatedProductEntry>, HRESULT> {
+/// `AppxManifest.xml`) - same "nothing to resolve" stance as [`get_game_license`]'s gate on
+/// [`ENV_CONTENT_ID`].
+pub(crate) fn get_associated_products(
+    max_items: u32,
+) -> Result<Vec<AssociatedProductEntry>, HRESULT> {
     let package_family_name = std::env::var(ENV_PACKAGE_FAMILY_NAME).map_err(|_| E_NOTIMPL)?;
     let request_body = AssociatedProductsRequest {
         package_family_name,
@@ -696,7 +693,7 @@ pub(crate) fn get_associated_products(max_items: u32) -> Result<Vec<AssociatedPr
 /// `xgameruntime.dll`, which implements `XPackageGetCurrentProcessPackageIdentifier` on top of
 /// Win32's own `GetCurrentPackageFamilyName`) to a `StoreId`, via the same
 /// `alternateid=PackageFamilyName` catalog lookup [`get_associated_products`] uses. `Ok(None)`
-/// is an honest "no such product", not an error - the caller decides what that means.
+/// is a "no such product", not an error - the caller decides what that means.
 pub(crate) fn resolve_product_id(package_family_name: &str) -> Result<Option<String>, HRESULT> {
     let request_body = ResolveProductIdRequest {
         package_family_name: package_family_name.to_string(),
@@ -720,7 +717,7 @@ pub(crate) fn resolve_product_id(package_family_name: &str) -> Result<Option<Str
 
 /// `XUserGetGamerPictureAsync`'s real backing. No user field - like [`get_entitled_products`],
 /// `xodus-service` always answers for whichever account's credentials are on this connection.
-/// `Ok(None)` when the account has no gamer picture set - an honest absence, not an error.
+/// `Ok(None)` when the account has no gamer picture set - an absence, not an error.
 pub(crate) fn get_gamer_picture() -> Result<Option<Vec<u8>>, HRESULT> {
     let body = quick_xml::se::to_string(&GamerPictureRequest {
         client_id: title_client_id(),
@@ -1022,7 +1019,8 @@ mod tests {
                 socket.read_exact(&mut header).expect("read header");
                 let msg_type = u16::from_le_bytes([header[0], header[1]]);
                 assert_eq!(msg_type, MSG_TYPE_XSTS_TOKEN_REQUEST);
-                let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+                let size =
+                    u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
                 let _body = read_exact_blocking(&mut socket, size);
 
                 let (reply_type, payload) = if attempt == 0 {

@@ -1,3 +1,17 @@
+//! `XAsync`/`XTaskQueue` COM-face surface: the `IXAsync` interface, the ABI types
+//! (`XAsyncBlock`, `XAsyncOp`, `XAsyncProviderData`), and the public wrapper functions
+//! titles call (`begin`, `run`, `run_sync`, `get_result`, …) that drive the `XAsyncObject`
+//! in [`r#impl`]. The engine lives in [`core`] (per-call async state) and [`task_queue`]
+//! (the queue implementation).
+//!
+//! [`r#impl`]: crate::com::xasync::impl
+//! [`core`]: crate::com::xasync::core
+//! [`task_queue`]: crate::com::xasync::task_queue
+
+pub mod core;
+pub mod r#impl;
+pub mod task_queue;
+
 use crate::S_OK;
 use crate::com::query_api_impl;
 

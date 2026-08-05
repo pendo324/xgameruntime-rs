@@ -27,7 +27,11 @@ use std::time::{Duration, Instant};
 /// of serialized writes per second. Gate it behind `XODUS_DIAG` (off by default).
 static DIAG: OnceLock<bool> = OnceLock::new();
 pub(crate) fn diag() -> bool {
-    *DIAG.get_or_init(|| std::env::var("XODUS_DIAG").map(|v| v != "0").unwrap_or(false))
+    *DIAG.get_or_init(|| {
+        std::env::var("XODUS_DIAG")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
 }
 
 // True while a callback is being run inline by `Port::dispatch` on the pump thread.
@@ -485,7 +489,8 @@ unsafe impl Send for Monitor {}
 /// queue's ports via `XTaskQueueCreateComposite` — so several contexts can share one
 /// `Port`. Termination is scoped to the context: cancelling a context cancels only the
 /// callbacks *it* submitted (`Port::terminate_context`), and the shared port only dies
-/// when its last context terminates. This mirrors WineGDK's `x_task_queue_port_context`.
+/// when its last context terminates - the `XTaskQueuePortContext` concept from
+/// `xasyncprovider.idl`.
 struct PortContext {
     port: Arc<Port>,
     /// Unique id tagging the callbacks this context submits, so `terminate_context` can
@@ -513,13 +518,9 @@ impl PortContext {
         self.terminated.load(Ordering::Relaxed)
     }
 
-    fn submit(
-        &self,
-        context: *mut c_void,
-        callback: TaskCallback,
-        delay: Duration,
-    ) -> bool {
-        self.port.submit(self.owner, self.is_terminated(), context, callback, delay)
+    fn submit(&self, context: *mut c_void, callback: TaskCallback, delay: Duration) -> bool {
+        self.port
+            .submit(self.owner, self.is_terminated(), context, callback, delay)
     }
 
     fn terminate(&self, wait: bool) {
@@ -750,7 +751,7 @@ static PROCESS_QUEUE_HANDLE: Mutex<Option<u64>> = Mutex::new(None);
 /// `XAsyncBlock`s that name no queue get this handle written into their `queue`
 /// field so libHttpClient-style providers that read `asyncBlock->queue` directly
 /// (instead of going through `XTaskQueueGetCurrentProcessTaskQueue`) actually see a
-/// non-NULL queue: WineGDK's embedded XSAPI does exactly that, and a NULL queue
+/// non-NULL queue: the embedded XSAPI does exactly that, and a NULL queue
 /// makes its `HttpCallPerformAsync` provider `Begin` return `E_INVALIDARG`. The
 /// handle owns a table reference, so it stays valid across block reuse and queue
 /// teardown for the lifetime of the process.
@@ -928,7 +929,7 @@ mod tests {
         assert!(!port.dispatch(5_000), "port is now drained");
     }
 
-#[test]
+    #[test]
     fn dispatch_drains_all_immediately_queued_callbacks_in_one_call() {
         let counter = counter();
         let context = (&*counter as *const Counter as *mut c_void).cast();
@@ -938,7 +939,10 @@ mod tests {
         assert!(ctx.submit(context, count, Duration::ZERO));
         assert!(ctx.submit(context, count, Duration::ZERO));
 
-        assert!(port.dispatch(10), "drains all three ready callbacks in one call");
+        assert!(
+            port.dispatch(10),
+            "drains all three ready callbacks in one call"
+        );
         assert_eq!(counter.ran.load(Ordering::SeqCst), 3);
         assert!(!port.dispatch(10), "nothing left after the drain");
     }
