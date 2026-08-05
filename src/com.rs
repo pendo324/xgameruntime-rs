@@ -225,7 +225,7 @@ impl XPackageMountHandleTable {
     }
 }
 
-/// Maps `EntitledProduct`/`AssociatedProduct`'s freeform `product_kind` string onto
+/// Maps `EntitledProduct`/`AssociatedProductEntry`'s freeform `product_kind` string onto
 /// `XStoreProductKind`'s bitmask (`wine/include/xstore.idl`). Only "Game" is derivable from
 /// what `xodus-service` actually returns - anything else honestly reports as none rather
 /// than guessing a specific DLC/consumable/durable kind.

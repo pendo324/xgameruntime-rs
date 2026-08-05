@@ -13,7 +13,7 @@
 //! - `xodus::ipc`: the env vars `xodus-cli run` sets on the game process
 //!   (`ENV_TCP_PORT`/`ENV_TCP_SECRET`), and that the secret is hex-encoded on the wire.
 //! - `xodus-service::connection`: the handshake (`tcp.rs`) and v2 XML framing
-//!   (`mod.rs`/`xml.rs`) byte layouts. `Ping`, `MsaTokenRequest`, `XstsTokenRequest`,
+//!   (`mod.rs`/`xml.rs`) byte layouts. `Ping`, `MSATokenRequest`, `XstsTokenRequest`,
 //!   `UserInfoRequest`, and `LicenseRequest` have working handlers server-side today -
 //!   everything else in `XodusMessageType` is schema-only.
 
@@ -179,262 +179,23 @@ fn title_client_id() -> String {
 /// Anything else is treated as an ordinary sign-in scope request.
 const FULL_TRUST_SCOPE: &str = "service::user.auth.xboxlive.com::MBI_SSL";
 
-// Both structs derive both directions: production code only ever serializes a request
-// and deserializes a response, but the test below plays xodus-service's part of the
-// conversation (deserializing the request it received, serializing the response it
-// sends back) to exercise the wire format without a real service running.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename = "MSATokenRequest")]
-#[serde(rename_all = "PascalCase")]
-struct MsaTokenRequest {
-    client_id: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    allow_ui: bool,
-    msa_full_trust: bool,
-}
+// Request/response shapes for xodus-service's loopback IPC. The authoritative
+// definitions live in `xodus-ipc-models` (a sub-crate of the `xodus` repo) - the single
+// source of truth both this DLL and xodus-service serialize against, so the two
+// hand-mirrored copies can't drift apart. Names here follow the crate's canonical
+// spelling (`MSATokenRequest`, `AssociatedProductEntry`, ...).
+use xodus_ipc_models::xstore::{
+    AssociatedProductEntry, AssociatedProductsRequest, AssociatedProductsResponse,
+    CollectionsIdRequest, CollectionsIdResponse, EntitledProduct, EntitledProductsRequest,
+    EntitledProductsResponse, LicenseRequest, LicenseResponse, LicenseTokenRequest,
+    LicenseTokenResponse, ResolveProductIdRequest, ResolveProductIdResponse,
+};
+use xodus_ipc_models::xuser::{
+    GamerPictureRequest, GamerPictureResponse, InteractiveSignInRequest, InteractiveSignInResponse,
+    MSATokenRequest, MSATokenResponse, UserInfoRequest, UserInfoResponse, XstsTokenRequest,
+    XstsTokenResponse,
+};
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct MsaTokenResponse {
-    token: String,
-    expiry: i64,
-    #[allow(dead_code)]
-    device_rps: String,
-    #[allow(dead_code)]
-    device_expiry: i64,
-}
-
-/// `xodus-service`'s `XstsTokenRequest` handler derives the relying party itself from
-/// `url` (Xbox Live's title-management endpoint table), the same way the real title-managed
-/// SDK would - the caller never supplies one, matching `XUserGetTokenAndSignatureAsync`'s
-/// real signature. `client_id` is [`title_client_id`]'s real per-title `MSAAppId` when one
-/// is available, so the MSA/user-token exchange the service performs on our behalf is scoped
-/// to this title rather than the shared Xbox Live client - `#[serde(default)]` so an older
-/// service that doesn't know the field yet still parses the request (and falls back to its
-/// own hardcoded client id).
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct XstsTokenRequest {
-    method: String,
-    url: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    force_refresh: bool,
-    #[serde(default)]
-    client_id: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct XstsTokenResponse {
-    #[allow(dead_code)]
-    token: String,
-    authorization: String,
-    #[serde(default)]
-    signature: String,
-    #[allow(dead_code)]
-    expiry: i64,
-}
-
-/// `xodus-service` always answers for whichever user's credentials are on this connection -
-/// `client_id` is the only request field, [`title_client_id`]'s real per-title `MSAAppId`
-/// when available, scoping the MSA/user-token exchange to this title (see
-/// `XstsTokenRequest`'s docs).
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct UserInfoRequest {
-    #[serde(default)]
-    client_id: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct UserInfoResponse {
-    xuid: String,
-    gamertag: String,
-    #[serde(default)]
-    gamertag_modern: String,
-    age_group: String,
-}
-
-/// No user field - like `UserInfoRequest`, `xodus-service` always answers for whichever
-/// account's credentials are on this connection.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct LicenseRequest {
-    content_id: String,
-    #[serde(default)]
-    market: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct LicenseResponse {
-    is_active: bool,
-    #[serde(default)]
-    expiration_date: i64,
-}
-
-/// No user field - like `LicenseRequest`, `xodus-service` always answers for whichever
-/// account's credentials are on this connection.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct EntitledProductsRequest {
-    #[serde(default)]
-    market: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct EntitledProductsResponse {
-    #[serde(default, rename = "Product")]
-    products: Vec<EntitledProduct>,
-}
-
-/// `XStoreEnumerateProductsQuery`'s per-product payload. Kept as owned `String`s here;
-/// `com.rs`'s handle table is responsible for converting these into the `CString`/raw-pointer
-/// backing storage `XStoreProduct` (`wine/include/xstore.idl`) needs and keeping it alive for
-/// the query handle's lifetime.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-#[serde(rename_all = "PascalCase")]
-pub(crate) struct EntitledProduct {
-    pub(crate) store_id: String,
-    pub(crate) title: String,
-    pub(crate) product_kind: String,
-    #[serde(default)]
-    pub(crate) included_in_game_pass: bool,
-}
-
-/// No user field - like `EntitledProductsRequest`, `xodus-service` always answers for
-/// whichever account's credentials are on this connection. `service_ticket`/
-/// `publisher_user_id` are the caller's own opaque values, forwarded verbatim to
-/// `collections.mp.microsoft.com` - xodus does not generate or interpret them.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct CollectionsIdRequest {
-    service_ticket: String,
-    publisher_user_id: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct CollectionsIdResponse {
-    #[serde(default)]
-    key: String,
-}
-
-/// `product_ids[0]` is the parent product, the rest are related products - matching
-/// `XStoreQueryLicenseTokenAsync`'s real GDK signature (one flat `productIds` array).
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct LicenseTokenRequest {
-    #[serde(rename = "ProductId")]
-    product_ids: Vec<String>,
-    custom_developer_string: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct LicenseTokenResponse {
-    #[serde(default)]
-    token: String,
-}
-
-/// No user field - like `EntitledProductsRequest`, `xodus-service` always answers for
-/// whichever account's credentials are on this connection. `package_family_name` is read
-/// from [`ENV_PACKAGE_FAMILY_NAME`] rather than accepted as a parameter here: unlike
-/// `service_ticket`/`publisher_user_id`, it isn't something the caller passes to
-/// `XStoreQueryAssociatedProductsAsync` - it's the running game's own identity.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct AssociatedProductsRequest {
-    #[serde(default)]
-    package_family_name: String,
-    #[serde(default)]
-    market: String,
-    #[serde(default)]
-    max_items: u32,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct AssociatedProductsResponse {
-    #[serde(default, rename = "Product")]
-    products: Vec<AssociatedProduct>,
-}
-
-/// `XStoreQueryAssociatedProductsAsync`'s per-product payload - see
-/// `EntitledProduct`'s docs for why this is owned `String`s rather than the raw-pointer
-/// `XStoreProduct` shape.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-#[serde(rename_all = "PascalCase")]
-pub(crate) struct AssociatedProduct {
-    pub(crate) store_id: String,
-    pub(crate) title: String,
-    pub(crate) product_kind: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ResolveProductIdRequest {
-    #[serde(default)]
-    package_family_name: String,
-    #[serde(default)]
-    market: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ResolveProductIdResponse {
-    #[serde(default)]
-    product_id: String,
-}
-
-/// Like `UserInfoRequest`, whichever Microsoft account the human signs into completes it;
-/// there is no per-request account selection at the GDK layer to forward - `client_id` is
-/// the only field, same per-title scoping as `UserInfoRequest`.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct InteractiveSignInRequest {
-    #[serde(default)]
-    client_id: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct InteractiveSignInResponse {
-    success: bool,
-    #[serde(default)]
-    xuid: String,
-    #[serde(default)]
-    gamertag: String,
-    #[serde(default)]
-    gamertag_modern: String,
-    #[serde(default)]
-    age_group: String,
-}
-
-/// `XUserGetGamerPictureAsync`'s real backing. Like `UserInfoRequest`, `xodus-service`
-/// always answers for whichever account's credentials are on this connection - `client_id`
-/// is the only field, same per-title scoping as `UserInfoRequest`. `XUserGamerPictureSize`
-/// is not forwarded - see `xodus::api::xbox::profile::get_gamer_picture`'s docs (in the
-/// `xodus` repo) for why.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct GamerPictureRequest {
-    #[serde(default)]
-    client_id: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct GamerPictureResponse {
-    /// Base64 (raw bytes can't ride inside XML text unescaped). Empty when the account has
-    /// no gamer picture set - honest absence, not an error.
-    #[serde(default)]
-    picture: String,
-}
 
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -628,7 +389,7 @@ fn request_with_timeout(
 /// passed in; anything other than [`FULL_TRUST_SCOPE`] is treated as an ordinary sign-in
 /// scope request. Returns `(token, expiry_unix_seconds)`.
 pub fn get_msa_token_silently(scope: Option<&str>) -> Result<(String, i64), HRESULT> {
-    let request_body = MsaTokenRequest {
+    let request_body = MSATokenRequest {
         client_id: title_client_id(),
         allow_ui: false,
         msa_full_trust: scope == Some(FULL_TRUST_SCOPE),
@@ -644,7 +405,7 @@ pub fn get_msa_token_silently(scope: Option<&str>) -> Result<(String, i64), HRES
     }
 
     let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: MsaTokenResponse = match quick_xml::de::from_str(text) {
+    let response: MSATokenResponse = match quick_xml::de::from_str(text) {
         Ok(r) => r,
         Err(err) => {
             eprintln!("[diag] get_msa_token_silently deserialize error: {err}");
@@ -911,7 +672,7 @@ pub(crate) fn get_license_token(
 /// unset (not running under `xodus-cli run`, or `xodus-cli run` couldn't find/parse an
 /// `AppxManifest.xml`) - same honest "nothing to resolve" stance as [`get_game_license`]'s
 /// gate on [`ENV_CONTENT_ID`].
-pub(crate) fn get_associated_products(max_items: u32) -> Result<Vec<AssociatedProduct>, HRESULT> {
+pub(crate) fn get_associated_products(max_items: u32) -> Result<Vec<AssociatedProductEntry>, HRESULT> {
     let package_family_name = std::env::var(ENV_PACKAGE_FAMILY_NAME).map_err(|_| E_NOTIMPL)?;
     let request_body = AssociatedProductsRequest {
         package_family_name,
@@ -1135,12 +896,12 @@ mod tests {
             assert_eq!(msg_type, MSG_TYPE_MSA_TOKEN_REQUEST);
             let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
             let body = read_exact_blocking(&mut socket, size);
-            let request: MsaTokenRequest =
+            let request: MSATokenRequest =
                 quick_xml::de::from_str(std::str::from_utf8(&body).unwrap()).expect("parses");
             assert_eq!(request.client_id, XBOX_LIVE_CLIENT_ID);
             assert!(!request.msa_full_trust);
 
-            let response = MsaTokenResponse {
+            let response = MSATokenResponse {
                 token: "fake-user-token".to_string(),
                 expiry: 1_700_000_000,
                 device_rps: String::new(),

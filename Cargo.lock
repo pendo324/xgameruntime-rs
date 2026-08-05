@@ -273,4 +273,13 @@ dependencies = [
  "windows-strings",
  "windows-sys",
  "windows-window",
+ "xodus-ipc-models",
+]
+
+[[package]]
+name = "xodus-ipc-models"
+version = "0.1.0"
+dependencies = [
+ "quick-xml",
+ "serde",
 ]
