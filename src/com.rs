@@ -1297,6 +1297,9 @@ pub fn query_api_impl(
 
     let class_id = unsafe { *runtime_class_id };
     // println!("query_api_impl: {:#8x}-{:#4x}-{:#4x}-{:#4x}", class_id.data1, class_id.data2, class_id.data3, class_id.data4);
+    if let Some(result) = crate::gdk_extra::query_stubbed(class_id, interface_id, out) {
+        return result;
+    }
     let res = match class_id {
         IXFeature::IID => {
             // println!("query_api_impl: {:#32x} {:#32x}", class_id.to_u128(), unsafe { *interface_id }.to_u128());
@@ -1432,5 +1435,75 @@ mod tests {
 
         let uninit_hr = UninitializeApiImpl();
         assert_eq!(uninit_hr, HRESULT(0));
+    }
+    /// The stub surface (`gdk_extra.rs`) must be reachable through the same
+    /// `QueryApiImpl` entry point a game uses: every class WineGDK's C `QueryApiImpl`
+    /// dispatches that this crate stubs (rather than implements) should resolve with its
+    /// default interface IID to `S_OK` and a non-null object, exactly like the real
+    /// classes - so a title probing for e.g. `CLSID_XDisplayImpl` gets a live vtable,
+    /// not the unresolved-class `E_NOTIMPL` a `_`-fallthrough would give.
+    #[test]
+    fn stub_classes_resolve_via_query_api_impl() {
+        // (class id, default interface IID, singleton pointer sanity) - mirror of the
+        // `gdk_extra` dispatch table. `IXThreadingImpl` is intentionally absent: its
+        // coclass uuid is `CLSID_XASYNC`, served by the real `XAsync` singleton.
+        let cases: &[(GUID, GUID)] = &[
+            (
+                crate::gdk_extra::CLSID_XACCESSIBILITY,
+                crate::gdk_extra::IXAccessibilityImpl2::IID,
+            ),
+            (
+                crate::gdk_extra::CLSID_XAPPCAPTURE,
+                crate::gdk_extra::IXAppCaptureImpl4::IID,
+            ),
+            (
+                crate::gdk_extra::CLSID_XAPPCAPTURE_METADATA,
+                crate::gdk_extra::IXAppCaptureMetadataImpl::IID,
+            ),
+            (
+                crate::gdk_extra::CLSID_XDISPLAY,
+                crate::gdk_extra::IXDisplayImpl::IID,
+            ),
+            (
+                crate::gdk_extra::CLSID_XLAUNCHER,
+                crate::gdk_extra::IXLauncherImpl::IID,
+            ),
+            (
+                crate::gdk_extra::CLSID_XGAME_ACTIVATION,
+                crate::gdk_extra::IXGameActivationImpl::IID,
+            ),
+            (
+                crate::gdk_extra::CLSID_XGAME_EVENT,
+                crate::gdk_extra::IXGameEventImpl::IID,
+            ),
+            (
+                crate::gdk_extra::CLSID_XGAME_STREAMING,
+                crate::gdk_extra::IXGameStreamingImpl3::IID,
+            ),
+            (
+                crate::gdk_extra::CLSID_XGAME_UI,
+                crate::gdk_extra::IXGameUiImpl4::IID,
+            ),
+        ];
+
+        for (class_id, interface_id) in cases {
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = query_api_impl(class_id, interface_id, &mut out);
+            assert_eq!(
+                hr,
+                HRESULT(0),
+                "QueryApiImpl for {class_id:?} with default IID {interface_id:?} should resolve"
+            );
+            assert!(!out.is_null(), "stub class {class_id:?} returned a null object");
+
+            // An unrelated IID must be refused honestly, not crash.
+            let mut other: *mut c_void = std::ptr::null_mut();
+            let hr = query_api_impl(class_id, &windows_core::GUID::zeroed(), &mut other);
+            assert_eq!(
+                hr,
+                crate::results::E_NOINTERFACE,
+                "QueryApiImpl for {class_id:?} with a bogus IID should be E_NOINTERFACE"
+            );
+        }
     }
 }

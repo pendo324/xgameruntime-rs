@@ -19,6 +19,7 @@ use crate::xuser::{IXUserImpl5, XUserPlatformRemoteConnectEventHandlers};
 use windows_core::{GUID, HRESULT, Interface};
 
 mod com;
+mod gdk_extra;
 mod ipc;
 mod results;
 mod task_queue;
