@@ -6,3 +6,7 @@
 
 # Local toolchain overrides (WINE_MSVC_LIB_DIR).
 /.env
+
+# Working notes and launch helpers kept out of version control.
+/PLAN.md
+/scripts/
