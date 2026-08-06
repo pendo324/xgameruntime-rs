@@ -10,9 +10,11 @@ pub struct XFeature;
 impl IXFeature_Impl for XFeature_Impl {
     /// Every feature reports available.
     ///
-    /// A title that is told a feature is missing takes a fallback path we have not
-    /// implemented either, so claiming absence buys nothing. The honest "not implemented"
-    /// lives at the individual API, which returns `E_NOTIMPL`.
+    /// Titles call this in hot paths - a Bedrock session was measured making ~34,000 calls
+    /// in three seconds - so this must stay allocation- and syscall-free. Answering `true`
+    /// uniformly is deliberate: a title that is told a feature is missing takes a fallback
+    /// path we have not implemented either, so claiming absence buys nothing. The honest
+    /// "not implemented" lives at the individual API, which returns `E_NOTIMPL`.
     unsafe fn XGameRuntimeIsFeatureAvailable(&self, _feature: u32) -> bool {
         true
     }
