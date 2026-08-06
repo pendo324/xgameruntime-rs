@@ -154,6 +154,12 @@ pub struct XNetworkingSecurityInformation {
     thumbprints: *const c_void,
 }
 
+// `run_sync` produces its result on a worker thread, so the result type has to cross a
+// thread boundary. Sound here because both producers below report zero thumbprints and a
+// null `thumbprints` pointer - there is no pointee to race over. Should this ever return a
+// real thumbprint array, revisit: the array's ownership would have to cross with it.
+unsafe impl Send for XNetworkingSecurityInformation {}
+
 type OnChanged =
     unsafe extern "system" fn(context: *mut c_void, hint: *const XNetworkingConnectivityHint);
 

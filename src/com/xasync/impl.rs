@@ -961,6 +961,12 @@ mod tests {
         let hr = unsafe { run_sync(&mut block, || Ok::<u32, HRESULT>(2)) };
         assert_eq!(hr, E_INVALIDARG);
 
+        // `run_sync` runs its body on a worker, so the result is not there the instant it
+        // returns; wait for the call it started before reading it.
+        assert_eq!(
+            unsafe { crate::com::xasync::get_status(&mut block, true) },
+            Ok(())
+        );
         let mut value = 0u32;
         assert_eq!(
             unsafe { get_result(&mut block, std::ptr::null(), &mut value) },

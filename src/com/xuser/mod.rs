@@ -369,6 +369,12 @@ mod tests {
         };
         let hr = unsafe { xuser_singleton().XUserSignOutAsync(handle, &mut async_block) };
         assert_eq!(hr, S_OK);
+        // The sign-out body runs on a worker now, so the state transition and its change
+        // events have not necessarily landed by the time the call returns.
+        assert_eq!(
+            unsafe { crate::com::xasync::get_status(&mut async_block, true) },
+            Ok(())
+        );
 
         let mut state = 0u32;
         let hr = unsafe { xuser_singleton().XUserGetState(handle, &mut state) };

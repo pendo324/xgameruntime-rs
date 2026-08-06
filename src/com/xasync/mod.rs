@@ -19,6 +19,7 @@ use crate::results::*;
 use std::ffi::{c_char, c_void};
 use std::mem::size_of;
 use std::ptr::null_mut;
+use std::sync::Arc;
 use windows_core::{GUID, HRESULT, IUnknown, Interface, interface};
 use windows_sys::core::BOOL;
 
@@ -235,6 +236,39 @@ pub unsafe fn get_result_size(async_block: *mut XAsyncBlock) -> Result<usize, HR
     result(buffer_size, hr)
 }
 
+/// Worker pool for [`run_sync`]'s blocking bodies.
+///
+/// Deliberately a queue of our own rather than the process queue: the whole point is to
+/// get this work *off* whatever thread called the API. XSAPI issues these from inside
+/// DoWork callbacks that the game dispatches on its own manual work port, so running them
+/// inline (as this helper used to) meant the game's pump thread performed a ~1s blocking
+/// IPC round-trip per callback - ten per dispatch measured at 12.1s of frozen pump, which
+/// was the load-time lag. Only the *work* moves; completion is still delivered on the
+/// block's own completion port, so callers that must observe completions on the game
+/// thread (XSAPI's SocialManager, which mutates its social graph there) are unaffected.
+static RUN_SYNC_QUEUE: std::sync::OnceLock<Arc<task_queue::Queue>> = std::sync::OnceLock::new();
+fn run_sync_queue() -> &'static Arc<task_queue::Queue> {
+    RUN_SYNC_QUEUE.get_or_init(|| {
+        task_queue::Queue::new(
+            task_queue::DispatchMode::ThreadPool,
+            task_queue::DispatchMode::ThreadPool,
+        )
+    })
+}
+
+/// A raw pointer moved to a worker thread. The pointee is a heap allocation whose lifetime
+/// the XAsync protocol pins for us: the context is only freed on `Cleanup`, which the
+/// caller cannot reach until it has seen the completion this worker posts.
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+
+type BoxedWork = Box<dyn FnOnce(bool) + Send>;
+
+unsafe extern "system" fn run_sync_worker(context: *mut c_void, canceled: bool) {
+    let work = unsafe { Box::from_raw(context as *mut BoxedWork) };
+    work(canceled);
+}
+
 struct XsyncContextHelper<T: Sized, F: Fn() -> Result<T, HRESULT>> {
     result: HRESULT,
     canceled: bool,
@@ -242,7 +276,10 @@ struct XsyncContextHelper<T: Sized, F: Fn() -> Result<T, HRESULT>> {
     future: F,
 }
 
-unsafe extern "system" fn run_sync_helper<T: Sized, F: Fn() -> Result<T, HRESULT>>(
+unsafe extern "system" fn run_sync_helper<
+    T: Sized + Send + 'static,
+    F: Fn() -> Result<T, HRESULT> + Send + 'static,
+>(
     op: XAsyncOp,
     data: *const XAsyncProviderData,
 ) -> HRESULT {
@@ -255,18 +292,52 @@ unsafe extern "system" fn run_sync_helper<T: Sized, F: Fn() -> Result<T, HRESULT
     };
 
     match op {
-        XAsyncOp::Begin => unsafe {
-            match (async_context.future)() {
-                Ok(value) => {
-                    async_context.result = S_OK;
-                    async_context.payload = Some(value);
+        XAsyncOp::Begin => {
+            // Hand the blocking body to a worker and return immediately. The context and
+            // the block both outlive this: `Cleanup` (which frees the context) cannot run
+            // until the caller has observed the completion posted at the end of the work.
+            let context = SendPtr(async_context as *mut XsyncContextHelper<T, F>);
+            let block = SendPtr(data.async_);
+            let work: BoxedWork = Box::new(move |canceled: bool| {
+                let context = context;
+                let block = block;
+                let async_context = unsafe { &mut *context.0 };
+                if canceled {
+                    // The pool is going away. Still complete, or the caller waits forever.
+                    async_context.result = E_ABORT;
+                } else {
+                    match (async_context.future)() {
+                        Ok(value) => {
+                            async_context.result = S_OK;
+                            async_context.payload = Some(value);
+                        }
+                        Err(hr) => async_context.result = hr,
+                    }
                 }
-                Err(hr) => async_context.result = hr,
-            };
-            complete(data.async_, async_context.result, size_of::<T>())
-                .map(|_| S_OK)
-                .unwrap_or_else(|hr| hr)
-        },
+                let _ = unsafe { complete(block.0, async_context.result, size_of::<T>()) };
+            });
+            let submitted = run_sync_queue().submit(
+                task_queue::PortKind::Work,
+                Box::into_raw(Box::new(work)) as *mut c_void,
+                run_sync_worker,
+                std::time::Duration::ZERO,
+            );
+            if !submitted {
+                // No worker to run it on; fall back to the old inline behaviour rather
+                // than strand the call.
+                match (async_context.future)() {
+                    Ok(value) => {
+                        async_context.result = S_OK;
+                        async_context.payload = Some(value);
+                    }
+                    Err(hr) => async_context.result = hr,
+                }
+                return unsafe { complete(data.async_, async_context.result, size_of::<T>()) }
+                    .map(|_| S_OK)
+                    .unwrap_or_else(|hr| hr);
+            }
+            S_OK
+        }
         XAsyncOp::DoWork => S_OK,
         XAsyncOp::GetResult => {
             if async_context.result == S_OK
@@ -295,9 +366,9 @@ unsafe extern "system" fn run_sync_helper<T: Sized, F: Fn() -> Result<T, HRESULT
     }
 }
 
-pub unsafe fn run_sync<T: Sized, F>(async_: *mut XAsyncBlock, future: F) -> HRESULT
+pub unsafe fn run_sync<T: Sized + Send + 'static, F>(async_: *mut XAsyncBlock, future: F) -> HRESULT
 where
-    F: Fn() -> Result<T, HRESULT>,
+    F: Fn() -> Result<T, HRESULT> + Send + 'static,
 {
     if async_.is_null() {
         return S_OK;
