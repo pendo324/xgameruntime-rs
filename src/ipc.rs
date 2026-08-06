@@ -304,13 +304,6 @@ fn perform_handshake(stream: &mut TcpStream, secret: &[u8]) -> Result<(), HRESUL
 /// Reply bodies carry live Xbox Live credentials (XSTS `XBL3.0` headers, MSA compact
 /// tokens, request signatures). Never log one: log sizes and outcomes instead, the way
 /// the callers below do.
-fn request(msg_type: u16, payload: &[u8]) -> Result<(u16, Vec<u8>), HRESULT> {
-    request_with_timeout(msg_type, payload, IO_TIMEOUT)
-}
-
-/// Same round trip as [`request`], but with a caller-chosen read/write timeout - for calls
-/// like [`interactive_sign_in`] that wait on human timescale, not [`IO_TIMEOUT`]'s
-/// sub-second round-trip assumption.
 fn request_with_timeout(
     msg_type: u16,
     payload: &[u8],
@@ -380,33 +373,63 @@ fn request_with_timeout(
     Ok((reply_type, body))
 }
 
-/// `XUserGetMsaTokenSilentlyAsync`'s real backing. `scope` is the raw string the game
-/// passed in; anything other than [`FULL_TRUST_SCOPE`] is treated as an ordinary sign-in
-/// scope request. Returns `(token, expiry_unix_seconds)`.
-pub fn get_msa_token_silently(scope: Option<&str>) -> Result<(String, i64), HRESULT> {
-    let request_body = MSATokenRequest {
-        client_id: title_client_id(),
-        allow_ui: false,
-        msa_full_trust: scope == Some(FULL_TRUST_SCOPE),
-    };
-    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
+/// One typed request/response exchange: serialize `body` as XML, send it as `req_type`,
+/// and deserialize the reply - insisting it came back as `resp_type`.
+///
+/// `xml.rs::parse_message` answers every unhandled message type (including a malformed
+/// request that failed to deserialize) with an empty buffer at `request_type + 1`, so the
+/// type check also covers "the service didn't understand us", and the dedicated
+/// [`MSG_TYPE_ERROR`] reply covers "the service understood but failed".
+fn exchange<Req, Resp>(req_type: u16, resp_type: u16, body: &Req) -> Result<Resp, HRESULT>
+where
+    Req: serde::Serialize,
+    Resp: serde::de::DeserializeOwned,
+{
+    exchange_with_timeout(req_type, resp_type, body, IO_TIMEOUT)
+}
 
-    let (reply_type, reply_body) = request(MSG_TYPE_MSA_TOKEN_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_MSA_TOKEN_RESPONSE {
-        // xml.rs::parse_message answers every unhandled message type (including a
-        // malformed request that failed to deserialize) with an empty buffer at
-        // `request_type + 1`, so this also covers "the service didn't understand us".
+/// Same exchange as [`exchange`], with a caller-chosen timeout.
+fn exchange_with_timeout<Req, Resp>(
+    req_type: u16,
+    resp_type: u16,
+    body: &Req,
+    io_timeout: Duration,
+) -> Result<Resp, HRESULT>
+where
+    Req: serde::Serialize,
+    Resp: serde::de::DeserializeOwned,
+{
+    let payload = quick_xml::se::to_string(body).map_err(|err| {
+        diag!("msg_type={req_type} serialize error: {err}");
+        E_FAIL
+    })?;
+
+    let (reply_type, reply_body) = request_with_timeout(req_type, payload.as_bytes(), io_timeout)?;
+    if reply_type != resp_type {
+        diag!("msg_type={req_type} unexpected reply_type={reply_type}");
         return Err(E_FAIL);
     }
 
     let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: MSATokenResponse = match quick_xml::de::from_str(text) {
-        Ok(r) => r,
-        Err(err) => {
-            diag!("get_msa_token_silently deserialize error: {err}");
-            return Err(E_FAIL);
-        }
-    };
+    quick_xml::de::from_str(text).map_err(|err| {
+        diag!("msg_type={req_type} deserialize error: {err}");
+        E_FAIL
+    })
+}
+
+/// `XUserGetMsaTokenSilentlyAsync`'s real backing. `scope` is the raw string the game
+/// passed in; anything other than [`FULL_TRUST_SCOPE`] is treated as an ordinary sign-in
+/// scope request. Returns `(token, expiry_unix_seconds)`.
+pub fn get_msa_token_silently(scope: Option<&str>) -> Result<(String, i64), HRESULT> {
+    let response: MSATokenResponse = exchange(
+        MSG_TYPE_MSA_TOKEN_REQUEST,
+        MSG_TYPE_MSA_TOKEN_RESPONSE,
+        &MSATokenRequest {
+            client_id: title_client_id(),
+            allow_ui: false,
+            msa_full_trust: scope == Some(FULL_TRUST_SCOPE),
+        },
+    )?;
     diag!(
         "get_msa_token_silently -> token ({} bytes) expiry={}",
         response.token.len(),
@@ -457,28 +480,17 @@ fn get_token_and_signature_once(
     url: &str,
     body: &[u8],
 ) -> Result<(String, String), HRESULT> {
-    let request_body = XstsTokenRequest {
-        method: method.to_string(),
-        url: url.to_string(),
-        body: base64_encode(body),
-        force_refresh: false,
-        client_id: title_client_id(),
-    };
-    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_XSTS_TOKEN_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_XSTS_TOKEN_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: XstsTokenResponse = match quick_xml::de::from_str(text) {
-        Ok(r) => r,
-        Err(err) => {
-            diag!("get_token_and_signature deserialize error: {err}");
-            return Err(E_FAIL);
-        }
-    };
+    let response: XstsTokenResponse = exchange(
+        MSG_TYPE_XSTS_TOKEN_REQUEST,
+        MSG_TYPE_XSTS_TOKEN_RESPONSE,
+        &XstsTokenRequest {
+            method: method.to_string(),
+            url: url.to_string(),
+            body: base64_encode(body),
+            force_refresh: false,
+            client_id: title_client_id(),
+        },
+    )?;
     diag!(
         "get_token_and_signature({url}) -> authorization ({} bytes) signature ({} bytes)",
         response.authorization.len(),
@@ -492,24 +504,13 @@ fn get_token_and_signature_once(
 /// callers should do the same. Returns `(xuid, gamertag, gamertag_modern, age_group)`; `age_group`
 /// is Xbox Live's raw claim (`"Adult"`/`"Teen"`/`"Child"`), not yet mapped to `XUserAgeGroup`.
 pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
-    let body = quick_xml::se::to_string(&UserInfoRequest {
-        client_id: title_client_id(),
-    })
-    .map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_USER_INFO_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_USER_INFO_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: UserInfoResponse = match quick_xml::de::from_str(text) {
-        Ok(r) => r,
-        Err(err) => {
-            diag!("get_user_info deserialize error: {err}");
-            return Err(E_FAIL);
-        }
-    };
+    let response: UserInfoResponse = exchange(
+        MSG_TYPE_USER_INFO_REQUEST,
+        MSG_TYPE_USER_INFO_RESPONSE,
+        &UserInfoRequest {
+            client_id: title_client_id(),
+        },
+    )?;
     diag!(
         "get_user_info parsed: xuid={:?} gamertag={:?} gamertag_modern={:?} age_group={:?}",
         response.xuid,
@@ -534,29 +535,14 @@ pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
 /// `(xuid, gamertag, gamertag_modern, age_group)` shape as [`get_user_info`] on success.
 pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>, HRESULT> {
     diag!("interactive_sign_in called");
-    let body = quick_xml::se::to_string(&InteractiveSignInRequest {
-        client_id: title_client_id(),
-    })
-    .map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request_with_timeout(
+    let response: InteractiveSignInResponse = exchange_with_timeout(
         MSG_TYPE_INTERACTIVE_SIGN_IN_REQUEST,
-        body.as_bytes(),
+        MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE,
+        &InteractiveSignInRequest {
+            client_id: title_client_id(),
+        },
         INTERACTIVE_SIGN_IN_TIMEOUT,
     )?;
-    if reply_type != MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE {
-        diag!("interactive_sign_in unexpected reply_type={reply_type}");
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: InteractiveSignInResponse = match quick_xml::de::from_str(text) {
-        Ok(r) => r,
-        Err(err) => {
-            diag!("interactive_sign_in deserialize error: {err}");
-            return Err(E_FAIL);
-        }
-    };
     if !response.success {
         diag!("interactive_sign_in: server reported declined/failed sign-in");
         return Ok(None);
@@ -577,19 +563,14 @@ pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>,
 pub fn get_game_license() -> Result<(bool, i64), HRESULT> {
     let content_id = std::env::var(ENV_CONTENT_ID).map_err(|_| E_NOTIMPL)?;
 
-    let request_body = LicenseRequest {
-        content_id,
-        market: String::new(),
-    };
-    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_LICENSE_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_LICENSE_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: LicenseResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: LicenseResponse = exchange(
+        MSG_TYPE_LICENSE_REQUEST,
+        MSG_TYPE_LICENSE_RESPONSE,
+        &LicenseRequest {
+            content_id,
+            market: String::new(),
+        },
+    )?;
     Ok((response.is_active, response.expiration_date))
 }
 
@@ -598,18 +579,13 @@ pub fn get_game_license() -> Result<(bool, i64), HRESULT> {
 /// games" library lookup. Unlike [`get_game_license`], not gated on [`ENV_CONTENT_ID`]: this
 /// always answers for whichever account is signed in, package or no package.
 pub(crate) fn get_entitled_products(market: &str) -> Result<Vec<EntitledProduct>, HRESULT> {
-    let request_body = EntitledProductsRequest {
-        market: market.to_string(),
-    };
-    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_ENTITLED_PRODUCTS_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_ENTITLED_PRODUCTS_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: EntitledProductsResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: EntitledProductsResponse = exchange(
+        MSG_TYPE_ENTITLED_PRODUCTS_REQUEST,
+        MSG_TYPE_ENTITLED_PRODUCTS_RESPONSE,
+        &EntitledProductsRequest {
+            market: market.to_string(),
+        },
+    )?;
     Ok(response.products)
 }
 
@@ -623,19 +599,14 @@ pub(crate) fn get_user_collections_id(
     service_ticket: &str,
     publisher_user_id: &str,
 ) -> Result<String, HRESULT> {
-    let request_body = CollectionsIdRequest {
-        service_ticket: service_ticket.to_string(),
-        publisher_user_id: publisher_user_id.to_string(),
-    };
-    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_COLLECTIONS_ID_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_COLLECTIONS_ID_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: CollectionsIdResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: CollectionsIdResponse = exchange(
+        MSG_TYPE_COLLECTIONS_ID_REQUEST,
+        MSG_TYPE_COLLECTIONS_ID_RESPONSE,
+        &CollectionsIdRequest {
+            service_ticket: service_ticket.to_string(),
+            publisher_user_id: publisher_user_id.to_string(),
+        },
+    )?;
     Ok(response.key)
 }
 
@@ -648,19 +619,14 @@ pub(crate) fn get_license_token(
     product_ids: &[String],
     custom_developer_string: &str,
 ) -> Result<String, HRESULT> {
-    let request_body = LicenseTokenRequest {
-        product_ids: product_ids.to_vec(),
-        custom_developer_string: custom_developer_string.to_string(),
-    };
-    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_LICENSE_TOKEN_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_LICENSE_TOKEN_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: LicenseTokenResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: LicenseTokenResponse = exchange(
+        MSG_TYPE_LICENSE_TOKEN_REQUEST,
+        MSG_TYPE_LICENSE_TOKEN_RESPONSE,
+        &LicenseTokenRequest {
+            product_ids: product_ids.to_vec(),
+            custom_developer_string: custom_developer_string.to_string(),
+        },
+    )?;
     Ok(response.token)
 }
 
@@ -674,20 +640,15 @@ pub(crate) fn get_associated_products(
     max_items: u32,
 ) -> Result<Vec<AssociatedProductEntry>, HRESULT> {
     let package_family_name = std::env::var(ENV_PACKAGE_FAMILY_NAME).map_err(|_| E_NOTIMPL)?;
-    let request_body = AssociatedProductsRequest {
-        package_family_name,
-        market: String::new(),
-        max_items,
-    };
-    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_ASSOCIATED_PRODUCTS_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: AssociatedProductsResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: AssociatedProductsResponse = exchange(
+        MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST,
+        MSG_TYPE_ASSOCIATED_PRODUCTS_RESPONSE,
+        &AssociatedProductsRequest {
+            package_family_name,
+            market: String::new(),
+            max_items,
+        },
+    )?;
     Ok(response.products)
 }
 
@@ -698,19 +659,14 @@ pub(crate) fn get_associated_products(
 /// `alternateid=PackageFamilyName` catalog lookup [`get_associated_products`] uses. `Ok(None)`
 /// is a "no such product", not an error - the caller decides what that means.
 pub(crate) fn resolve_product_id(package_family_name: &str) -> Result<Option<String>, HRESULT> {
-    let request_body = ResolveProductIdRequest {
-        package_family_name: package_family_name.to_string(),
-        market: String::new(),
-    };
-    let body = quick_xml::se::to_string(&request_body).map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_RESOLVE_PRODUCT_ID_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_RESOLVE_PRODUCT_ID_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: ResolveProductIdResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: ResolveProductIdResponse = exchange(
+        MSG_TYPE_RESOLVE_PRODUCT_ID_REQUEST,
+        MSG_TYPE_RESOLVE_PRODUCT_ID_RESPONSE,
+        &ResolveProductIdRequest {
+            package_family_name: package_family_name.to_string(),
+            market: String::new(),
+        },
+    )?;
     if response.product_id.is_empty() {
         Ok(None)
     } else {
@@ -722,18 +678,13 @@ pub(crate) fn resolve_product_id(package_family_name: &str) -> Result<Option<Str
 /// `xodus-service` always answers for whichever account's credentials are on this connection.
 /// `Ok(None)` when the account has no gamer picture set - an absence, not an error.
 pub(crate) fn get_gamer_picture() -> Result<Option<Vec<u8>>, HRESULT> {
-    let body = quick_xml::se::to_string(&GamerPictureRequest {
-        client_id: title_client_id(),
-    })
-    .map_err(|_| E_FAIL)?;
-
-    let (reply_type, reply_body) = request(MSG_TYPE_GAMER_PICTURE_REQUEST, body.as_bytes())?;
-    if reply_type != MSG_TYPE_GAMER_PICTURE_RESPONSE {
-        return Err(E_FAIL);
-    }
-
-    let text = std::str::from_utf8(&reply_body).map_err(|_| E_FAIL)?;
-    let response: GamerPictureResponse = quick_xml::de::from_str(text).map_err(|_| E_FAIL)?;
+    let response: GamerPictureResponse = exchange(
+        MSG_TYPE_GAMER_PICTURE_REQUEST,
+        MSG_TYPE_GAMER_PICTURE_RESPONSE,
+        &GamerPictureRequest {
+            client_id: title_client_id(),
+        },
+    )?;
     if response.picture.is_empty() {
         return Ok(None);
     }
