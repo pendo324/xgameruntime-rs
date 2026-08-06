@@ -1,20 +1,31 @@
-use std::ffi::{CStr, CString, c_char, c_void};
+//! Native runtime behind the Game Development Kit's `xgameruntime.dll`, exposing XTaskQueue,
+//! XAsync, XUser, XStore, XGameSave and friends to statically-linked XSAPI titles.
+//!
+//! The COM surface deliberately mirrors the Microsoft GDK API: method and field names match the
+//! published headers (PascalCase), so the whole crate opts out of `non_snake_case` rather than
+//! annotate each binding. This is the same convention the `winapi`/`windows` crates use.
+
+#![allow(non_snake_case)]
+
+use std::ffi::{CStr, c_char, c_void};
 use std::ptr::null_mut;
-use std::result::Result;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::minwindef::LPARAM;
 use windows::windef::HWND;
 use windows::winuser::{EnumWindows, MB_OK, MessageBoxW};
 
-use crate::com::{IXUserPlatform, XUserPlatformRemoteConnectEventHandlers};
+use crate::xuser::{IXUserImpl5, XUserPlatformRemoteConnectEventHandlers};
 use windows_core::{GUID, HRESULT, Interface};
-use windows_sys::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryA};
-use windows_sys::minwindef::HMODULE;
 
 mod com;
+mod ipc;
 mod results;
+mod task_queue;
 mod xasync;
+mod xasync_impl;
+mod xgamesave;
+mod xuser;
 
 type Ulong = u32;
 type Char = i8;
@@ -27,80 +38,17 @@ const E_NOTIMPL: HRESULT = HRESULT(0x80004001u32 as i32);
 #[repr(C)]
 pub struct InitializeOptions;
 
-type InitializeApiImplEx2Fn =
-    unsafe extern "system" fn(Ulong, Ulong, Char, *mut InitializeOptions) -> HRESULT;
-type QueryApiImplFn =
-    unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
-type UninitializeApiImplFn = unsafe extern "system" fn() -> HRESULT;
-
-struct DelegatedApi {
-    module: HMODULE,
-    initialize_api_impl_ex2: InitializeApiImplEx2Fn,
-    query_api_impl: QueryApiImplFn,
-    uninitialize_api_impl: UninitializeApiImplFn,
-}
-
-unsafe impl Send for DelegatedApi {}
-
-struct DelegatedApiState {
-    ref_count: usize,
-    api: Option<DelegatedApi>,
-}
-
-static DELEGATED_API_STATE: Mutex<DelegatedApiState> = Mutex::new(DelegatedApiState {
-    ref_count: 0,
-    api: None,
-});
-
-#[cfg(test)]
-static TEST_DELEGATED_DLL_PATH: Mutex<Option<CString>> = Mutex::new(None);
-
-fn delegated_state() -> std::sync::MutexGuard<'static, DelegatedApiState> {
-    DELEGATED_API_STATE
-        .lock()
-        .expect("delegated xgameruntime state poisoned")
-}
-
-#[cfg(test)]
-fn delegated_dll_name() -> CString {
-    TEST_DELEGATED_DLL_PATH
-        .lock()
-        .expect("delegated xgameruntime test path poisoned")
-        .clone()
-        .unwrap_or_else(|| CString::new("xgameruntime.gdk.dll").expect("static dll name"))
-}
-
-#[cfg(not(test))]
-fn delegated_dll_name() -> CString {
-    CString::new("xgameruntime.gdk.dll").expect("static dll name")
-}
-
-#[cfg(test)]
-pub(crate) fn set_delegated_dll_path_for_test(path: Option<&str>) {
-    let mut slot = TEST_DELEGATED_DLL_PATH
-        .lock()
-        .expect("delegated xgameruntime test path poisoned");
-    *slot = path.map(|path| CString::new(path).expect("dll path contains interior NUL"));
-}
-
-unsafe fn load_symbol<T>(module: HMODULE, symbol: &'static [u8]) -> Result<T, HRESULT>
-where
-    T: Copy,
-{
-    let proc = unsafe { GetProcAddress(module, symbol.as_ptr()) };
-    if let Some(proc) = proc {
-        Ok(unsafe { std::mem::transmute_copy(&proc) })
-    } else {
-        Err(E_FAIL)
-    }
-}
+/// How many times `InitializeApiImpl` has been called without a matching
+/// `UninitializeApiImpl`. Games in the same process can initialize independently, and
+/// the last one out is the one that tears down.
+static INIT_REF_COUNT: Mutex<usize> = Mutex::new(0);
 
 unsafe extern "system" fn find_window(hwnd: HWND, lp: LPARAM) -> windows_core::BOOL {
     unsafe {
         let result: &mut HWND = &mut *(lp.0 as *mut HWND);
         *result = hwnd;
     }
-    return false.into();
+    false.into()
 }
 
 unsafe extern "system" fn show(
@@ -142,145 +90,86 @@ unsafe extern "system" fn show(
 
 unsafe extern "system" fn hide() {}
 
-unsafe fn load_delegated_api() -> Result<DelegatedApi, HRESULT> {
-    let dll_name = delegated_dll_name();
-    let module = unsafe { LoadLibraryA(dll_name.as_ptr().cast()) };
-    if module.is_null() {
-        return Err(E_FAIL);
-    }
-
-    let initialize_api_impl_ex2 =
-        match unsafe { load_symbol::<InitializeApiImplEx2Fn>(module, b"InitializeApiImplEx2\0") } {
-            Ok(symbol) => symbol,
-            Err(error) => {
-                unsafe {
-                    FreeLibrary(module);
-                }
-                return Err(error);
-            }
-        };
-    let query_api_impl = match unsafe { load_symbol::<QueryApiImplFn>(module, b"QueryApiImpl\0") } {
-        Ok(symbol) => symbol,
-        Err(error) => {
-            unsafe {
-                FreeLibrary(module);
-            }
-            return Err(error);
-        }
-    };
-    let uninitialize_api_impl =
-        match unsafe { load_symbol::<UninitializeApiImplFn>(module, b"UninitializeApiImpl\0") } {
-            Ok(symbol) => symbol,
-            Err(error) => {
-                unsafe {
-                    FreeLibrary(module);
-                }
-                return Err(error);
-            }
-        };
-    Ok(DelegatedApi {
-        module,
-        initialize_api_impl_ex2,
-        query_api_impl,
-        uninitialize_api_impl,
-    })
-}
-
-fn initialize_delegate(
-    gdk_ver: Ulong,
-    gs_ver: Ulong,
-    mode: Char,
-    options: *mut InitializeOptions,
+fn initialize(
+    _gdk_ver: Ulong,
+    _gs_ver: Ulong,
+    _mode: Char,
+    _options: *mut InitializeOptions,
 ) -> HRESULT {
-    let mut state = delegated_state();
-    if state.ref_count > 0 {
-        state.ref_count += 1;
+    let mut count = INIT_REF_COUNT.lock().expect("init refcount poisoned");
+    *count += 1;
+    if *count > 1 {
         return S_OK;
     }
 
-    let api = match unsafe { load_delegated_api() } {
-        Ok(api) => api,
-        Err(error) => return error,
-    };
-
-    let hr = unsafe {
-        (api.initialize_api_impl_ex2)(gdk_ver, gs_ver, mode | 8 /* xplat mode */, options)
-    };
-    if hr != S_OK {
-        unsafe {
-            FreeLibrary(api.module);
-        }
-        return hr;
+    // Real GDK hosts install a process task queue (XTaskQueueSetCurrentProcessTaskQueue)
+    // before any async API runs. WineGDK's host never does, so libHttpClient - which falls
+    // back to XTaskQueueGetCurrentProcessTaskQueue whenever an async block's queue is NULL,
+    // as XSAPI's service calls are - would resolve a NULL queue and abort its own operations
+    // with E_INVALIDARG/E_ABORT. Install one here so those NULL-queue asyncs always have a
+    // valid ThreadPool queue to run on. See PLAN.md milestone 29 / open risk entry 8.
+    if !task_queue::has_process_queue() {
+        let queue = task_queue::Queue::new(
+            task_queue::DispatchMode::ThreadPool,
+            task_queue::DispatchMode::ThreadPool,
+        );
+        eprintln!(
+            "[diag] initialize: install process task queue work_port={:#x} completion_port={:#x}",
+            Arc::as_ptr(queue.port(task_queue::PortKind::Work)) as usize,
+            Arc::as_ptr(queue.port(task_queue::PortKind::Completion)) as usize,
+        );
+        task_queue::set_process_queue(Some(queue));
     }
 
-    let mut out: *mut c_void = std::ptr::null_mut();
-
-    let xuserguid = GUID::from_u128(0x01acd177_91f9_4763_a38e_ccbb55ce32e0);
-
-    let hr = unsafe { (api.query_api_impl)(&xuserguid, &IXUserPlatform::IID, &mut out) };
-
-    assert_eq!(hr, HRESULT(0));
-    assert!(!out.is_null());
-
-    if let Some(platform) = unsafe { IXUserPlatform::from_raw_borrowed(&out) } {
-        let callback: XUserPlatformRemoteConnectEventHandlers =
-            XUserPlatformRemoteConnectEventHandlers {
-                show: Some(show),
-                close: Some(hide),
-                context: std::ptr::null_mut(),
-            };
-        let hr = unsafe {
-            platform.XUserPlatformRemoteConnectSetEventHandlers(std::ptr::null_mut(), &callback)
+    // Wine has no CloudExperienceHost, so the remote-connect prompt that would normally
+    // be shown by the shell has to come from us.
+    let mut out: *mut c_void = null_mut();
+    if com::query_api_impl(&xuser::CLSID_XUSER, &IXUserImpl5::IID, &mut out) == S_OK
+        && let Some(platform) = unsafe { IXUserImpl5::from_raw_borrowed(&out) }
+    {
+        let handlers = XUserPlatformRemoteConnectEventHandlers {
+            show: Some(show),
+            close: Some(hide),
+            context: null_mut(),
         };
-        assert_eq!(hr, HRESULT(0));
+        let _ = unsafe { platform.XUserPlatformRemoteConnectSetEventHandlers(0, &handlers) };
     }
 
-    state.ref_count = 1;
-    state.api = Some(api);
     S_OK
 }
 
-pub(crate) fn delegated_query_api_impl(
-    runtime_class_id: *const GUID,
-    interface_id: *const GUID,
-    out: *mut *mut c_void,
-) -> HRESULT {
-    let state = delegated_state();
-    let Some(api) = state.api.as_ref() else {
-        unsafe {
-            *out = std::ptr::null_mut();
-        }
-        return E_NOTIMPL;
-    };
-
-    unsafe { (api.query_api_impl)(runtime_class_id, interface_id, out) }
-}
-
-fn uninitialize_delegate() -> HRESULT {
-    let mut state = delegated_state();
-    if state.ref_count == 0 {
+fn uninitialize() -> HRESULT {
+    let mut count = INIT_REF_COUNT.lock().expect("init refcount poisoned");
+    if *count == 0 {
         return E_NOTIMPL;
     }
-
-    state.ref_count -= 1;
-    if state.ref_count > 0 {
-        return S_OK;
+    *count -= 1;
+    if *count == 0 {
+        // Last init out: drop the process queue we installed so a later re-init recreates
+        // it fresh (its worker threads have been stopped by then anyway).
+        task_queue::set_process_queue(None);
     }
-
-    let Some(api) = state.api.take() else {
-        return E_FAIL;
-    };
-
-    let hr = unsafe { (api.uninitialize_api_impl)() };
-    unsafe {
-        FreeLibrary(api.module);
-    }
-    hr
+    S_OK
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_OK
+}
+
+/// DLL entry point. Nothing needs doing at attach or detach: every piece of runtime state is
+/// built lazily on first use, so returning success is the whole job.
+///
+/// # Safety
+/// `hinst` and `reserved` are only valid under the Windows loader's standard guarantees and are
+/// never dereferenced here, so the unsafe bounds are those implied by Windows calling this export.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn DllMain(
+    _hinst: *mut c_void,
+    _reason: u32,
+    _reserved: *mut c_void,
+) -> i32 {
+    1
 }
 
 #[unsafe(no_mangle)]
@@ -290,7 +179,7 @@ pub extern "system" fn InitializeApiImplEx2(
     mode: Char,
     options: *mut InitializeOptions,
 ) -> HRESULT {
-    initialize_delegate(gdk_ver, gs_ver, mode, options)
+    initialize(gdk_ver, gs_ver, mode, options)
 }
 
 #[unsafe(no_mangle)]
@@ -314,10 +203,40 @@ pub extern "system" fn QueryApiImpl(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn UninitializeApiImpl() -> HRESULT {
-    uninitialize_delegate()
+    uninitialize()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn XErrorReport(_status: HRESULT, _message: Lpcstr) -> HRESULT {
     E_NOTIMPL
+}
+
+const CLASS_E_CLASSNOTAVAILABLE: HRESULT = HRESULT(0x80040111u32 as i32);
+
+/// Diagnostic-only for now: this crate has never exported `DllGetClassObject`, so classic COM
+/// `CoCreateInstance` against any CLSID this DLL should serve (e.g. XSAPI's Xbox Live context,
+/// `CLSID_XsapiContext` in WineGDK's `main.c`) fails silently rather than reaching us at all.
+/// Logging which CLSIDs are actually requested here - before committing to porting WineGDK's
+/// large reverse-engineered service-broker vtable - tells us whether that path is even used by
+/// this title, rather than guessing.
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "system" fn DllGetClassObject(
+    clsid: *const GUID,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return windows_core::HRESULT(0x80004003u32 as i32); // E_POINTER
+    }
+    unsafe {
+        *out = null_mut();
+    }
+    let (clsid, iid) = unsafe { (clsid.as_ref(), iid.as_ref()) };
+    println!(
+        "DllGetClassObject: clsid {:?}, iid {:?} - not implemented",
+        clsid.map(|g| g.to_u128()),
+        iid.map(|g| g.to_u128()),
+    );
+    CLASS_E_CLASSNOTAVAILABLE
 }

@@ -62,19 +62,24 @@ fn write_c_string<const N: usize>(dst: &mut [c_char; N], value: &[u8]) {
     }
 }
 
-fn build_trial_game_license() -> XStoreGameLicense {
-    let mut license = XStoreGameLicense {
+/// A permanent, non-trial license for the running title.
+///
+/// A placeholder: entitlement really belongs to Xodus, which already knows what the
+/// signed-in account owns, and this will be answered over the IPC channel once licensing
+/// is wired up. Until then an active license is the right default - the alternative, a
+/// zeroed struct, reads as "not licensed" and makes a game refuse to start for a reason
+/// that has nothing to do with the account.
+fn build_full_game_license() -> XStoreGameLicense {
+    XStoreGameLicense {
         isActive: true,
-        isTrialOwnedByThisUser: true,
+        isTrialOwnedByThisUser: false,
         isDiscLicense: false,
-        isTrial: true,
-        trialTimeRemainingInSeconds: 3600,
-        expirationDate: 4_102_444_800,
+        isTrial: false,
+        trialTimeRemainingInSeconds: 0,
+        // Trials expire; a full license does not.
+        expirationDate: 0,
         ..XStoreGameLicense::default()
-    };
-    write_c_string(&mut license.skuStoreId, b"TRIAL-SKU-001");
-    write_c_string(&mut license.trialUniqueId, b"trial-license");
-    license
+    }
 }
 
 #[repr(C)]
@@ -921,12 +926,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         if storeContextHandle == 0 {
             return E_POINTER;
         }
-        unsafe {
-            xasync::run_sync(async_.cast(), move || {
-                // println!("storeContextHandle: {storeContextHandle}");
-                return Ok(XStoreGameLicense::default());
-            })
-        }
+        unsafe { xasync::run_sync(async_.cast(), move || Ok(build_full_game_license())) }
     }
 
     unsafe fn XStoreQueryGameLicenseResult(
@@ -1223,6 +1223,15 @@ static XSTORE_SINGLETON: OnceLock<GlobalInterface<IXStore>> = OnceLock::new();
 static XNETWORKING_SINGLETON: OnceLock<GlobalInterface<IXNetworking>> = OnceLock::new();
 static XPERSISTENT_LOCAL_STORAGE_SINGLETON: OnceLock<GlobalInterface<IXPersistentLocalStorage>> =
     OnceLock::new();
+static XASYNC_SINGLETON: OnceLock<GlobalInterface<crate::xasync::IXAsync>> = OnceLock::new();
+
+/// The async runtime is a process-wide singleton: task queues and in-flight calls have
+/// to be shared between every API that hands out an `XAsyncBlock`.
+fn xasync_singleton() -> &'static crate::xasync::IXAsync {
+    &XASYNC_SINGLETON
+        .get_or_init(|| GlobalInterface(crate::xasync_impl::XAsyncObject.into()))
+        .0
+}
 
 fn xfeature_singleton() -> &'static IXFeature {
     &XFEATURE_SINGLETON
@@ -1308,7 +1317,19 @@ pub fn query_api_impl(
         CLSID_XPERSISTENT_LOCAL_STORAGE => {
             query(xpersistent_local_storage_singleton(), interface_id, out)
         }
-        _ => crate::delegated_query_api_impl(runtime_class_id, interface_id, out),
+        crate::xasync::CLSID_XASYNC => query(xasync_singleton(), interface_id, out),
+        _ => {
+            // Everything this crate does not implement yet. There is no Microsoft DLL to
+            // fall back to - that is the point - so say so rather than crashing the game.
+            println!(
+                "query_api_impl: unimplemented class {:#034x}",
+                class_id.to_u128()
+            );
+            unsafe {
+                *out = std::ptr::null_mut();
+            }
+            E_NOTIMPL
+        }
     };
     res
 }
@@ -1316,14 +1337,11 @@ pub fn query_api_impl(
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_char, c_void};
-    use std::ptr::null;
 
-    use crate::com::{IXStore, XStoreGameLicense, get_result, query_api_impl};
-    use crate::xasync::{XAsyncBlock, get_status, run};
-    use crate::{
-        E_FAIL, InitializeApiImplEx2, UninitializeApiImpl, set_delegated_dll_path_for_test,
-    };
-    use windows_core::{GUID, HRESULT, Interface};
+    use crate::com::{IXStore, XStoreGameLicense, query_api_impl};
+    use crate::xasync::{XAsyncBlock, get_status};
+    use crate::{InitializeApiImplEx2, UninitializeApiImpl};
+    use windows_core::{HRESULT, Interface};
 
     fn read_c_string(bytes: &[c_char]) -> String {
         let len = bytes
@@ -1355,8 +1373,10 @@ mod tests {
         };
     }
 
+    /// The end-to-end shape a game sees: initialize the runtime, ask XStore for the
+    /// game license through an XAsyncBlock, then block on the result. Nothing here
+    /// loads a Microsoft DLL.
     #[test]
-    #[ignore = "requires xgameruntime.gdk.dll delegate support in the Wine environment"]
     fn query_game_license_async_blocks_via_xasync() {
         let init_hr = InitializeApiImplEx2(2604, 100000, 10, std::ptr::null_mut());
         assert_eq!(init_hr, HRESULT(0));
@@ -1399,76 +1419,18 @@ mod tests {
             )
         };
         assert_eq!(result_hr, HRESULT(0));
-        // assert_eq!(read_c_string(&license.skuStoreId), "TRIAL-SKU-001");
         assert!(license.isActive);
         assert!(!license.isTrialOwnedByThisUser);
         assert!(!license.isTrial);
         assert!(!license.isDiscLicense);
         assert_eq!(license.trialTimeRemainingInSeconds, 0);
-        // assert_eq!(read_c_string(&license.trialUniqueId), "trial-license");
-
-        let mut async_block = XAsyncBlock {
-            queue: std::ptr::null_mut(),
-            context: std::ptr::null_mut(),
-            callback: None,
-            internal: [0; std::mem::size_of::<*mut c_void>() * 4],
-        };
-
-        let tokio = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create Tokio runtime");
-
-        let handle = tokio.handle().clone();
-        #[derive(Debug)]
-        struct Payload {
-            v: i32,
-            v2: i64,
-            v3: GUID,
-        }
-
-        let hr = unsafe {
-            run(&mut async_block, async move {
-                println!("starting");
-
-                let task = handle.spawn(async {
-                    let client = reqwest::Client::new();
-
-                    let response = client
-                        .get("http://google.com")
-                        .send()
-                        .await
-                        .map_err(|_| E_FAIL)?;
-
-                    println!("finished {}", response.status());
-
-                    Ok::<Payload, HRESULT>(Payload {
-                        v: 0,
-                        v2: 323,
-                        v3: GUID::zeroed(),
-                    })
-                });
-
-                task.await.map_err(|_| E_FAIL)?
-            })
-        };
-        assert_eq!(hr, HRESULT(0));
-
-        let status_hr = unsafe { get_status(&mut async_block, true) };
-        assert_eq!(status_hr, Ok(()));
-
-        let mut payload: Payload = Payload {
-            v: 0,
-            v2: 0,
-            v3: GUID::zeroed(),
-        };
-        let hr = unsafe { get_result(&mut async_block, null(), &mut payload) };
-        assert_eq!(hr, Ok(()));
-
-        println!("res {:?}", payload);
+        assert_eq!(
+            read_c_string(&license.trialUniqueId),
+            "",
+            "a full license has no trial id"
+        );
 
         let uninit_hr = UninitializeApiImpl();
         assert_eq!(uninit_hr, HRESULT(0));
-        set_delegated_dll_path_for_test(None);
     }
 }
