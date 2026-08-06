@@ -215,7 +215,6 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         _token: *mut c_void,
     ) -> HRESULT {
         if let Some(callback) = callback {
-            // println!("XNetworkingRegisterConnectivityHintChanged");
             unsafe {
                 callback(
                     context,
@@ -240,7 +239,6 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         asyncBlock: *mut c_void,
     ) -> HRESULT {
         let _url = unsafe { CStr::from_ptr(url) };
-        // println!("XNetworkingQuerySecurityInformationForUrlAsync {}", url.to_string_lossy());
         unsafe {
             xasync::run_sync(asyncBlock.cast(), move || {
                 Ok(XNetworkingSecurityInformation {
@@ -264,7 +262,6 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         match r {
             Ok(size) => unsafe {
                 *securityInformationBufferByteCount = size;
-                // println!("XNetworkingQuerySecurityInformationForUrlAsyncResultSize: OK");
                 S_OK
             },
             Err(hr) => hr,

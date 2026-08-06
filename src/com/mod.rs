@@ -263,7 +263,6 @@ fn query<T: Interface + Clone>(
     let object = object.clone();
     let interface_id = unsafe { *interface_id };
     if unsafe { object.query(&interface_id, out) }.is_ok() {
-        // println!("query: ack {:#32x}", interface_id.to_u128());
         S_OK
     } else {
         diag!("query: no such interface {:#034x}", interface_id.to_u128());
@@ -284,27 +283,15 @@ pub fn query_api_impl(
     }
 
     let class_id = unsafe { *runtime_class_id };
-    // println!("query_api_impl: {:#8x}-{:#4x}-{:#4x}-{:#4x}", class_id.data1, class_id.data2, class_id.data3, class_id.data4);
+    diag!(
+        "query_api_impl: class {:#034x} interface {:#034x}",
+        class_id.to_u128(),
+        unsafe { *interface_id }.to_u128()
+    );
     match class_id {
-        IXFeature::IID => {
-            // println!("query_api_impl: {:#32x} {:#32x}", class_id.to_u128(), unsafe { *interface_id }.to_u128());
-            query(xfeature_singleton(), interface_id, out)
-        }
-        CLSID_XSTORE => {
-            eprintln!(
-                "[diag {:?}] query_api_impl: CLSID_XSTORE requested",
-                std::thread::current().id()
-            );
-            query(xstore_singleton(), interface_id, out)
-        }
-        CLSID_XNETWORKING => {
-            // println!(
-            //     "query_api_impl: {:#32x} {:#32x}",
-            //     class_id.to_u128(),
-            //     unsafe { *interface_id }.to_u128()
-            // );
-            query(xnetworking_singleton(), interface_id, out)
-        }
+        IXFeature::IID => query(xfeature_singleton(), interface_id, out),
+        CLSID_XSTORE => query(xstore_singleton(), interface_id, out),
+        CLSID_XNETWORKING => query(xnetworking_singleton(), interface_id, out),
         CLSID_XPERSISTENT_LOCAL_STORAGE => {
             query(xpersistent_local_storage_singleton(), interface_id, out)
         }
@@ -323,24 +310,12 @@ pub fn query_api_impl(
             interface_id,
             out,
         ),
-        CLSID_XSYSTEM => {
-            eprintln!(
-                "[diag {:?}] query_api_impl: CLSID_XSYSTEM requested",
-                std::thread::current().id()
-            );
-            query(xsystem_singleton(), interface_id, out)
-        }
+        CLSID_XSYSTEM => query(xsystem_singleton(), interface_id, out),
         CLSID_XGAME => query(xgame_singleton(), interface_id, out),
         CLSID_XGAME_INVITE => query(xgame_invite_singleton(), interface_id, out),
         CLSID_XGAME_PROTOCOL => query(xgame_protocol_singleton(), interface_id, out),
         CLSID_XERROR => query(xerror_singleton(), interface_id, out),
-        CLSID_XSYSTEM_ANALYTICS => {
-            eprintln!(
-                "[diag {:?}] query_api_impl: CLSID_XSYSTEM_ANALYTICS requested",
-                std::thread::current().id()
-            );
-            query(xsystem_analytics_singleton(), interface_id, out)
-        }
+        CLSID_XSYSTEM_ANALYTICS => query(xsystem_analytics_singleton(), interface_id, out),
         CLSID_XACCESSIBILITY => query(xaccessibility_singleton(), interface_id, out),
         CLSID_XAPPCAPTURE => query(xappcapture_singleton(), interface_id, out),
         CLSID_XAPPCAPTURE_METADATA => query(xappcapturemetadata_singleton(), interface_id, out),

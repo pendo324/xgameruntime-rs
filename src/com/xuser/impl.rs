@@ -24,17 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use windows_core::{HRESULT, IUnknown, implement, interface};
 
 use crate::E_NOTIMPL;
+use crate::com::hresult_stub;
 use crate::diag::{diag, stub};
-
-macro_rules! hresult_stub {
-    ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> HRESULT;)*) => {
-        $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT {
-            $(let _ = $arg;)*
-            eprintln!("[stub {:?}] {} -> E_NOTIMPL", std::thread::current().id(), stringify!($name));
-            E_NOTIMPL
-        })*
-    };
-}
 
 macro_rules! boolean_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> Boolean;)*) => {

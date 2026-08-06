@@ -868,7 +868,6 @@ impl IXStore_Impl for XStoreObject_Impl {
         async_: *mut c_void,
         license: *mut c_void,
     ) -> HRESULT {
-        // println!("XStoreQueryGameLicenseResult");
         if async_.is_null() || license.is_null() {
             return E_POINTER;
         }
