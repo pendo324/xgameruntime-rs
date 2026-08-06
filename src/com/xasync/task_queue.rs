@@ -132,9 +132,69 @@ impl Task {
 /// Source of unique per-`PortContext` ids (for tagging tasks by owner).
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Wall-clock origin for diagnostics, so every instrumented line carries a comparable
+/// millisecond stamp. Latency is the whole question here - "which port is starving, and by
+/// how long" - and untimestamped lines cannot answer it.
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+pub fn now_ms() -> u128 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// Live ports, for the periodic starvation report. Weak so a port that is genuinely gone
+/// drops out of the report instead of being kept alive by the instrumentation.
+static PORT_REGISTRY: Mutex<Vec<std::sync::Weak<Port>>> = Mutex::new(Vec::new());
+static REPORTER: OnceLock<()> = OnceLock::new();
+
+/// Every 2s, one line per live port: how much went in, how much came out, and how long it
+/// has been since anyone pumped it. A port whose `queued` climbs while `ran` stays flat is
+/// the thing stalling the game.
+fn start_port_reporter() {
+    REPORTER.get_or_init(|| {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let ports: Vec<Arc<Port>> = PORT_REGISTRY
+                    .lock()
+                    .expect("port registry poisoned")
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .collect();
+                let t = now_ms();
+                for port in ports {
+                    let state = port.state.lock().expect("port state poisoned");
+                    // Only report ports that have ever seen traffic; a fresh process has
+                    // dozens of idle ports and they drown the interesting ones.
+                    if state.submitted == 0 {
+                        continue;
+                    }
+                    let since = state
+                        .last_dispatch_ms
+                        .map(|ms| (t.saturating_sub(ms)).to_string())
+                        .unwrap_or_else(|| "never".to_string());
+                    eprintln!(
+                        "[qdiag t={t}] port={:p} mode={:?} depth={} queued={} ran={} in_flight={} since_last_dispatch_ms={since}",
+                        Arc::as_ptr(&port),
+                        port.mode,
+                        state.tasks.len(),
+                        state.submitted,
+                        state.dispatched,
+                        state.in_flight,
+                    );
+                }
+            }
+        });
+    });
+}
+
 #[derive(Default)]
 struct PortState {
     tasks: VecDeque<Task>,
+    /// Instrumentation: total callbacks ever accepted onto this port.
+    submitted: u64,
+    /// Instrumentation: total callbacks ever run off this port (any dispatch path).
+    dispatched: u64,
+    /// Instrumentation: [`now_ms`] of the last dispatch that ran at least one callback.
+    last_dispatch_ms: Option<u128>,
     /// Set once the *last* `PortContext` referencing this port is terminated. No further
     /// callbacks are accepted and workers exit. Deliberately not set when only one of
     /// several sharing contexts terminates - the others keep the port alive (this is the
@@ -161,12 +221,23 @@ pub struct Port {
 
 impl Port {
     fn new(mode: DispatchMode) -> Arc<Self> {
-        Arc::new(Self {
+        let port = Arc::new(Self {
             mode,
             state: Mutex::new(PortState::default()),
             ready: Condvar::new(),
             drained: Condvar::new(),
-        })
+        });
+        start_port_reporter();
+        PORT_REGISTRY
+            .lock()
+            .expect("port registry poisoned")
+            .push(Arc::downgrade(&port));
+        eprintln!(
+            "[qdiag t={}] port_create port={:p} mode={mode:?}",
+            now_ms(),
+            Arc::as_ptr(&port)
+        );
+        port
     }
 
     pub fn mode(&self) -> DispatchMode {
@@ -290,6 +361,7 @@ impl Port {
                 return true;
             }
 
+            state.submitted += 1;
             // Keep the queue ordered by deadline so the head is always the next task to
             // become ready, which is what the wait below times out against.
             let position = state
@@ -391,6 +463,8 @@ impl Port {
 
     fn finish_one(&self) {
         let mut state = self.state.lock().expect("port state poisoned");
+        state.dispatched += 1;
+        state.last_dispatch_ms = Some(now_ms());
         state.in_flight -= 1;
         drop(state);
         self.drained.notify_all();
@@ -419,6 +493,8 @@ impl Port {
             return;
         }
         let mut state = self.state.lock().expect("port state poisoned");
+        state.dispatched += n as u64;
+        state.last_dispatch_ms = Some(now_ms());
         state.in_flight -= n;
         drop(state);
         self.drained.notify_all();
@@ -442,7 +518,23 @@ impl Port {
                 self
             );
         }
+        let entered = now_ms();
+        let (depth_on_entry, idle_ms) = {
+            let state = self.state.lock().expect("port state poisoned");
+            (
+                state.tasks.len(),
+                state
+                    .last_dispatch_ms
+                    .map(|ms| entered.saturating_sub(ms) as i128)
+                    .unwrap_or(-1),
+            )
+        };
         let Some(first) = self.wait_for_task(Some(Duration::from_millis(timeout_ms as u64))) else {
+            eprintln!(
+                "[qdiag t={entered}] dispatch EMPTY port={:p} mode={:?} timeout_ms={timeout_ms} since_last_ms={idle_ms}",
+                std::ptr::from_ref(self),
+                self.mode
+            );
             return false;
         };
         let prev_in_dispatch = IN_DISPATCH.with(|f| f.replace(true));
@@ -471,6 +563,14 @@ impl Port {
         }
         IN_DISPATCH.with(|f| f.set(prev_in_dispatch));
         self.finish_n(total);
+        let done = now_ms();
+        let depth_after = self.state.lock().expect("port state poisoned").tasks.len();
+        eprintln!(
+            "[qdiag t={done}] dispatch RAN port={:p} mode={:?} ran={total} depth_on_entry={depth_on_entry} depth_after={depth_after} took_ms={} gap_since_last_ms={idle_ms}",
+            std::ptr::from_ref(self),
+            self.mode,
+            done.saturating_sub(entered),
+        );
         true
     }
 }

@@ -29,6 +29,9 @@ pub(crate) struct AsyncState {
     /// API that actually started the call.
     pub(crate) identity: *mut c_void,
     pub(crate) queue: Arc<Queue>,
+    /// Instrumentation: [`task_queue::now_ms`] at `XAsyncBegin`, so completion can report
+    /// end-to-end latency per API name - the number the load-time lag is actually made of.
+    pub(crate) began_ms: u128,
     pub(crate) block: *mut XAsyncBlock,
     pub(crate) inner: Mutex<Inner>,
     /// Signalled on completion, for `XAsyncGetStatus(wait: true)`.
@@ -217,11 +220,16 @@ pub(crate) struct Completion {
 
 pub(crate) unsafe extern "system" fn completion_callback(context: *mut c_void, _canceled: bool) {
     let completion = unsafe { Box::from_raw(context as *mut Completion) };
-    eprintln!(
-        "[diag] completion_callback invoking game callback for block={:p}",
-        completion.state.block
-    );
     let name = block_name(completion.state.block);
+    // The number that matters: XAsyncBegin -> the game hearing about it. Split into the
+    // work half and the wait-for-a-pump half by comparing against complete_state's
+    // `work_ms` for the same block.
+    eprintln!(
+        "[qdiag t={}] completion_callback name={name:?} block={:p} total_ms={}",
+        task_queue::now_ms(),
+        completion.state.block,
+        task_queue::now_ms().saturating_sub(completion.state.began_ms),
+    );
     let prev = current_identity();
     set_current_identity(name);
     unsafe { (completion.callback)(completion.state.block) };
@@ -283,10 +291,14 @@ pub(crate) fn complete_state(
         Duration::ZERO,
     );
     eprintln!(
-        "[diag] complete_state block={:p} submitted completion callback to queue: {submitted} completion_port_mode={:?} queue_ptr={:p}",
+        "[qdiag t={}] complete_state name={:?} block={:p} submitted={submitted} completion_port={:p} mode={:?} queue_ptr={:p} work_ms={}",
+        task_queue::now_ms(),
+        block_name(state.block),
         state.block,
+        Arc::as_ptr(state.queue.port(PortKind::Completion)),
         state.queue.port(PortKind::Completion).mode(),
-        Arc::as_ptr(&state.queue)
+        Arc::as_ptr(&state.queue),
+        task_queue::now_ms().saturating_sub(state.began_ms),
     );
     if !submitted {
         // The completion port is gone. The game still has to hear about the call, so

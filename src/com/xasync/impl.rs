@@ -141,6 +141,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             context,
             identity,
             queue,
+            began_ms: task_queue::now_ms(),
             block,
             inner: Mutex::new(Inner {
                 status: E_PENDING,
@@ -678,12 +679,26 @@ impl IXAsync_Impl for XAsyncObject_Impl {
     }
 
     unsafe fn XTaskQueueSetCurrentProcessTaskQueue(&self, queue: u64) {
-        eprintln!(
-            "[diag {:?}] XTaskQueueSetCurrentProcessTaskQueue handle={:#x}",
-            std::thread::current().id(),
-            queue
-        );
-        task_queue::set_process_queue(QueueHandle::get(queue));
+        let resolved = QueueHandle::get(queue);
+        // Which *ports* the process queue is made of is the load-bearing detail: the game
+        // pumps a handle of its own choosing, and if that handle's ports are not these
+        // ports, everything we submit here waits for a dispatch that never comes.
+        match &resolved {
+            Some(q) => eprintln!(
+                "[qdiag t={}] set_process_queue handle={queue:#x} queue_ptr={:p} work_port={:p} ({:?}) completion_port={:p} ({:?})",
+                task_queue::now_ms(),
+                Arc::as_ptr(q),
+                Arc::as_ptr(q.port(PortKind::Work)),
+                q.port(PortKind::Work).mode(),
+                Arc::as_ptr(q.port(PortKind::Completion)),
+                q.port(PortKind::Completion).mode(),
+            ),
+            None => eprintln!(
+                "[qdiag t={}] set_process_queue handle={queue:#x} -> UNRESOLVED",
+                task_queue::now_ms()
+            ),
+        }
+        task_queue::set_process_queue(resolved);
     }
 
     unsafe fn XThreadSetTimeSensitive(&self, is_time_sensitive_thread: BOOL) -> HRESULT {
