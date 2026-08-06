@@ -1,12 +1,10 @@
 //! Blocking loopback TCP client to `xodus-service`, for the `XUser` methods that need a
 //! real signed-in identity instead of an `E_NOTIMPL`.
 //!
-//! Blocking is deliberate, not a shortcut: `xasync.rs`'s `run_sync` executes its closure
-//! synchronously on whatever thread called the `*Async` entry point (`XAsyncOp::Begin` in
-//! `xasync_impl.rs` invokes it inline, before returning to the caller), and there is no
-//! ambient tokio reactor anywhere in this crate for `tokio::net` to hook into. A loopback
-//! round trip is expected to be fast, so blocking that one thread for it is architecturally
-//! consistent with everything else this crate already does.
+//! Blocking is deliberate, not a shortcut: `xasync`'s `run_sync` already moves the closure
+//! off the caller's thread onto its own worker pool, so the only thread this parks is one
+//! that exists to wait for exactly this. A loopback round trip is expected to be fast, and
+//! there is no async runtime anywhere in this crate for a non-blocking client to run on.
 //!
 //! This hand-mirrors two things from the sibling `xodus` workspace that this crate cannot
 //! depend on directly (it is a separate, Windows-only crate cross-compiled for Wine):

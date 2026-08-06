@@ -211,12 +211,12 @@ pub extern "system" fn XErrorReport(_status: HRESULT, _message: Lpcstr) -> HRESU
 
 const CLASS_E_CLASSNOTAVAILABLE: HRESULT = HRESULT(0x80040111u32 as i32);
 
-/// Diagnostic-only for now: this crate has never exported `DllGetClassObject`, so classic COM
-/// `CoCreateInstance` against any CLSID this DLL should serve (e.g. XSAPI's Xbox Live context,
-/// `CLSID_XsapiContext`) fails silently rather than reaching us at all. Logging which CLSIDs
-/// are actually requested here - before committing to porting the large reverse-engineered
-/// service-broker vtable - tells us whether that path is even used by this title, rather than
-/// guessing.
+/// Classic COM activation, which this runtime serves no class through.
+///
+/// The export exists to log what a title asks for: a `CoCreateInstance` against a CLSID this
+/// DLL should serve (e.g. XSAPI's Xbox Live context) would otherwise fail before reaching us
+/// at all. Knowing which CLSIDs are actually requested is what would justify porting the
+/// service-broker vtable behind them, rather than guessing at it.
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "system" fn DllGetClassObject(
