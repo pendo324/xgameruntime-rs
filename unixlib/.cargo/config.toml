@@ -1,0 +1,11 @@
+# The parent crate's `.cargo/config.toml` sets `target = "x86_64-pc-windows-msvc"` for
+# everything beneath it, which is right for the DLL and exactly wrong here: this half is
+# native Linux code, and is the only reason the pair can reach an AF_UNIX socket at all.
+# Cargo merges configs from the cwd upward with the nearest winning, so this re-points the
+# default target without disturbing the parent.
+#
+# Release builds use `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` instead, to pin
+# a glibc floor old enough for the runtimes games actually launch under. Plain `cargo
+# test`/`cargo build` here target the host, which is what you want while developing.
+[build]
+target = "x86_64-unknown-linux-gnu"

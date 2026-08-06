@@ -1,0 +1,23 @@
+# Its own workspace: this crate is built for the *host* (x86_64-unknown-linux-gnu, via
+# `cargo zigbuild`), while its parent is built for x86_64-pc-windows-msvc. Keeping them in
+# one workspace would force a shared lockfile and target dir across two unrelated triples.
+[workspace]
+
+[package]
+name = "xgameruntime-unixlib"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# Named to match the PE it pairs with: Wine's builtin loader looks for `<module>.so` next
+# to `<module>.dll`, and the LD_PRELOAD path wants a stable filename too.
+name = "xgameruntime"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+# No panic may cross back into Wine's PE side, so there is nothing for unwinding to do.
+panic = "abort"
+strip = true

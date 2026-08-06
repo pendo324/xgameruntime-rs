@@ -1,5 +1,18 @@
-//! Blocking loopback TCP client to `xodus-service`, for the `XUser` methods that need a
-//! real signed-in identity instead of an `E_NOTIMPL`.
+//! Blocking client to `xodus-service`, for the `XUser` methods that need a real signed-in
+//! identity instead of an `E_NOTIMPL`.
+//!
+//! Two transports speak the same framing to the same router. [`unixlib`] reaches
+//! `xodus.sock` directly by calling into native Linux code, and is preferred when the
+//! launcher set it up; loopback TCP is the fallback, and the only option when it did not,
+//! because Wine's Winsock cannot open a Unix socket at all. The choice is per request and
+//! costs one cached bool - see [`request_with_timeout`].
+//!
+//! TCP staying in as a real, maintained fallback rather than being dropped once `unixlib`
+//! existed is deliberate, for two reasons beyond compatibility with a launcher that has not
+//! set the builtin pair up: it is what a debugger or `strace` sees without also having to
+//! unpick the unixlib handoff, and it is what lets this crate's own tests and any tool that
+//! links it exercise the client on a plain Linux target, with no Wine process and no PE
+//! loader involved at all.
 //!
 //! Blocking is deliberate, not a shortcut: `xasync`'s `run_sync` already moves the closure
 //! off the caller's thread onto its own worker pool, so the only thread this parks is one
@@ -24,6 +37,8 @@ use windows_core::HRESULT;
 
 use crate::diag::diag;
 use crate::{E_FAIL, E_NOTIMPL};
+
+mod unixlib;
 
 const ENV_TCP_PORT: &str = "XODUS_TCP_PORT";
 const ENV_TCP_SECRET: &str = "XODUS_TCP_SECRET";
@@ -293,16 +308,42 @@ fn perform_handshake(stream: &mut TcpStream, secret: &[u8]) -> Result<(), HRESUL
     Ok(())
 }
 
-/// One request/response round trip: connect, handshake, send one v2-framed XML message,
-/// read one back. `xodus-service` serves one message per accepted connection loop
-/// iteration but happily keeps reading more on the same connection, so a fresh connection
-/// per call is not required by the protocol - it is just simpler, and loopback connection
-/// setup is cheap next to the token exchange this exists to make.
+/// Sends one framed request and reads the framed reply, over whichever transport this
+/// process has.
+///
+/// The unixlib transport is preferred purely because it is better authenticated: a Unix
+/// socket's mode keeps other users out and `SO_PEERCRED` says who connected, neither of
+/// which loopback TCP can prove - it leans on a shared secret that any same-uid process can
+/// read out of this process's environment. Latency is not the reason; the round trip is
+/// dominated by whatever `xodus-service` does upstream, not by the local framing.
+///
+/// Falling back is not an error path: a game launched by something that did not set the
+/// unixlib up runs entirely on TCP, which is the configuration this crate shipped with.
+///
+/// # Credentials
+/// Both transports carry live Xbox Live/MSA credentials - XBL3.0 tokens, MCTokens, XSTS
+/// JWTs. Nothing here may log a payload body, and neither transport leaves the machine.
+fn request_with_timeout(
+    msg_type: u16,
+    payload: &[u8],
+    io_timeout: Duration,
+) -> Result<(u16, Vec<u8>), HRESULT> {
+    if unixlib::available() {
+        return unixlib::request_with_timeout(msg_type, payload, io_timeout);
+    }
+    request_over_tcp(msg_type, payload, io_timeout)
+}
+
+/// One request/response round trip over loopback TCP: connect, handshake, send one
+/// v2-framed XML message, read one back. `xodus-service` serves one message per accepted
+/// connection loop iteration but happily keeps reading more on the same connection, so a
+/// fresh connection per call is not required by the protocol - it is just simpler, and
+/// loopback connection setup is cheap next to the token exchange this exists to make.
 ///
 /// Reply bodies carry live Xbox Live credentials (XSTS `XBL3.0` headers, MSA compact
 /// tokens, request signatures). Never log one: log sizes and outcomes instead, the way
 /// the callers below do.
-fn request_with_timeout(
+fn request_over_tcp(
     msg_type: u16,
     payload: &[u8],
     io_timeout: Duration,
