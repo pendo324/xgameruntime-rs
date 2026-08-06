@@ -56,7 +56,6 @@ use super::E_NOTIMPL;
 use crate::results::*;
 use std::env::temp_dir;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, Interface};
 
 /// GDK handle/primitive types shared by the stub classes, taken verbatim from the real GDK
@@ -149,107 +148,98 @@ pub(crate) use hresult_stub;
 pub(crate) use hresult_stub_panic;
 pub(crate) use void_stub;
 
+/// A COM interface pointer held in a `static`.
+///
+/// `windows-core` interfaces are neither `Send` nor `Sync`, because in general a COM object
+/// may be apartment-bound. Every object this crate hands out is free-threaded - they are
+/// plain Rust types behind a vtable, with their own interior synchronization - so a single
+/// process-wide instance shared across threads is exactly the GDK contract, and the unsafe
+/// impls below assert that.
 pub(crate) struct GlobalInterface<T>(T);
 
 unsafe impl<T> Send for GlobalInterface<T> {}
 unsafe impl<T> Sync for GlobalInterface<T> {}
 
-static XFEATURE_SINGLETON: OnceLock<GlobalInterface<IXFeature>> = OnceLock::new();
-static XSTORE_SINGLETON: OnceLock<GlobalInterface<IXStore>> = OnceLock::new();
-static XNETWORKING_SINGLETON: OnceLock<GlobalInterface<IXNetworking>> = OnceLock::new();
-static XPERSISTENT_LOCAL_STORAGE_SINGLETON: OnceLock<GlobalInterface<IXPersistentLocalStorage>> =
-    OnceLock::new();
-static XPACKAGE_SINGLETON: OnceLock<GlobalInterface<IXPackageImpl3>> = OnceLock::new();
-static XASYNC_SINGLETON: OnceLock<GlobalInterface<crate::com::xasync::IXAsync>> = OnceLock::new();
-static XSYSTEM_SINGLETON: OnceLock<GlobalInterface<IXSystem>> = OnceLock::new();
-static XGAME_SINGLETON: OnceLock<GlobalInterface<IXGameImpl3>> = OnceLock::new();
-static XGAME_INVITE_SINGLETON: OnceLock<GlobalInterface<IXGameInviteImpl2>> = OnceLock::new();
-static XGAME_PROTOCOL_SINGLETON: OnceLock<GlobalInterface<IXGameProtocolImpl>> = OnceLock::new();
-static XERROR_SINGLETON: OnceLock<GlobalInterface<IXErrorImpl>> = OnceLock::new();
-static XSYSTEM_ANALYTICS_SINGLETON: OnceLock<GlobalInterface<IXSystemAnalyticsImpl>> =
-    OnceLock::new();
-
-fn xsystem_singleton() -> &'static IXSystem {
-    &XSYSTEM_SINGLETON
-        .get_or_init(|| GlobalInterface(XSystem.into()))
-        .0
+/// Defines the process-wide instance of a COM object, built on first request.
+///
+/// Every `QueryApiImpl` class is a singleton: a title that asks for XStore twice must get
+/// the same object, since the state behind it (task queues, user handles, mount tables) is
+/// the runtime's, not the caller's.
+///
+/// ```ignore
+/// singleton! {
+///     /// Doc comment, if any.
+///     pub(crate) fn xdisplay_singleton() -> IXDisplayImpl = XDisplay;
+/// }
+/// ```
+macro_rules! singleton {
+    ($($(#[$meta:meta])* $vis:vis fn $name:ident() -> $iface:ty = $object:expr;)*) => {
+        $(
+            $(#[$meta])*
+            $vis fn $name() -> &'static $iface {
+                static INSTANCE: std::sync::OnceLock<$crate::com::GlobalInterface<$iface>> =
+                    std::sync::OnceLock::new();
+                &INSTANCE
+                    .get_or_init(|| $crate::com::GlobalInterface(($object).into()))
+                    .0
+            }
+        )*
+    };
 }
 
-fn xgame_singleton() -> &'static IXGameImpl3 {
-    &XGAME_SINGLETON
-        .get_or_init(|| GlobalInterface(XGame.into()))
-        .0
+pub(crate) use singleton;
+
+singleton! {
+    fn xsystem_singleton() -> IXSystem = XSystem;
 }
 
-fn xgame_invite_singleton() -> &'static IXGameInviteImpl2 {
-    &XGAME_INVITE_SINGLETON
-        .get_or_init(|| GlobalInterface(XGameInvite.into()))
-        .0
+singleton! {
+    fn xgame_singleton() -> IXGameImpl3 = XGame;
 }
 
-fn xgame_protocol_singleton() -> &'static IXGameProtocolImpl {
-    &XGAME_PROTOCOL_SINGLETON
-        .get_or_init(|| GlobalInterface(XGameProtocol.into()))
-        .0
+singleton! {
+    fn xgame_invite_singleton() -> IXGameInviteImpl2 = XGameInvite;
 }
 
-fn xerror_singleton() -> &'static IXErrorImpl {
-    &XERROR_SINGLETON
-        .get_or_init(|| GlobalInterface(XError.into()))
-        .0
+singleton! {
+    fn xgame_protocol_singleton() -> IXGameProtocolImpl = XGameProtocol;
 }
 
-fn xsystem_analytics_singleton() -> &'static IXSystemAnalyticsImpl {
-    &XSYSTEM_ANALYTICS_SINGLETON
-        .get_or_init(|| GlobalInterface(XSystemAnalytics.into()))
-        .0
+singleton! {
+    fn xerror_singleton() -> IXErrorImpl = XError;
 }
 
-/// The async runtime is a process-wide singleton: task queues and in-flight calls have
-/// to be shared between every API that hands out an `XAsyncBlock`.
-fn xasync_singleton() -> &'static crate::com::xasync::IXAsync {
-    &XASYNC_SINGLETON
-        .get_or_init(|| GlobalInterface(crate::com::xasync::r#impl::XAsyncObject.into()))
-        .0
+singleton! {
+    fn xsystem_analytics_singleton() -> IXSystemAnalyticsImpl = XSystemAnalytics;
 }
 
-fn xfeature_singleton() -> &'static IXFeature {
-    &XFEATURE_SINGLETON
-        .get_or_init(|| GlobalInterface(XFeature.into()))
-        .0
+singleton! {
+    /// The async runtime is a process-wide singleton: task queues and in-flight calls have
+    /// to be shared between every API that hands out an `XAsyncBlock`.
+    fn xasync_singleton() -> crate::com::xasync::IXAsync = crate::com::xasync::r#impl::XAsyncObject;
 }
 
-fn xstore_singleton() -> &'static IXStore {
-    &XSTORE_SINGLETON
-        .get_or_init(|| GlobalInterface(XStoreObject.into()))
-        .0
+singleton! {
+    fn xfeature_singleton() -> IXFeature = XFeature;
 }
 
-fn xnetworking_singleton() -> &'static IXNetworking {
-    &XNETWORKING_SINGLETON
-        .get_or_init(|| GlobalInterface(XNetworkingObject.into()))
-        .0
+singleton! {
+    fn xstore_singleton() -> IXStore = XStoreObject;
 }
 
-fn xpersistent_local_storage_singleton() -> &'static IXPersistentLocalStorage {
-    &XPERSISTENT_LOCAL_STORAGE_SINGLETON
-        .get_or_init(|| {
-            GlobalInterface(
-                XPersistentLocalStorage {
-                    tmp_path: temp_dir().to_string_lossy().into_owned(),
-                }
-                .into(),
-            )
-        })
-        .0
+singleton! {
+    fn xnetworking_singleton() -> IXNetworking = XNetworkingObject;
 }
 
-/// Only backs `XPackageGetMountPathSize`/`XPackageGetMountPath`/`XPackageCloseMountHandle` for
-/// real - see [`IXPackageImpl`]'s docs.
-fn xpackage_singleton() -> &'static IXPackageImpl3 {
-    &XPACKAGE_SINGLETON
-        .get_or_init(|| GlobalInterface(XPackageObject.into()))
-        .0
+singleton! {
+    fn xpersistent_local_storage_singleton() -> IXPersistentLocalStorage =
+        XPersistentLocalStorage { tmp_path: temp_dir().to_string_lossy().into_owned() };
+}
+
+singleton! {
+    /// Only backs `XPackageGetMountPathSize`/`XPackageGetMountPath`/`XPackageCloseMountHandle` for
+    /// real - see [`IXPackageImpl`]'s docs.
+    fn xpackage_singleton() -> IXPackageImpl3 = XPackageObject;
 }
 
 fn query<T: Interface + Clone>(

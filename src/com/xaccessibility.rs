@@ -1,8 +1,7 @@
-use super::GlobalInterface;
+use super::singleton;
 use super::{BOOLEAN, SIZE_T, UINT32, XSpeechSynthesizerHandle, XSpeechSynthesizerStreamHandle};
 use crate::E_NOTIMPL;
 use std::ffi::{c_char, c_void};
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 // ---------------------------------------------------------------------------------------
 // XAccessibilityImpl (`xaccessibility.idl`)
@@ -224,10 +223,6 @@ impl IXAccessibilityImpl_Impl for XAccessibility_Impl {
 
 impl IXAccessibilityImpl2_Impl for XAccessibility_Impl {}
 
-static XACCESSIBILITY_SINGLETON: OnceLock<GlobalInterface<IXAccessibilityImpl2>> = OnceLock::new();
-
-pub(crate) fn xaccessibility_singleton() -> &'static IXAccessibilityImpl2 {
-    &XACCESSIBILITY_SINGLETON
-        .get_or_init(|| GlobalInterface(XAccessibility.into()))
-        .0
+singleton! {
+    pub(crate) fn xaccessibility_singleton() -> IXAccessibilityImpl2 = XAccessibility;
 }

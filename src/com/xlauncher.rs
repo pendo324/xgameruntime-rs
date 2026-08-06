@@ -1,8 +1,7 @@
-use super::GlobalInterface;
+use super::singleton;
 use super::{XDisplayTimeoutDeferralHandle, XUserHandle};
 use crate::E_NOTIMPL;
 use std::ffi::c_char;
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 pub(crate) const CLSID_XLAUNCHER: GUID = GUID::from_u128(0x1b339674_328d_4283_a200_3171f18d3639);
 
@@ -32,10 +31,6 @@ impl IXLauncherImpl_Impl for XLauncher_Impl {
     unsafe fn XDisplayCloseTimeoutDeferralHandle(&self, _handle: XDisplayTimeoutDeferralHandle) {}
 }
 
-static XLAUNCHER_SINGLETON: OnceLock<GlobalInterface<IXLauncherImpl>> = OnceLock::new();
-
-pub(crate) fn xlauncher_singleton() -> &'static IXLauncherImpl {
-    &XLAUNCHER_SINGLETON
-        .get_or_init(|| GlobalInterface(XLauncher.into()))
-        .0
+singleton! {
+    pub(crate) fn xlauncher_singleton() -> IXLauncherImpl = XLauncher;
 }

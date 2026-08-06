@@ -1,11 +1,10 @@
-use super::GlobalInterface;
+use super::singleton;
 use super::{
     BOOLEAN, FALSE, FLOAT, SIZE_T, UINT32, XGameStreamingClientId, XTaskQueueHandle,
     XTaskQueueRegistrationToken,
 };
 use crate::E_NOTIMPL;
 use std::ffi::{c_char, c_void};
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 // ---------------------------------------------------------------------------------------
 // XGameStreamingImpl / XGameStreamingImpl2 / XGameStreamingImpl3 (`xgamestreaming.idl`)
@@ -376,10 +375,6 @@ impl IXGameStreamingImpl3_Impl for XGameStreaming_Impl {
     }
 }
 
-static XGAMESTREAMING_SINGLETON: OnceLock<GlobalInterface<IXGameStreamingImpl3>> = OnceLock::new();
-
-pub(crate) fn xgamestreaming_singleton() -> &'static IXGameStreamingImpl3 {
-    &XGAMESTREAMING_SINGLETON
-        .get_or_init(|| GlobalInterface(XGameStreaming.into()))
-        .0
+singleton! {
+    pub(crate) fn xgamestreaming_singleton() -> IXGameStreamingImpl3 = XGameStreaming;
 }

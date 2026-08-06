@@ -1,8 +1,7 @@
-use super::GlobalInterface;
 use super::XUserHandle;
+use super::singleton;
 use crate::E_NOTIMPL;
 use std::ffi::c_char;
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 // ---------------------------------------------------------------------------------------
 // XGameEventImpl (`xgameevent.idl`)
@@ -41,10 +40,6 @@ impl IXGameEventImpl_Impl for XGameEvent_Impl {
     }
 }
 
-static XGAMEEVENT_SINGLETON: OnceLock<GlobalInterface<IXGameEventImpl>> = OnceLock::new();
-
-pub(crate) fn xgameevent_singleton() -> &'static IXGameEventImpl {
-    &XGAMEEVENT_SINGLETON
-        .get_or_init(|| GlobalInterface(XGameEvent.into()))
-        .0
+singleton! {
+    pub(crate) fn xgameevent_singleton() -> IXGameEventImpl = XGameEvent;
 }

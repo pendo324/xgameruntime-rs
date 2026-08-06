@@ -3,12 +3,12 @@
 
 use super::*;
 use crate::E_FAIL;
+use crate::com::singleton;
 use crate::com::xasync::{self, XAsyncBlock, get_result};
 use crate::results::*;
 
 use std::ffi::{c_char, c_void};
 use std::ptr::null_mut;
-use std::sync::OnceLock;
 
 use windows_core::{HRESULT, implement};
 
@@ -638,15 +638,6 @@ impl IXGameSaveImpl2_Impl for XGameSaveObject_Impl {
 
 impl IXGameSaveImpl3_Impl for XGameSaveObject_Impl {}
 
-struct GlobalInterface<T>(T);
-
-unsafe impl<T> Send for GlobalInterface<T> {}
-unsafe impl<T> Sync for GlobalInterface<T> {}
-
-static XGAMESAVE_SINGLETON: OnceLock<GlobalInterface<IXGameSaveImpl3>> = OnceLock::new();
-
-pub fn xgamesave_singleton() -> &'static IXGameSaveImpl3 {
-    &XGAMESAVE_SINGLETON
-        .get_or_init(|| GlobalInterface(XGameSaveObject.into()))
-        .0
+singleton! {
+    pub fn xgamesave_singleton() -> IXGameSaveImpl3 = XGameSaveObject;
 }

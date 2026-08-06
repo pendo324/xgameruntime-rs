@@ -1,11 +1,10 @@
-use super::GlobalInterface;
+use super::singleton;
 use super::{
     BOOLEAN, DOUBLE, FALSE, INT32, UINT32, UINT64, XTaskQueueHandle, XTaskQueueRegistrationToken,
     XUserHandle,
 };
 use crate::E_NOTIMPL;
 use std::ffi::{c_char, c_void};
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 // ---------------------------------------------------------------------------------------
 // XAppCaptureMetadataImpl (`xappcapture.idl`)
@@ -203,11 +202,6 @@ impl IXAppCaptureMetadataImpl_Impl for XAppCaptureMetadata_Impl {
     }
 }
 
-static XAPPCAPTUREMETADATA_SINGLETON: OnceLock<GlobalInterface<IXAppCaptureMetadataImpl>> =
-    OnceLock::new();
-
-pub(crate) fn xappcapturemetadata_singleton() -> &'static IXAppCaptureMetadataImpl {
-    &XAPPCAPTUREMETADATA_SINGLETON
-        .get_or_init(|| GlobalInterface(XAppCaptureMetadata.into()))
-        .0
+singleton! {
+    pub(crate) fn xappcapturemetadata_singleton() -> IXAppCaptureMetadataImpl = XAppCaptureMetadata;
 }

@@ -1,8 +1,7 @@
-use super::GlobalInterface;
+use super::singleton;
 use super::{BOOLEAN, FALSE, XTaskQueueHandle, XTaskQueueRegistrationToken};
 use crate::E_NOTIMPL;
 use std::ffi::{c_char, c_void};
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 // ---------------------------------------------------------------------------------------
 // XGameActivationImpl (`xgameactivation.idl`)
@@ -54,10 +53,6 @@ impl IXGameActivationImpl_Impl for XGameActivation_Impl {
     }
 }
 
-static XGAMEACTIVATION_SINGLETON: OnceLock<GlobalInterface<IXGameActivationImpl>> = OnceLock::new();
-
-pub(crate) fn xgameactivation_singleton() -> &'static IXGameActivationImpl {
-    &XGAMEACTIVATION_SINGLETON
-        .get_or_init(|| GlobalInterface(XGameActivation.into()))
-        .0
+singleton! {
+    pub(crate) fn xgameactivation_singleton() -> IXGameActivationImpl = XGameActivation;
 }

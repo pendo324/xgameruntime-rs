@@ -1,10 +1,9 @@
-use super::GlobalInterface;
+use super::singleton;
 use super::{
     BOOLEAN, SIZE_T, UINT32, UINT64, XGameUiCallbackHandle, XGameUiTextEntryHandle, XUserHandle,
 };
 use crate::E_NOTIMPL;
 use std::ffi::{c_char, c_void};
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 // ---------------------------------------------------------------------------------------
 // XGameUiImpl / XGameUiImpl2 / XGameUiImpl3 / XGameUiImpl4 (`xgameui.idl`)
@@ -583,10 +582,6 @@ impl IXGameUiImpl4_Impl for XGameUi_Impl {
     }
 }
 
-static XGAMEUI_SINGLETON: OnceLock<GlobalInterface<IXGameUiImpl4>> = OnceLock::new();
-
-pub(crate) fn xgameui_singleton() -> &'static IXGameUiImpl4 {
-    &XGAMEUI_SINGLETON
-        .get_or_init(|| GlobalInterface(XGameUi.into()))
-        .0
+singleton! {
+    pub(crate) fn xgameui_singleton() -> IXGameUiImpl4 = XGameUi;
 }

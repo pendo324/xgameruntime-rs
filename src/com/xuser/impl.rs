@@ -19,12 +19,13 @@ use crate::results::*;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows_core::{HRESULT, IUnknown, implement, interface};
 
 use crate::E_NOTIMPL;
 use crate::com::hresult_stub;
+use crate::com::singleton;
 use crate::diag::{diag, stub};
 
 macro_rules! boolean_stub {
@@ -1394,24 +1395,12 @@ impl IXUserDeviceImpl2_Impl for XUserDeviceObject_Impl {}
 // Singletons
 // ---------------------------------------------------------------------------------------
 
-struct GlobalInterface<T>(T);
-
-unsafe impl<T> Send for GlobalInterface<T> {}
-unsafe impl<T> Sync for GlobalInterface<T> {}
-
-static XUSER_SINGLETON: OnceLock<GlobalInterface<IXUserImpl6>> = OnceLock::new();
-static XUSER_DEVICE_SINGLETON: OnceLock<GlobalInterface<IXUserDeviceImpl2>> = OnceLock::new();
-
-pub fn xuser_singleton() -> &'static IXUserImpl6 {
-    &XUSER_SINGLETON
-        .get_or_init(|| GlobalInterface(XUserObject.into()))
-        .0
+singleton! {
+    pub fn xuser_singleton() -> IXUserImpl6 = XUserObject;
 }
 
-pub fn xuser_device_singleton() -> &'static IXUserDeviceImpl2 {
-    &XUSER_DEVICE_SINGLETON
-        .get_or_init(|| GlobalInterface(XUserDeviceObject.into()))
-        .0
+singleton! {
+    pub fn xuser_device_singleton() -> IXUserDeviceImpl2 = XUserDeviceObject;
 }
 
 /// Resolves an `XUserHandle` to the xuid it was signed in with, for callers outside this

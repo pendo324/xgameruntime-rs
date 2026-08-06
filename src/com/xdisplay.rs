@@ -1,8 +1,7 @@
-use super::GlobalInterface;
 use super::UINT32;
+use super::singleton;
 use crate::E_NOTIMPL;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 // ---------------------------------------------------------------------------------------
 // XDisplayImpl + XLauncherImpl (both in `xdisplay.idl`)
@@ -37,10 +36,6 @@ impl IXDisplayImpl_Impl for XDisplay_Impl {
     }
 }
 
-static XDISPLAY_SINGLETON: OnceLock<GlobalInterface<IXDisplayImpl>> = OnceLock::new();
-
-pub(crate) fn xdisplay_singleton() -> &'static IXDisplayImpl {
-    &XDISPLAY_SINGLETON
-        .get_or_init(|| GlobalInterface(XDisplay.into()))
-        .0
+singleton! {
+    pub(crate) fn xdisplay_singleton() -> IXDisplayImpl = XDisplay;
 }

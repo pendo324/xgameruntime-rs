@@ -1,11 +1,10 @@
-use super::GlobalInterface;
+use super::singleton;
 use super::{
     BOOLEAN, SIZE_T, UINT32, UINT64, XAppCaptureLocalStreamHandle,
     XAppCaptureScreenshotStreamHandle, XUserHandle,
 };
 use crate::E_NOTIMPL;
 use std::ffi::{c_char, c_void};
-use std::sync::OnceLock;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 // ---------------------------------------------------------------------------------------
 // XAppCaptureImpl / XAppCaptureImpl2 / XAppCaptureImpl3 / XAppCaptureImpl4
@@ -217,10 +216,6 @@ impl IXAppCaptureImpl4_Impl for XAppCapture_Impl {
     }
 }
 
-static XAPPCAPTURE_SINGLETON: OnceLock<GlobalInterface<IXAppCaptureImpl4>> = OnceLock::new();
-
-pub(crate) fn xappcapture_singleton() -> &'static IXAppCaptureImpl4 {
-    &XAPPCAPTURE_SINGLETON
-        .get_or_init(|| GlobalInterface(XAppCapture.into()))
-        .0
+singleton! {
+    pub(crate) fn xappcapture_singleton() -> IXAppCaptureImpl4 = XAppCapture;
 }
