@@ -17,9 +17,11 @@ use windows::winuser::{EnumWindows, MB_OK, MessageBoxW};
 
 use crate::com::xasync::task_queue;
 use crate::com::xuser::{IXUserImpl5, XUserPlatformRemoteConnectEventHandlers};
+use crate::diag::{diag, stub};
 use windows_core::{GUID, HRESULT, Interface};
 
 mod com;
+mod diag;
 mod ipc;
 mod results;
 
@@ -109,10 +111,10 @@ fn initialize(
             task_queue::DispatchMode::ThreadPool,
             task_queue::DispatchMode::ThreadPool,
         );
-        eprintln!(
-            "[diag] initialize: install process task queue work_port={:#x} completion_port={:#x}",
+        diag!(
+            "initialize: install process task queue work_port={:#x} completion_port={:#x}",
             Arc::as_ptr(queue.port(task_queue::PortKind::Work)) as usize,
-            Arc::as_ptr(queue.port(task_queue::PortKind::Completion)) as usize,
+            Arc::as_ptr(queue.port(task_queue::PortKind::Completion)) as usize
         );
         task_queue::set_process_queue(Some(queue));
     }
@@ -229,8 +231,8 @@ pub extern "system" fn DllGetClassObject(
         *out = null_mut();
     }
     let (clsid, iid) = unsafe { (clsid.as_ref(), iid.as_ref()) };
-    println!(
-        "DllGetClassObject: clsid {:?}, iid {:?} - not implemented",
+    stub!(
+        "DllGetClassObject: clsid {:?}, iid {:?}",
         clsid.map(|g| g.to_u128()),
         iid.map(|g| g.to_u128()),
     );

@@ -16,23 +16,12 @@
 //! of Microsoft's; the observable contract is the ordering and cancellation rules
 //! encoded in the tests at the bottom of this file.
 
+use crate::diag::{diag, now_ms};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-/// Opt-in per-task dispatch logging. The hot loop writes one line per dispatched callback
-/// (a locked stderr syscall); with producers like the websocket send flood that is hundreds
-/// of serialized writes per second. Gate it behind `XODUS_DIAG` (off by default).
-static DIAG: OnceLock<bool> = OnceLock::new();
-pub(crate) fn diag() -> bool {
-    *DIAG.get_or_init(|| {
-        std::env::var("XODUS_DIAG")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-    })
-}
 
 // True while a callback is being run inline by `Port::dispatch` on the pump thread.
 // A callback that then blocks in `XAsyncGetStatus(wait: true)` would deadlock: the async
@@ -132,14 +121,6 @@ impl Task {
 /// Source of unique per-`PortContext` ids (for tagging tasks by owner).
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Wall-clock origin for diagnostics, so every instrumented line carries a comparable
-/// millisecond stamp. Latency is the whole question here - "which port is starving, and by
-/// how long" - and untimestamped lines cannot answer it.
-static EPOCH: OnceLock<Instant> = OnceLock::new();
-pub fn now_ms() -> u128 {
-    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
-}
-
 /// Live ports, for the periodic starvation report. Weak so a port that is genuinely gone
 /// drops out of the report instead of being kept alive by the instrumentation.
 static PORT_REGISTRY: Mutex<Vec<std::sync::Weak<Port>>> = Mutex::new(Vec::new());
@@ -149,6 +130,9 @@ static REPORTER: OnceLock<()> = OnceLock::new();
 /// has been since anyone pumped it. A port whose `queued` climbs while `ran` stays flat is
 /// the thing stalling the game.
 fn start_port_reporter() {
+    if !crate::diag::enabled() {
+        return;
+    }
     REPORTER.get_or_init(|| {
         std::thread::spawn(|| {
             loop {
@@ -171,8 +155,8 @@ fn start_port_reporter() {
                         .last_dispatch_ms
                         .map(|ms| (t.saturating_sub(ms)).to_string())
                         .unwrap_or_else(|| "never".to_string());
-                    eprintln!(
-                        "[qdiag t={t}] port={:p} mode={:?} depth={} queued={} ran={} in_flight={} since_last_dispatch_ms={since}",
+                    diag!(
+                        "port={:p} mode={:?} depth={} queued={} ran={} in_flight={} since_last_dispatch_ms={since}",
                         Arc::as_ptr(&port),
                         port.mode,
                         state.tasks.len(),
@@ -232,11 +216,7 @@ impl Port {
             .lock()
             .expect("port registry poisoned")
             .push(Arc::downgrade(&port));
-        eprintln!(
-            "[qdiag t={}] port_create port={:p} mode={mode:?}",
-            now_ms(),
-            Arc::as_ptr(&port)
-        );
+        diag!("port_create port={:p} mode={mode:?}", Arc::as_ptr(&port));
         port
     }
 
@@ -403,14 +383,12 @@ impl Port {
 
     fn worker(self: Arc<Self>) {
         while let Some(task) = self.wait_for_task(None) {
-            if diag() {
-                eprintln!(
-                    "[diag] WORKER running task owner={} ctx={:p} port={:p}",
-                    task.owner,
-                    task.context,
-                    Arc::as_ptr(&self)
-                );
-            }
+            diag!(
+                "WORKER running task owner={} ctx={:p} port={:p}",
+                task.owner,
+                task.context,
+                Arc::as_ptr(&self)
+            );
             task.run(false);
             self.finish_one();
         }
@@ -511,10 +489,9 @@ impl Port {
     /// is done we return without blocking for new work (a hard freeze otherwise whenever
     /// submissions dry up and the rest of the process stalls).
     pub fn dispatch(&self, timeout_ms: u32) -> bool {
-        if diag() && timeout_ms > 5000 {
-            eprintln!(
-                "[diag {:?}] Port::dispatch entering long wait, timeout_ms={timeout_ms} self={:p}",
-                std::thread::current().id(),
+        if timeout_ms > 5000 {
+            diag!(
+                "Port::dispatch entering long wait, timeout_ms={timeout_ms} self={:p}",
                 self
             );
         }
@@ -530,43 +507,39 @@ impl Port {
             )
         };
         let Some(first) = self.wait_for_task(Some(Duration::from_millis(timeout_ms as u64))) else {
-            eprintln!(
-                "[qdiag t={entered}] dispatch EMPTY port={:p} mode={:?} timeout_ms={timeout_ms} since_last_ms={idle_ms}",
+            diag!(
+                "dispatch EMPTY port={:p} mode={:?} timeout_ms={timeout_ms} since_last_ms={idle_ms}",
                 std::ptr::from_ref(self),
                 self.mode
             );
             return false;
         };
         let prev_in_dispatch = IN_DISPATCH.with(|f| f.replace(true));
-        if diag() {
-            eprintln!(
-                "[diag] Port::dispatch RUNNING task owner={} ctx={:p} port={:p}",
-                first.owner,
-                first.context,
-                std::ptr::from_ref(self)
-            );
-        }
+        diag!(
+            "Port::dispatch RUNNING task owner={} ctx={:p} port={:p}",
+            first.owner,
+            first.context,
+            std::ptr::from_ref(self)
+        );
         first.run(false);
 
         let batch = self.drain_ready();
         let total = 1 + batch.len();
         for task in batch {
-            if diag() {
-                eprintln!(
-                    "[diag] Port::dispatch RUNNING task owner={} ctx={:p} port={:p}",
-                    task.owner,
-                    task.context,
-                    std::ptr::from_ref(self)
-                );
-            }
+            diag!(
+                "Port::dispatch RUNNING task owner={} ctx={:p} port={:p}",
+                task.owner,
+                task.context,
+                std::ptr::from_ref(self)
+            );
             task.run(false);
         }
         IN_DISPATCH.with(|f| f.set(prev_in_dispatch));
         self.finish_n(total);
         let done = now_ms();
         let depth_after = self.state.lock().expect("port state poisoned").tasks.len();
-        eprintln!(
-            "[qdiag t={done}] dispatch RAN port={:p} mode={:?} ran={total} depth_on_entry={depth_on_entry} depth_after={depth_after} took_ms={} gap_since_last_ms={idle_ms}",
+        diag!(
+            "dispatch RAN port={:p} mode={:?} ran={total} depth_on_entry={depth_on_entry} depth_after={depth_after} took_ms={} gap_since_last_ms={idle_ms}",
             std::ptr::from_ref(self),
             self.mode,
             done.saturating_sub(entered),

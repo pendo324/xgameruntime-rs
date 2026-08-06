@@ -11,6 +11,7 @@ use windows_sys::core::BOOL;
 use super::bool_stub;
 use super::hresult_stub;
 use super::void_stub;
+use crate::diag::diag;
 pub const CLSID_XSTORE: GUID = GUID::from_u128(0x0dd112ac_7c24_448c_b92b_3960fb5bd30c);
 const STORE_SKU_ID_SIZE: usize = 18;
 const TRIAL_UNIQUE_ID_MAX_SIZE: usize = 64;
@@ -843,10 +844,7 @@ impl IXStore_Impl for XStoreObject_Impl {
     }
 
     unsafe fn XStoreCreateContext(&self, _user: u64, storeContextHandle: *mut u64) -> HRESULT {
-        eprintln!(
-            "[diag {:?}] XStoreCreateContext(user={_user}) -> handle=1",
-            std::thread::current().id()
-        );
+        diag!("XStoreCreateContext(user={_user}) -> handle=1");
         unsafe {
             *storeContextHandle = 1;
         };
@@ -858,10 +856,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         storeContextHandle: u64,
         async_: *mut c_void,
     ) -> HRESULT {
-        eprintln!(
-            "[diag {:?}] XStoreQueryGameLicenseAsync(context={storeContextHandle})",
-            std::thread::current().id()
-        );
+        diag!("XStoreQueryGameLicenseAsync(context={storeContextHandle})");
         if storeContextHandle == 0 {
             return E_POINTER;
         }

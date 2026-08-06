@@ -30,6 +30,7 @@ pub mod xsystem;
 pub mod xsystemanalytics;
 pub mod xuser;
 
+use crate::diag::{diag, stub};
 pub(crate) use xaccessibility::*;
 pub(crate) use xappcapture::*;
 pub(crate) use xappcapturemetadata::*;
@@ -112,7 +113,7 @@ macro_rules! hresult_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> HRESULT;)*) => {
         $(unsafe fn $name(&self $(, $arg: $ty)*) -> HRESULT {
             $(let _ = $arg;)*
-            eprintln!("[stub {:?}] {} -> E_NOTIMPL", std::thread::current().id(), stringify!($name));
+            $crate::diag::stub!("{} -> E_NOTIMPL", stringify!($name));
             E_NOTIMPL
         })*
     };
@@ -128,7 +129,7 @@ macro_rules! bool_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> BOOL;)*) => {
         $(unsafe fn $name(&self $(, $arg: $ty)*) -> BOOL {
             $(let _ = $arg;)*
-            eprintln!("[stub {:?}] {} -> false", std::thread::current().id(), stringify!($name));
+            $crate::diag::stub!("{} -> false", stringify!($name));
             false.into()
         })*
     };
@@ -138,7 +139,7 @@ macro_rules! void_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> ();)*) => {
         $(unsafe fn $name(&self $(, $arg: $ty)*) -> () {
             $(let _ = $arg;)*
-            eprintln!("[stub {:?}] {}", std::thread::current().id(), stringify!($name));
+            $crate::diag::stub!("{}", stringify!($name));
         })*
     };
 }
@@ -265,7 +266,7 @@ fn query<T: Interface + Clone>(
         // println!("query: ack {:#32x}", interface_id.to_u128());
         S_OK
     } else {
-        println!("query: nack {:#32x}", interface_id.to_u128());
+        diag!("query: no such interface {:#034x}", interface_id.to_u128());
         unsafe {
             *out = std::ptr::null_mut();
         }
@@ -352,7 +353,7 @@ pub fn query_api_impl(
         _ => {
             // Everything this crate does not implement yet. There is no Microsoft DLL to
             // fall back to - that is the point - so say so rather than crashing the game.
-            println!(
+            stub!(
                 "query_api_impl: unimplemented class {:#034x}",
                 class_id.to_u128()
             );

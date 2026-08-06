@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use windows_core::HRESULT;
 
+use crate::diag::diag;
 use crate::{E_FAIL, E_NOTIMPL};
 
 const ENV_TCP_PORT: &str = "XODUS_TCP_PORT";
@@ -315,14 +316,13 @@ fn request_with_timeout(
     payload: &[u8],
     io_timeout: Duration,
 ) -> Result<(u16, Vec<u8>), HRESULT> {
-    eprintln!("[diag] request msg_type={msg_type} starting");
-    let (port, secret) = endpoint().inspect_err(|e| {
-        eprintln!("[diag] request msg_type={msg_type} endpoint() failed: {e:?}")
-    })?;
+    diag!("request msg_type={msg_type} starting");
+    let (port, secret) = endpoint()
+        .inspect_err(|e| diag!("request msg_type={msg_type} endpoint() failed: {e:?}"))?;
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| {
-        eprintln!("[diag] request msg_type={msg_type} connect to {addr} failed: {e}");
+        diag!("request msg_type={msg_type} connect to {addr} failed: {e}");
         E_FAIL
     })?;
     stream.set_read_timeout(Some(io_timeout)).ok();
@@ -330,7 +330,7 @@ fn request_with_timeout(
     stream.set_nodelay(true).ok();
 
     perform_handshake(&mut stream, &secret)
-        .inspect_err(|e| eprintln!("[diag] request msg_type={msg_type} handshake failed: {e:?}"))?;
+        .inspect_err(|e| diag!("request msg_type={msg_type} handshake failed: {e:?}"))?;
 
     let mut request = Vec::with_capacity(payload.len() + 10);
     request.extend(XML_MAGIC_V2.to_le_bytes());
@@ -338,42 +338,42 @@ fn request_with_timeout(
     request.extend((payload.len() as u32).to_le_bytes());
     request.extend_from_slice(payload);
     stream.write_all(&request).map_err(|e| {
-        eprintln!("[diag] request msg_type={msg_type} write failed: {e}");
+        diag!("request msg_type={msg_type} write failed: {e}");
         E_FAIL
     })?;
 
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic).map_err(|e| {
-        eprintln!("[diag] request msg_type={msg_type} read magic failed: {e}");
+        diag!("request msg_type={msg_type} read magic failed: {e}");
         E_FAIL
     })?;
     if u32::from_le_bytes(magic) != XML_MAGIC_V2 {
-        eprintln!("[diag] request msg_type={msg_type} bad reply magic: {magic:?}");
+        diag!("request msg_type={msg_type} bad reply magic: {magic:?}");
         return Err(E_FAIL);
     }
 
     let mut header = [0u8; 6];
     stream.read_exact(&mut header).map_err(|e| {
-        eprintln!("[diag] request msg_type={msg_type} read header failed: {e}");
+        diag!("request msg_type={msg_type} read header failed: {e}");
         E_FAIL
     })?;
     let reply_type = u16::from_le_bytes([header[0], header[1]]);
     let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
     if size > MAX_MESSAGE_SIZE {
-        eprintln!("[diag] request msg_type={msg_type} reply size {size} too large");
+        diag!("request msg_type={msg_type} reply size {size} too large");
         return Err(E_FAIL);
     }
 
     let mut body = vec![0u8; size];
     stream.read_exact(&mut body).map_err(|e| {
-        eprintln!("[diag] request msg_type={msg_type} read body failed: {e}");
+        diag!("request msg_type={msg_type} read body failed: {e}");
         E_FAIL
     })?;
 
-    eprintln!("[diag] request msg_type={msg_type} succeeded, reply_type={reply_type} size={size}");
+    diag!("request msg_type={msg_type} succeeded, reply_type={reply_type} size={size}");
     if reply_type == MSG_TYPE_ERROR {
-        eprintln!(
-            "[diag] request msg_type={msg_type} server reported an error: {}",
+        diag!(
+            "request msg_type={msg_type} server reported an error: {}",
             String::from_utf8_lossy(&body)
         );
     }
@@ -403,12 +403,12 @@ pub fn get_msa_token_silently(scope: Option<&str>) -> Result<(String, i64), HRES
     let response: MSATokenResponse = match quick_xml::de::from_str(text) {
         Ok(r) => r,
         Err(err) => {
-            eprintln!("[diag] get_msa_token_silently deserialize error: {err}");
+            diag!("get_msa_token_silently deserialize error: {err}");
             return Err(E_FAIL);
         }
     };
-    eprintln!(
-        "[diag] get_msa_token_silently -> token ({} bytes) expiry={}",
+    diag!(
+        "get_msa_token_silently -> token ({} bytes) expiry={}",
         response.token.len(),
         response.expiry
     );
@@ -439,8 +439,8 @@ pub fn get_token_and_signature(
         match get_token_and_signature_once(method, url, body) {
             Ok(result) => return Ok(result),
             Err(err) => {
-                eprintln!(
-                    "[diag] get_token_and_signature({url}) attempt {attempt}/{TOKEN_AND_SIGNATURE_RETRIES} failed: {err:?}"
+                diag!(
+                    "get_token_and_signature({url}) attempt {attempt}/{TOKEN_AND_SIGNATURE_RETRIES} failed: {err:?}"
                 );
                 last_err = err;
                 if attempt < TOKEN_AND_SIGNATURE_RETRIES {
@@ -475,12 +475,12 @@ fn get_token_and_signature_once(
     let response: XstsTokenResponse = match quick_xml::de::from_str(text) {
         Ok(r) => r,
         Err(err) => {
-            eprintln!("[diag] get_token_and_signature deserialize error: {err}");
+            diag!("get_token_and_signature deserialize error: {err}");
             return Err(E_FAIL);
         }
     };
-    eprintln!(
-        "[diag] get_token_and_signature({url}) -> authorization ({} bytes) signature ({} bytes)",
+    diag!(
+        "get_token_and_signature({url}) -> authorization ({} bytes) signature ({} bytes)",
         response.authorization.len(),
         response.signature.len()
     );
@@ -506,13 +506,16 @@ pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
     let response: UserInfoResponse = match quick_xml::de::from_str(text) {
         Ok(r) => r,
         Err(err) => {
-            eprintln!("[diag] get_user_info deserialize error: {err}");
+            diag!("get_user_info deserialize error: {err}");
             return Err(E_FAIL);
         }
     };
-    eprintln!(
-        "[diag] get_user_info parsed: xuid={:?} gamertag={:?} gamertag_modern={:?} age_group={:?}",
-        response.xuid, response.gamertag, response.gamertag_modern, response.age_group
+    diag!(
+        "get_user_info parsed: xuid={:?} gamertag={:?} gamertag_modern={:?} age_group={:?}",
+        response.xuid,
+        response.gamertag,
+        response.gamertag_modern,
+        response.age_group
     );
     Ok((
         response.xuid,
@@ -530,7 +533,7 @@ pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
 /// (a "declined", not an error); `Ok(Some(..))` on the same
 /// `(xuid, gamertag, gamertag_modern, age_group)` shape as [`get_user_info`] on success.
 pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>, HRESULT> {
-    eprintln!("[diag] interactive_sign_in called");
+    diag!("interactive_sign_in called");
     let body = quick_xml::se::to_string(&InteractiveSignInRequest {
         client_id: title_client_id(),
     })
@@ -542,7 +545,7 @@ pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>,
         INTERACTIVE_SIGN_IN_TIMEOUT,
     )?;
     if reply_type != MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE {
-        eprintln!("[diag] interactive_sign_in unexpected reply_type={reply_type}");
+        diag!("interactive_sign_in unexpected reply_type={reply_type}");
         return Err(E_FAIL);
     }
 
@@ -550,12 +553,12 @@ pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>,
     let response: InteractiveSignInResponse = match quick_xml::de::from_str(text) {
         Ok(r) => r,
         Err(err) => {
-            eprintln!("[diag] interactive_sign_in deserialize error: {err}");
+            diag!("interactive_sign_in deserialize error: {err}");
             return Err(E_FAIL);
         }
     };
     if !response.success {
-        eprintln!("[diag] interactive_sign_in: server reported declined/failed sign-in");
+        diag!("interactive_sign_in: server reported declined/failed sign-in");
         return Ok(None);
     }
     Ok(Some((

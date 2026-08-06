@@ -6,6 +6,7 @@ use super::task_queue::{self, PortKind, Queue, QueueHandle};
 use super::*;
 use crate::results::{E_ABORT, E_PENDING, S_OK};
 
+use crate::diag::diag;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{Arc, Condvar, Mutex};
@@ -182,8 +183,8 @@ pub(crate) fn cleanup(state: &Arc<AsyncState>) {
 pub(crate) unsafe extern "system" fn work_callback(context: *mut c_void, canceled: bool) {
     let state = unsafe { Arc::from_raw(context as *const AsyncState) };
     let name = block_name(state.block);
-    eprintln!(
-        "[diag] work_callback (DoWork dispatch) name={name:?} block={:p} canceled={canceled}",
+    diag!(
+        "work_callback (DoWork dispatch) name={name:?} block={:p} canceled={canceled}",
         state.block
     );
 
@@ -201,8 +202,8 @@ pub(crate) unsafe extern "system" fn work_callback(context: *mut c_void, cancele
         return;
     }
     if hr != S_OK {
-        eprintln!(
-            "[diag] provider DoWork returned non-pending {hr:?} for block={:p} (completing with it)",
+        diag!(
+            "provider DoWork returned non-pending {hr:?} for block={:p} (completing with it)",
             state.block
         );
     }
@@ -224,11 +225,10 @@ pub(crate) unsafe extern "system" fn completion_callback(context: *mut c_void, _
     // The number that matters: XAsyncBegin -> the game hearing about it. Split into the
     // work half and the wait-for-a-pump half by comparing against complete_state's
     // `work_ms` for the same block.
-    eprintln!(
-        "[qdiag t={}] completion_callback name={name:?} block={:p} total_ms={}",
-        task_queue::now_ms(),
+    diag!(
+        "completion_callback name={name:?} block={:p} total_ms={}",
         completion.state.block,
-        task_queue::now_ms().saturating_sub(completion.state.began_ms),
+        crate::diag::now_ms().saturating_sub(completion.state.began_ms),
     );
     let prev = current_identity();
     set_current_identity(name);
@@ -241,24 +241,26 @@ pub(crate) fn complete_state(
     result: HRESULT,
     required_buffer_size: usize,
 ) {
-    eprintln!(
-        "[diag] complete_state block={:p} result={result:?} size={required_buffer_size}",
+    diag!(
+        "complete_state block={:p} result={result:?} size={required_buffer_size}",
         state.block
     );
     {
         let mut inner = state.inner.lock().expect("async state poisoned");
         if result == E_ABORT {
-            eprintln!(
-                "[diag] E_ABORT completion block={:p} canceled_flag={}",
-                state.block, inner.canceled
+            diag!(
+                "E_ABORT completion block={:p} canceled_flag={}",
+                state.block,
+                inner.canceled
             );
         }
         if inner.status != E_PENDING {
             // Already completed. Providers routinely both call XAsyncComplete and return
             // a status from DoWork, so this is the normal path, not an error.
-            eprintln!(
-                "[diag] complete_state block={:p} already completed with status={:?}, ignoring",
-                state.block, inner.status
+            diag!(
+                "complete_state block={:p} already completed with status={:?}, ignoring",
+                state.block,
+                inner.status
             );
             return;
         }
@@ -274,8 +276,8 @@ pub(crate) fn complete_state(
     state.completed.notify_all();
 
     let Some(callback) = callback else {
-        eprintln!(
-            "[diag] complete_state block={:p} has no callback set, relying on polling",
+        diag!(
+            "complete_state block={:p} has no callback set, relying on polling",
             state.block
         );
         return;
@@ -290,15 +292,14 @@ pub(crate) fn complete_state(
         completion_callback,
         Duration::ZERO,
     );
-    eprintln!(
-        "[qdiag t={}] complete_state name={:?} block={:p} submitted={submitted} completion_port={:p} mode={:?} queue_ptr={:p} work_ms={}",
-        task_queue::now_ms(),
+    diag!(
+        "complete_state name={:?} block={:p} submitted={submitted} completion_port={:p} mode={:?} queue_ptr={:p} work_ms={}",
         block_name(state.block),
         state.block,
         Arc::as_ptr(state.queue.port(PortKind::Completion)),
         state.queue.port(PortKind::Completion).mode(),
         Arc::as_ptr(&state.queue),
-        task_queue::now_ms().saturating_sub(state.began_ms),
+        crate::diag::now_ms().saturating_sub(state.began_ms),
     );
     if !submitted {
         // The completion port is gone. The game still has to hear about the call, so

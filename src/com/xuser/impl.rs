@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use windows_core::{HRESULT, IUnknown, implement, interface};
 
 use crate::E_NOTIMPL;
+use crate::diag::{diag, stub};
 
 macro_rules! hresult_stub {
     ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> HRESULT;)*) => {
@@ -325,14 +326,14 @@ impl IXUserImpl_Impl for XUserObject_Impl {
     unsafe fn XUserAddAsync(&self, options: u32, async_: *mut XAsyncBlock) -> HRESULT {
         // XUserAddOptions: None=0, AddDefaultUserSilently=1, AllowGuests=2,
         // AddDefaultUserAllowingUI=4 (wine/include/xuser.h).
-        eprintln!(
-            "[diag] XUserAddAsync called options={options:#x} async_block={:p} callback_set={} queue={:?}",
+        diag!(
+            "XUserAddAsync called options={options:#x} async_block={:p} callback_set={} queue={:?}",
             async_,
             (unsafe { async_.as_ref() }).is_some_and(|b| b.callback.is_some()),
             (unsafe { async_.as_ref() }).map(|b| b.queue)
         );
         if options & 0b101 == 0 {
-            eprintln!("[diag] XUserAddAsync rejecting options={options:#x} -> E_ABORT");
+            diag!("XUserAddAsync rejecting options={options:#x} -> E_ABORT");
             return E_ABORT;
         }
         let allow_ui = options & 0x04 != 0;
@@ -342,20 +343,18 @@ impl IXUserImpl_Impl for XUserObject_Impl {
                 match crate::ipc::get_user_info() {
                     Ok(info) => {
                         let r = user_handle_from_info(info);
-                        eprintln!("[diag] XUserAddAsync silent path result: {r:?}");
+                        diag!("XUserAddAsync silent path result: {r:?}");
                         r
                     }
                     // A game that only asked for Silently should behave as if nobody is
                     // signed in, not pop a window it didn't ask for.
                     Err(err) if !allow_ui => {
-                        eprintln!(
-                            "[diag] XUserAddAsync get_user_info failed and allow_ui=false: {err:?}"
-                        );
+                        diag!("XUserAddAsync get_user_info failed and allow_ui=false: {err:?}");
                         Err(err)
                     }
                     Err(err) => {
-                        eprintln!(
-                            "[diag] XUserAddAsync get_user_info failed ({err:?}), falling back to interactive_sign_in"
+                        diag!(
+                            "XUserAddAsync get_user_info failed ({err:?}), falling back to interactive_sign_in"
                         );
                         match crate::ipc::interactive_sign_in()? {
                             Some(info) => user_handle_from_info(info),
@@ -368,21 +367,21 @@ impl IXUserImpl_Impl for XUserObject_Impl {
                 }
             })
         };
-        eprintln!("[diag] XUserAddAsync run_sync (XAsyncBegin) returned {hr:?}");
+        diag!("XUserAddAsync run_sync (XAsyncBegin) returned {hr:?}");
         hr
     }
 
     unsafe fn XUserAddResult(&self, async_: *mut XAsyncBlock, new_user: *mut u64) -> HRESULT {
-        eprintln!("[diag] XUserAddResult called async_block={:p}", async_);
+        diag!("XUserAddResult called async_block={:p}", async_);
         if new_user.is_null() {
-            eprintln!("[diag] XUserAddResult: new_user is null -> E_POINTER");
+            diag!("XUserAddResult: new_user is null -> E_POINTER");
             return E_POINTER;
         }
         let hr = match unsafe { xasync::get_result(async_, std::ptr::null(), new_user) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
         };
-        eprintln!("[diag] XUserAddResult returning {hr:?}");
+        diag!("XUserAddResult returning {hr:?}");
         hr
     }
 
@@ -582,19 +581,13 @@ impl IXUserImpl_Impl for XUserObject_Impl {
                 .to_string_lossy()
                 .into_owned()
         };
-        eprintln!(
-            "[stub {:?}] XUserResolveIssueWithUiAsync(url={url:?}) -> E_NOTIMPL",
-            std::thread::current().id()
-        );
+        stub!("XUserResolveIssueWithUiAsync(url={url:?}) -> E_NOTIMPL");
         E_NOTIMPL
     }
 
     unsafe fn XUserResolveIssueWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
         let _ = async_;
-        eprintln!(
-            "[stub {:?}] XUserResolveIssueWithUiResult -> E_NOTIMPL",
-            std::thread::current().id()
-        );
+        stub!("XUserResolveIssueWithUiResult -> E_NOTIMPL");
         E_NOTIMPL
     }
 
@@ -611,19 +604,13 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             let len = (0..).take_while(|&i| unsafe { *url.add(i) } != 0).count();
             String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(url, len) })
         };
-        eprintln!(
-            "[stub {:?}] XUserResolveIssueWithUiUtf16Async(url={url:?}) -> E_NOTIMPL",
-            std::thread::current().id()
-        );
+        stub!("XUserResolveIssueWithUiUtf16Async(url={url:?}) -> E_NOTIMPL");
         E_NOTIMPL
     }
 
     unsafe fn XUserResolveIssueWithUiUtf16Result(&self, async_: *mut XAsyncBlock) -> HRESULT {
         let _ = async_;
-        eprintln!(
-            "[stub {:?}] XUserResolveIssueWithUiUtf16Result -> E_NOTIMPL",
-            std::thread::current().id()
-        );
+        stub!("XUserResolveIssueWithUiUtf16Result -> E_NOTIMPL");
         E_NOTIMPL
     }
 
@@ -668,17 +655,13 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             unsafe { std::slice::from_raw_parts(body_buffer.cast::<u8>(), body_size) }.to_vec()
         };
 
-        eprintln!(
-            "[diag {:?}] XUserGetTokenAndSignatureAsync(method={method:?}, url={url:?})",
-            std::thread::current().id()
-        );
+        diag!("XUserGetTokenAndSignatureAsync(method={method:?}, url={url:?})");
         let key = async_ as usize;
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result = crate::ipc::get_token_and_signature(&method, &url, &body);
-                eprintln!(
-                    "[diag {:?}] XUserGetTokenAndSignatureAsync(url={url:?}) -> {:?}",
-                    std::thread::current().id(),
+                diag!(
+                    "XUserGetTokenAndSignatureAsync(url={url:?}) -> {:?}",
                     result.as_ref().map(|_| ()).map_err(|hr: &HRESULT| *hr)
                 );
                 let outcome = match &result {
@@ -922,10 +905,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         has_privilege: *mut Boolean,
         reason: *mut u32,
     ) -> HRESULT {
-        eprintln!(
-            "[diag {:?}] XUserCheckPrivilege(user={user}, options={options:#x}, privilege={privilege:#x})",
-            std::thread::current().id()
-        );
+        diag!("XUserCheckPrivilege(user={user}, options={options:#x}, privilege={privilege:#x})");
         if has_privilege.is_null() {
             return E_POINTER;
         }
@@ -948,19 +928,15 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         privilege: u32,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
-        eprintln!(
-            "[diag {:?}] XUserResolvePrivilegeWithUiAsync(user={user}, options={options:#x}, privilege={privilege:#x})",
-            std::thread::current().id()
+        diag!(
+            "XUserResolvePrivilegeWithUiAsync(user={user}, options={options:#x}, privilege={privilege:#x})"
         );
         // Every privilege is already granted, so there is nothing to resolve.
         unsafe { xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> { Ok(()) }) }
     }
 
     unsafe fn XUserResolvePrivilegeWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
-        eprintln!(
-            "[diag {:?}] XUserResolvePrivilegeWithUiResult",
-            std::thread::current().id()
-        );
+        diag!("XUserResolvePrivilegeWithUiResult");
         match unsafe { xasync::get_result::<()>(async_, std::ptr::null(), &mut () as *mut ()) } {
             Ok(()) => S_OK,
             Err(hr) => hr,

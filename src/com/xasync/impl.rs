@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::diag::diag;
 use windows_core::{HRESULT, implement};
 use windows_sys::core::BOOL;
 
@@ -64,14 +65,12 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             let name = unsafe { std::ffi::CStr::from_ptr(identity_name) }.to_string_lossy();
             let name = async_core::intern(&name);
             name_block(block, name);
-            if task_queue::diag() {
-                eprintln!("[diag] XAsyncBegin name={name:?} block={block:p}");
-                if is_lhc_internal(name) {
-                    eprintln!(
-                        "[diag] XAsyncBegin PARENT parent={:?} -> internal {name} block={block:p}",
-                        current_identity()
-                    );
-                }
+            diag!("XAsyncBegin name={name:?} block={block:p}");
+            if is_lhc_internal(name) {
+                diag!(
+                    "XAsyncBegin PARENT parent={:?} -> internal {name} block={block:p}",
+                    current_identity()
+                );
             }
         }
         let Some(block_ref) = (unsafe { block.as_mut() }) else {
@@ -81,8 +80,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             return E_POINTER;
         }
         if unsafe { state_of(block) }.is_some() {
-            eprintln!(
-                "[diag] XAsyncBegin REJECT block={block:p} queue={:#x} reason=block-in-use",
+            diag!(
+                "XAsyncBegin REJECT block={block:p} queue={:#x} reason=block-in-use",
                 block_ref.queue as u64
             );
             // The block is still driving another call; reusing it would strand that one.
@@ -91,15 +90,15 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let mut queue = match queue_for(block_ref) {
             Some(queue) => queue,
             None => {
-                eprintln!(
-                    "[diag] XAsyncBegin REJECT block={block:p} queue={:#x} reason=unknown-queue",
+                diag!(
+                    "XAsyncBegin REJECT block={block:p} queue={:#x} reason=unknown-queue",
                     block_ref.queue as u64
                 );
                 return E_INVALIDARG;
             }
         };
-        eprintln!(
-            "[diag] XAsyncBegin queue-mode block={block:p} queue={:#x} work={:?} completion={:?} queue_ptr={:p}",
+        diag!(
+            "XAsyncBegin queue-mode block={block:p} queue={:#x} work={:?} completion={:?} queue_ptr={:p}",
             block_ref.queue as u64,
             queue.port(PortKind::Work).mode(),
             queue.port(PortKind::Completion).mode(),
@@ -113,7 +112,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             // same effect the wrapper's temporary FIXQ injection had, but natively.
             let handle = task_queue::process_queue_handle();
             block_ref.queue = handle as *mut c_void;
-            eprintln!("[diag] XAsyncBegin BACKFILL block={block:p} queue=0 -> handle={handle:#x}");
+            diag!("XAsyncBegin BACKFILL block={block:p} queue=0 -> handle={handle:#x}");
         } else if queue.port(PortKind::Work).mode() == DispatchMode::Manual
             && !task_queue::is_process_queue(&queue)
         {
@@ -125,8 +124,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             // exactly like the NULL-queue BACKFILL above.
             let handle = task_queue::process_queue_handle();
             block_ref.queue = handle as *mut c_void;
-            eprintln!(
-                "[diag] XAsyncBegin MANUAL->PROCESS block={block:p} old_queue={:#x} -> handle={handle:#x}",
+            diag!(
+                "XAsyncBegin MANUAL->PROCESS block={block:p} old_queue={:#x} -> handle={handle:#x}",
                 original_queue as u64
             );
             let Some(process_queue) = QueueHandle::get(handle) else {
@@ -141,7 +140,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             context,
             identity,
             queue,
-            began_ms: task_queue::now_ms(),
+            began_ms: crate::diag::now_ms(),
             block,
             inner: Mutex::new(Inner {
                 status: E_PENDING,
@@ -155,8 +154,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
 
         let hr = state.invoke(XAsyncOp::Begin, std::ptr::null_mut(), 0);
         if hr != S_OK {
-            eprintln!(
-                "[diag] XAsyncBegin BEGIN-FAILED block={block:p} queue={:#x} hr={hr:?}",
+            diag!(
+                "XAsyncBegin BEGIN-FAILED block={block:p} queue={:#x} hr={hr:?}",
                 block_ref.queue as u64
             );
             // Begin failing means the call never started, so there is no completion to
@@ -182,16 +181,16 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             work_callback,
             Duration::from_millis(delay_in_ms as u64),
         ) {
-            eprintln!(
-                "[diag] XAsyncSchedule submitted name={name:?} block={async_block:p} work_port={:p} delay={delay_in_ms}",
+            diag!(
+                "XAsyncSchedule submitted name={name:?} block={async_block:p} work_port={:p} delay={delay_in_ms}",
                 Arc::as_ptr(state.queue.port(PortKind::Work))
             );
             S_OK
         } else {
             // Reclaim the reference the failed submit did not take, then report the
             // termination the way a cancelled call reports it.
-            eprintln!(
-                "[diag] XAsyncSchedule submit FAILED (work port terminated) block={:p} queue={:p} work_port={:p} -> E_ABORT",
+            diag!(
+                "XAsyncSchedule submit FAILED (work port terminated) block={:p} queue={:p} work_port={:p} -> E_ABORT",
                 async_block,
                 Arc::as_ptr(&state.queue),
                 Arc::as_ptr(state.queue.port(PortKind::Work))
@@ -227,15 +226,13 @@ impl IXAsync_Impl for XAsyncObject_Impl {
                     // here would deadlock: the async's completing DoWork is queued on a queue
                     // only this same thread dispatches, and we cannot pump it while blocked.
                     // Return E_PENDING so the caller polls and control returns to the pump.
-                    eprintln!(
-                        "[diag {:?}] XAsyncGetStatus wait=true -> E_PENDING (in dispatch callback; avoiding pump deadlock) block={:p}",
-                        std::thread::current().id(),
+                    diag!(
+                        "XAsyncGetStatus wait=true -> E_PENDING (in dispatch callback; avoiding pump deadlock) block={:p}",
                         async_block
                     );
                 } else {
-                    eprintln!(
-                        "[diag {:?}] XAsyncGetStatus wait=true blocking, block={:p}",
-                        std::thread::current().id(),
+                    diag!(
+                        "XAsyncGetStatus wait=true blocking, block={:p}",
                         async_block
                     );
                     while inner.status == E_PENDING {
@@ -273,9 +270,10 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         if inner.status == E_PENDING {
             return E_PENDING;
         }
-        eprintln!(
-            "[diag] XAsyncGetResultSize block={async_block:p} status={:?} result_size={}",
-            inner.status, inner.result_size
+        diag!(
+            "XAsyncGetResultSize block={async_block:p} status={:?} result_size={}",
+            inner.status,
+            inner.result_size
         );
         *size_out = inner.result_size;
         inner.status
@@ -292,9 +290,11 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let Some(state) = (unsafe { state_of(async_block as *mut XAsyncBlock) }) else {
             return E_ILLEGAL_METHOD_CALL;
         };
-        eprintln!(
-            "[diag] XAsyncGetResult enter block={async_block:p} identity={:p} state_identity={:p} buffer={:p} buffer_size={buffer_size}",
-            identity, state.identity, buffer
+        diag!(
+            "XAsyncGetResult enter block={async_block:p} identity={:p} state_identity={:p} buffer={:p} buffer_size={buffer_size}",
+            identity,
+            state.identity,
+            buffer
         );
 
         let (status, result_size) = {
@@ -302,14 +302,12 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             (inner.status, inner.result_size)
         };
         if status == E_PENDING {
-            eprintln!(
-                "[diag] XAsyncGetResult block={async_block:p} -> E_PENDING (async not yet complete)"
-            );
+            diag!("XAsyncGetResult block={async_block:p} -> E_PENDING (async not yet complete)");
             return E_PENDING;
         }
         if status != S_OK {
-            eprintln!(
-                "[diag] XAsyncGetResult block={async_block:p} status={status:?} result_size={result_size}"
+            diag!(
+                "XAsyncGetResult block={async_block:p} status={status:?} result_size={result_size}"
             );
             cleanup(&state);
             return status;
@@ -318,15 +316,15 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         // belongs to. Mismatches are a caller bug worth surfacing, not something to
         // paper over by returning another API's result.
         if !identity.is_null() && identity != state.identity {
-            eprintln!(
-                "[diag] XAsyncGetResult block={async_block:p} IDENTITY MISMATCH identity={identity:p} != state_identity={:p} -> E_INVALIDARG",
+            diag!(
+                "XAsyncGetResult block={async_block:p} IDENTITY MISMATCH identity={identity:p} != state_identity={:p} -> E_INVALIDARG",
                 state.identity
             );
             return E_INVALIDARG;
         }
         if (buffer_size as usize) < result_size {
-            eprintln!(
-                "[diag] XAsyncGetResult block={async_block:p} buffer_size={buffer_size} < result_size={result_size} -> E_NOT_SUFFICIENT_BUFFER"
+            diag!(
+                "XAsyncGetResult block={async_block:p} buffer_size={buffer_size} < result_size={result_size} -> E_NOT_SUFFICIENT_BUFFER"
             );
             return E_NOT_SUFFICIENT_BUFFER;
         }
@@ -335,16 +333,16 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         if let Some(used) = unsafe { buffer_used.as_mut() } {
             *used = result_size;
         }
-        eprintln!(
-            "[diag] XAsyncGetResult block={async_block:p} invoked GetResult hr={hr:?} buffer_used={result_size}"
+        diag!(
+            "XAsyncGetResult block={async_block:p} invoked GetResult hr={hr:?} buffer_used={result_size}"
         );
         cleanup(&state);
         hr
     }
 
     unsafe fn XAsyncCancel(&self, async_block: *mut c_void) {
-        eprintln!(
-            "[diag] XAsyncCancel called for block={:p} on {:?}",
+        diag!(
+            "XAsyncCancel called for block={:p} on {:?}",
             async_block,
             std::thread::current().id()
         );
@@ -410,9 +408,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         };
         let q = Queue::new(work, completion);
         *out = QueueHandle::create(q.clone());
-        eprintln!(
-            "[diag {:?}] XTaskQueueCreate mode=({work:?},{completion:?}) work_port={:#x} completion_port={:#x} -> handle={:#x}",
-            std::thread::current().id(),
+        diag!(
+            "XTaskQueueCreate mode=({work:?},{completion:?}) work_port={:#x} completion_port={:#x} -> handle={:#x}",
             Arc::as_ptr(q.port(PortKind::Work)) as usize,
             Arc::as_ptr(q.port(PortKind::Completion)) as usize,
             *out
@@ -435,9 +432,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             return E_INVALIDARG;
         };
         *out = QueueHandle::create(Queue::composite(work, completion));
-        eprintln!(
-            "[diag {:?}] XTaskQueueCreateComposite work_port={:#x} completion_port={:#x} -> handle={:#x}",
-            std::thread::current().id(),
+        diag!(
+            "XTaskQueueCreateComposite work_port={:#x} completion_port={:#x} -> handle={:#x}",
             work_port,
             completion_port,
             *out
@@ -454,9 +450,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             return E_INVALIDARG;
         };
         *out = PortHandle::create(queue.port(kind).clone());
-        eprintln!(
-            "[diag {:?}] XTaskQueueGetPort queue={:#x} kind={} -> port_handle={:#x}",
-            std::thread::current().id(),
+        diag!(
+            "XTaskQueueGetPort queue={:#x} kind={} -> port_handle={:#x}",
             queue_orig_for_log,
             port,
             *out
@@ -476,9 +471,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             return E_INVALIDARG;
         };
         *out = QueueHandle::create(queue);
-        eprintln!(
-            "[diag {:?}] XTaskQueueDuplicateHandle in={:#x} -> out={:#x}",
-            std::thread::current().id(),
+        diag!(
+            "XTaskQueueDuplicateHandle in={:#x} -> out={:#x}",
             queue_handle,
             *out
         );
@@ -486,32 +480,19 @@ impl IXAsync_Impl for XAsyncObject_Impl {
     }
 
     unsafe fn XTaskQueueCloseHandle(&self, queue: u64) {
-        eprintln!(
-            "[diag {:?}] XTaskQueueCloseHandle handle={:#x}",
-            std::thread::current().id(),
-            queue
-        );
+        diag!("XTaskQueueCloseHandle handle={:#x}", queue);
         QueueHandle::close(queue);
     }
 
     unsafe fn XTaskQueueDispatch(&self, queue: u64, port: u64, timeout_in_ms: u32) -> BOOL {
-        eprintln!(
-            "[diag {:?}] XTaskQueueDispatch enter handle={:#x} port={}",
-            std::thread::current().id(),
-            queue,
-            port
-        );
+        diag!("XTaskQueueDispatch enter handle={:#x} port={}", queue, port);
         let (Some(queue), Some(kind)) = (QueueHandle::get(queue), PortKind::from_raw(port)) else {
-            eprintln!(
-                "[diag {:?}] XTaskQueueDispatch bad handle/port, bailing",
-                std::thread::current().id()
-            );
+            diag!("XTaskQueueDispatch bad handle/port, bailing");
             return 0;
         };
         let port_arc = queue.port(kind);
-        eprintln!(
-            "[diag {:?}] XTaskQueueDispatch queue_ptr={:p} port_ptr={:p}",
-            std::thread::current().id(),
+        diag!(
+            "XTaskQueueDispatch queue_ptr={:p} port_ptr={:p}",
             std::sync::Arc::as_ptr(&queue),
             std::sync::Arc::as_ptr(port_arc)
         );
@@ -543,8 +524,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             return E_INVALIDARG;
         };
         let callback: TaskCallback = unsafe { std::mem::transmute(callback) };
-        eprintln!(
-            "[diag] XTaskQueueSubmitDelayedCallback queue_ptr={:#x} kind={} work_port={:#x} delay={delay_ms} ctx={:#x}",
+        diag!(
+            "XTaskQueueSubmitDelayedCallback queue_ptr={:#x} kind={} work_port={:#x} delay={delay_ms} ctx={:#x}",
             Arc::as_ptr(&queue) as usize,
             port,
             Arc::as_ptr(queue.port(kind)) as usize,
@@ -599,8 +580,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let Some(queue) = QueueHandle::get(queue) else {
             return E_INVALIDARG;
         };
-        eprintln!(
-            "[diag] XTaskQueueTerminate queue={:#x} wait={wait} has_cb={}",
+        diag!(
+            "XTaskQueueTerminate queue={:#x} wait={wait} has_cb={}",
             Arc::as_ptr(&queue) as usize,
             !callback.is_null()
         );
@@ -670,11 +651,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             return 0;
         }
         *out = QueueHandle::create(task_queue::default_process_queue());
-        eprintln!(
-            "[diag {:?}] XTaskQueueGetCurrentProcessTaskQueue -> handle={:#x}",
-            std::thread::current().id(),
-            *out
-        );
+        diag!("XTaskQueueGetCurrentProcessTaskQueue -> handle={:#x}", *out);
         1
     }
 
@@ -684,19 +661,15 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         // pumps a handle of its own choosing, and if that handle's ports are not these
         // ports, everything we submit here waits for a dispatch that never comes.
         match &resolved {
-            Some(q) => eprintln!(
-                "[qdiag t={}] set_process_queue handle={queue:#x} queue_ptr={:p} work_port={:p} ({:?}) completion_port={:p} ({:?})",
-                task_queue::now_ms(),
+            Some(q) => diag!(
+                "set_process_queue handle={queue:#x} queue_ptr={:p} work_port={:p} ({:?}) completion_port={:p} ({:?})",
                 Arc::as_ptr(q),
                 Arc::as_ptr(q.port(PortKind::Work)),
                 q.port(PortKind::Work).mode(),
                 Arc::as_ptr(q.port(PortKind::Completion)),
                 q.port(PortKind::Completion).mode(),
             ),
-            None => eprintln!(
-                "[qdiag t={}] set_process_queue handle={queue:#x} -> UNRESOLVED",
-                task_queue::now_ms()
-            ),
+            None => diag!("set_process_queue handle={queue:#x} -> UNRESOLVED"),
         }
         task_queue::set_process_queue(resolved);
     }
