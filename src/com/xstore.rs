@@ -379,9 +379,15 @@ fn query_entitled_products() -> u64 {
 /// Unlike `query_entitled_products`, `isInUserCollection` is always `false`: associated
 /// products are catalog entries this account may not own yet (that is the point of the
 /// query), not confirmed entitlements.
-fn query_associated_products(max_items_to_retrieve_per_page: u32) -> u64 {
-    let products =
-        crate::ipc::get_associated_products(max_items_to_retrieve_per_page).unwrap_or_default();
+///
+/// `maxItemsToRetrievePerPage` is deliberately not forwarded as a limit. It is a page size, and
+/// `XStoreProductsQueryHasMorePages` here always answers "no more pages", so whatever comes back
+/// from this one call is everything the title will ever see - capping it at the title's page size
+/// would silently hide the rest of the catalog. Minecraft asks for a page of 25 and its Realms
+/// subscriptions sit several hundred products into the associated-product list, which is exactly
+/// how the "Choose your plan" screen ends up with no price to show.
+fn query_associated_products(_max_items_to_retrieve_per_page: u32) -> u64 {
+    let products = crate::ipc::get_associated_products(0).unwrap_or_default();
 
     build_product_query(products)
 }
