@@ -257,10 +257,13 @@ dependencies = [
  "serde",
  "windows",
  "windows-canvas",
+ "windows-collections",
  "windows-core",
+ "windows-future",
  "windows-reference",
  "windows-strings",
  "windows-sys",
+ "windows-time",
  "windows-window",
  "xodus-ipc-models",
 ]

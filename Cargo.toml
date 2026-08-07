@@ -47,6 +47,21 @@ git = "https://github.com/microsoft/windows-rs"
 branch = "master"
 default-features = true
 
+[dependencies.windows-future]
+git = "https://github.com/microsoft/windows-rs"
+branch = "master"
+default-features = true
+
+[dependencies.windows-collections]
+git = "https://github.com/microsoft/windows-rs"
+branch = "master"
+default-features = true
+
+[dependencies.windows-time]
+git = "https://github.com/microsoft/windows-rs"
+branch = "master"
+default-features = true
+
 [dependencies.windows]
 git = "https://github.com/microsoft/windows-rs"
 branch = "master"
@@ -65,6 +80,10 @@ features = [
     "Security_Credentials_UI",
     "Security_Cryptography_DataProtection",
     "std",
+    "Storage_FileProperties",
+    "Storage_Pickers",
+    "Storage_Provider",
+    "Storage_Search",
     "Storage_Streams",
     "UI",
     "Web_Syndication",
@@ -92,6 +111,7 @@ features = [
     "shlguid",
     "shlobj_core",
     "shobjidl_core",
+    "shtypes",
     "synchapi",
     "threadpoolapiset",
     "urlmon",
