@@ -792,10 +792,10 @@ mod waiter {
             }
         });
 
-        Box::into_raw(Box::new(Waiter {
+        crate::com::xasync::ctx_box_into_raw(Waiter {
             cancel,
             thread: Some(thread),
-        })) as u64
+        }) as u64
     }
 
     /// # Safety
@@ -804,7 +804,11 @@ mod waiter {
         if token == 0 {
             return;
         }
-        let mut waiter = unsafe { Box::from_raw(token as *mut Waiter) };
+        // SAFETY: `token` is a still-live pointer from `register`'s `ctx_box_into_raw`
+        // call above, and the caller's contract (this function's `# Safety` doc) is that
+        // it is unregistered at most once.
+        let mut waiter =
+            unsafe { crate::com::xasync::ctx_box_from_raw::<Waiter>(token as *mut c_void) };
         let _ = unsafe { SetEvent(waiter.cancel) };
         if let Some(thread) = waiter.thread.take() {
             let _ = thread.join();

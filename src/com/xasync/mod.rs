@@ -262,10 +262,29 @@ fn run_sync_queue() -> &'static Arc<task_queue::Queue> {
 struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 
+/// Hand ownership of `value` to an FFI callback as an opaque context pointer.
+/// Must be reclaimed exactly once via [`ctx_box_from_raw`].
+fn ctx_box_into_raw<T>(value: T) -> *mut c_void {
+    Box::into_raw(Box::new(value)).cast()
+}
+
+/// Reclaim a value previously handed out by [`ctx_box_into_raw::<T>`].
+///
+/// # Safety
+/// `ptr` must be a still-live pointer from `ctx_box_into_raw::<T>` for this same `T`,
+/// and this must be the only reclaim of it (the GDK `Cleanup`/completion contract at
+/// each call site guarantees both).
+unsafe fn ctx_box_from_raw<T>(ptr: *mut c_void) -> Box<T> {
+    unsafe { Box::from_raw(ptr.cast::<T>()) }
+}
+
 type BoxedWork = Box<dyn FnOnce(bool) + Send>;
 
 unsafe extern "system" fn run_sync_worker(context: *mut c_void, canceled: bool) {
-    let work = unsafe { Box::from_raw(context as *mut BoxedWork) };
+    // SAFETY: `context` is always a pointer this module produced via `ctx_box_into_raw`
+    // when it submitted the work below, and the queue invokes a worker exactly once per
+    // submission.
+    let work = unsafe { ctx_box_from_raw::<BoxedWork>(context) };
     work(canceled);
 }
 
@@ -318,7 +337,7 @@ unsafe extern "system" fn run_sync_helper<
             });
             let submitted = run_sync_queue().submit(
                 task_queue::PortKind::Work,
-                Box::into_raw(Box::new(work)) as *mut c_void,
+                ctx_box_into_raw(work),
                 run_sync_worker,
                 std::time::Duration::ZERO,
             );
@@ -358,8 +377,12 @@ unsafe extern "system" fn run_sync_helper<
             S_OK
         }
         XAsyncOp::Cleanup => {
+            // SAFETY: `async_context` originates from the `ctx_box_into_raw` call in
+            // `run_sync` below, and XAsync guarantees `Cleanup` fires exactly once for it.
             unsafe {
-                drop(Box::from_raw(async_context));
+                drop(ctx_box_from_raw::<XsyncContextHelper<T, F>>(
+                    (async_context as *mut XsyncContextHelper<T, F>).cast(),
+                ));
             }
             S_OK
         }
@@ -374,16 +397,16 @@ where
         return S_OK;
     }
 
-    let async_context = Box::into_raw(Box::new(XsyncContextHelper {
+    let async_context = ctx_box_into_raw(XsyncContextHelper {
         canceled: false,
         payload: None as Option<T>,
         result: E_ABORT,
         future,
-    }));
+    });
     match unsafe {
         begin(
             async_,
-            async_context.cast(),
+            async_context,
             null_mut(),
             c"run_async".as_ptr(),
             run_sync_helper::<T, F>,
@@ -391,8 +414,10 @@ where
     } {
         Ok(_) => S_OK,
         Err(hr) => {
+            // SAFETY: `begin` failed before handing `async_context` off to XAsync, so
+            // `Cleanup` will never run for it - this is the only reclaim.
             unsafe {
-                drop(Box::from_raw(async_context));
+                drop(ctx_box_from_raw::<XsyncContextHelper<T, F>>(async_context));
             }
             hr
         }

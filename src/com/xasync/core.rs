@@ -220,7 +220,10 @@ pub(crate) struct Completion {
 }
 
 pub(crate) unsafe extern "system" fn completion_callback(context: *mut c_void, _canceled: bool) {
-    let completion = unsafe { Box::from_raw(context as *mut Completion) };
+    // SAFETY: `context` always originates from the `ctx_box_into_raw` call in
+    // `complete_state` below, and the completion port (or the direct fallback call
+    // there) invokes this exactly once per submission.
+    let completion = unsafe { super::ctx_box_from_raw::<Completion>(context) };
     let name = block_name(completion.state.block);
     // The number that matters: XAsyncBegin -> the game hearing about it. Split into the
     // work half and the wait-for-a-pump half by comparing against complete_state's
@@ -282,10 +285,10 @@ pub(crate) fn complete_state(
         );
         return;
     };
-    let context = Box::into_raw(Box::new(Completion {
+    let context = super::ctx_box_into_raw(Completion {
         state: state.clone(),
         callback,
-    })) as *mut c_void;
+    });
     let submitted = state.queue.submit(
         PortKind::Completion,
         context,
