@@ -976,7 +976,10 @@ impl IXStore_Impl for XStoreObject_Impl {
         let Some(query) = ProductQueryHandleTable::get(productQueryHandle) else {
             return E_INVALIDARG;
         };
-        let callback: XStoreProductQueryCallback = unsafe { std::mem::transmute(callback) };
+        // SAFETY: GDK guarantees `callback` matches `XStoreProductQueryCallback` when
+        // calling `XStoreEnumerateProductsQuery`.
+        let callback: XStoreProductQueryCallback =
+            unsafe { crate::ffi_util::fn_ptr_cast(callback) };
         for entry in &query.entries {
             let keep_going = unsafe { callback(&entry.product as *const XStoreProduct, context) };
             if keep_going == 0 {

@@ -151,7 +151,9 @@ fn wine_unix_call() -> Option<WineUnixCall> {
     if let Some(proc) = unsafe { GetProcAddress(ntdll, c"__wine_unix_call".as_ptr() as *const u8) }
     {
         diag!("unixlib: using ntdll!__wine_unix_call");
-        return Some(unsafe { std::mem::transmute::<_, WineUnixCall>(proc) });
+        // SAFETY: resolved via `GetProcAddress("__wine_unix_call")`, whose signature is
+        // fixed by Wine's unixlib ABI.
+        return Some(unsafe { crate::ffi_util::fn_ptr_cast::<_, WineUnixCall>(proc) });
     }
 
     let slot =
@@ -168,7 +170,9 @@ fn wine_unix_call() -> Option<WineUnixCall> {
         return None;
     }
     diag!("unixlib: using ntdll!__wine_unix_call_dispatcher");
-    Some(unsafe { std::mem::transmute::<_, WineUnixCall>(dispatcher) })
+    // SAFETY: resolved via `GetProcAddress("__wine_unix_call_dispatcher")`, whose
+    // signature is fixed by Wine's unixlib ABI.
+    Some(unsafe { crate::ffi_util::fn_ptr_cast::<_, WineUnixCall>(dispatcher) })
 }
 
 /// The `LD_PRELOAD` path: the unix half published its own table address before Wine started.
@@ -221,7 +225,9 @@ fn handle_from_builtin_query() -> Option<u64> {
             return None;
         }
         let proc = unsafe { GetProcAddress(ntdll, c"NtQueryVirtualMemory".as_ptr() as *const u8) }?;
-        unsafe { std::mem::transmute::<_, NtQueryVirtualMemory>(proc) }
+        // SAFETY: resolved via `GetProcAddress("NtQueryVirtualMemory")`, whose signature
+        // is the documented ntdll ABI.
+        unsafe { crate::ffi_util::fn_ptr_cast::<_, NtQueryVirtualMemory>(proc) }
     };
 
     let mut handle: u64 = 0;

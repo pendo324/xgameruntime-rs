@@ -22,6 +22,7 @@ use windows_core::{GUID, HRESULT, Interface};
 
 mod com;
 mod diag;
+mod ffi_util;
 mod ipc;
 mod results;
 

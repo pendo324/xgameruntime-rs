@@ -134,7 +134,9 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             queue = process_queue;
         }
 
-        let provider: XAsyncProvider = unsafe { std::mem::transmute(provider) };
+        // SAFETY: GDK guarantees `provider` matches `XAsyncProvider` when calling
+        // `XAsyncBegin`.
+        let provider: XAsyncProvider = unsafe { crate::ffi_util::fn_ptr_cast(provider) };
         let state = Arc::new(AsyncState {
             provider,
             context,
@@ -523,7 +525,9 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let (Some(queue), Some(kind)) = (QueueHandle::get(queue), PortKind::from_raw(port)) else {
             return E_INVALIDARG;
         };
-        let callback: TaskCallback = unsafe { std::mem::transmute(callback) };
+        // SAFETY: GDK guarantees `callback` matches `TaskCallback` when calling
+        // `XTaskQueueSubmitDelayedCallback`.
+        let callback: TaskCallback = unsafe { crate::ffi_util::fn_ptr_cast(callback) };
         diag!(
             "XTaskQueueSubmitDelayedCallback queue_ptr={:#x} kind={} work_port={:#x} delay={delay_ms} ctx={:#x}",
             Arc::as_ptr(&queue) as usize,
@@ -561,7 +565,9 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let (Some(queue), Some(kind)) = (QueueHandle::get(queue), PortKind::from_raw(port)) else {
             return E_INVALIDARG;
         };
-        let callback: TaskCallback = unsafe { std::mem::transmute(callback) };
+        // SAFETY: GDK guarantees `callback` matches `TaskCallback` when calling
+        // `XTaskQueueRegisterWaiter`.
+        let callback: TaskCallback = unsafe { crate::ffi_util::fn_ptr_cast(callback) };
         *out = waiter::register(queue, kind, wait_handle, callback_context, callback);
         S_OK
     }
@@ -585,8 +591,10 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             Arc::as_ptr(&queue) as usize,
             !callback.is_null()
         );
+        // SAFETY: GDK guarantees `callback` matches `TerminatedCallback` when calling
+        // `XTaskQueueTerminate`.
         let terminated: Option<TerminatedCallback> =
-            (!callback.is_null()).then(|| unsafe { std::mem::transmute(callback) });
+            (!callback.is_null()).then(|| unsafe { crate::ffi_util::fn_ptr_cast(callback) });
 
         if wait != 0 {
             queue.terminate(true);
@@ -628,7 +636,9 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let Some(queue) = QueueHandle::get(queue) else {
             return E_INVALIDARG;
         };
-        let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
+        // SAFETY: GDK guarantees `callback` matches `MonitorCallback` when calling
+        // `XTaskQueueRegisterMonitor`.
+        let callback: MonitorCallback = unsafe { crate::ffi_util::fn_ptr_cast(callback) };
         *out = queue.register_monitor(callback_context, callback);
         S_OK
     }
@@ -713,7 +723,9 @@ unsafe extern "system" fn run_provider(op: XAsyncOp, data: *const XAsyncProvider
     let Some(data) = (unsafe { data.as_ref() }) else {
         return E_POINTER;
     };
-    let work: XAsyncWork = unsafe { std::mem::transmute(data.context) };
+    // SAFETY: `data.context` was set to an `XAsyncWork` by `XAsyncRun`'s caller and GDK
+    // hands it back unchanged.
+    let work: XAsyncWork = unsafe { crate::ffi_util::fn_ptr_cast(data.context) };
     match op {
         XAsyncOp::Begin => {
             let Some(state) = (unsafe { state_of(data.async_) }) else {
