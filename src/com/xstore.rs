@@ -5,9 +5,11 @@ use crate::results::*;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 use windows_sys::core::BOOL;
+use xodus_ipc_models::xstore::CatalogProductEntry;
 
 use super::bool_stub;
 use super::hresult_stub;
@@ -102,7 +104,11 @@ struct XStoreQueryGameLicenseAsyncResultPayload {
 // ---------------------------------------------------------------------------------------
 
 const XSTORE_PRODUCT_KIND_NONE: u32 = 0x00;
+const XSTORE_PRODUCT_KIND_CONSUMABLE: u32 = 0x01;
+const XSTORE_PRODUCT_KIND_DURABLE: u32 = 0x02;
 const XSTORE_PRODUCT_KIND_GAME: u32 = 0x04;
+const XSTORE_PRODUCT_KIND_PASS: u32 = 0x08;
+const XSTORE_PRODUCT_KIND_UNMANAGED_CONSUMABLE: u32 = 0x10;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -157,7 +163,61 @@ type XStoreProductQueryCallback =
 struct ProductQueryEntry {
     _store_id: CString,
     _title: CString,
+    _currency_code: CString,
     product: XStoreProduct,
+}
+
+/// Fills in an [`XStorePrice`] from what `xodus-service`'s catalog lookup returned.
+///
+/// `is_on_sale` isn't carried over the wire because it isn't a catalog field - it's the
+/// comparison between the list price and the undiscounted one, made here so both sides can't
+/// disagree about it. `sale_end_date` is passed through untouched; the catalog fills it with a
+/// far-future sentinel outside a sale, which is harmless because nothing reads it unless
+/// `isOnSale`.
+///
+/// The `currencyCode` pointer borrows `currency_code`, which the caller must keep alive in the
+/// same [`ProductQueryEntry`] as the returned price - the same arrangement as `storeId`/`title`.
+fn store_price(entry: &CatalogProductEntry, currency_code: &CStr) -> XStorePrice {
+    XStorePrice {
+        basePrice: entry.base_price,
+        price: entry.price,
+        recurrencePrice: entry.recurrence_price,
+        currencyCode: currency_code.as_ptr(),
+        formattedBasePrice: format_price(entry.base_price, &entry.currency_code),
+        formattedPrice: format_price(entry.price, &entry.currency_code),
+        formattedRecurrencePrice: format_price(entry.recurrence_price, &entry.currency_code),
+        isOnSale: entry.price < entry.base_price,
+        saleEndDate: entry.sale_end_date,
+    }
+}
+
+/// Renders an amount for the `formatted*` fields, which is what a store page actually displays.
+///
+/// The real GDK gets these strings from the Store client, already formatted for the account's
+/// market - symbol placement, decimal separator, digit grouping and all. We have only the amount
+/// and an ISO 4217 code, and the field is 16 *bytes* of ANSI, so the best available answer is a
+/// plain ASCII rendering: `$7.99` where the symbol is unambiguous and ASCII, `7.99 EUR`
+/// otherwise. Deliberately not a locale-formatting attempt - a wrong separator reads as a wrong
+/// price, whereas a currency code beside the number is merely plain.
+///
+/// An empty `currency_code` means the catalog listed no purchasable availability, and yields an
+/// empty string rather than a bare `0.00` that would read as free.
+fn format_price(amount: f32, currency_code: &str) -> [c_char; 16] {
+    let text = match currency_code {
+        "" => String::new(),
+        // The only symbol that is both ASCII and unambiguous. `$` alone would be wrong for the
+        // eight other dollar currencies, which get the code treatment below.
+        "USD" => format!("${amount:.2}"),
+        code => format!("{amount:.2} {code}"),
+    };
+
+    let mut out = [0 as c_char; 16];
+    // Truncating at a byte boundary is safe for content this function produced: it is ASCII by
+    // construction. The last slot stays zero so the result is always terminated.
+    for (slot, byte) in out.iter_mut().zip(text.bytes().take(15)) {
+        *slot = byte as c_char;
+    }
+    out
 }
 
 struct ProductQuery {
@@ -183,6 +243,10 @@ unsafe impl Sync for ProductQuery {}
 /// allocations.
 struct ProductQueryHandleTable;
 
+/// Token source for `XStoreRegisterGameLicenseChanged`. Starts at 1 so 0 stays available
+/// as "not a token this crate issued".
+static LICENSE_CHANGE_TOKENS: AtomicU64 = AtomicU64::new(1);
+
 static PRODUCT_QUERY_HANDLES: handle_table::HandleTable<Arc<ProductQuery>> =
     handle_table::HandleTable::new();
 
@@ -200,16 +264,25 @@ impl ProductQueryHandleTable {
     }
 }
 
-/// Maps `EntitledProduct`/`AssociatedProductEntry`'s freeform `product_kind` string onto
-/// `XStoreProductKind`'s bitmask (`wine/include/xstore.idl`). Only "Game" is derivable from
-/// what `xodus-service` actually returns - anything else reports as none rather than guessing
-/// a specific DLC/consumable/durable kind.
+/// Maps `EntitledProduct`/`CatalogProductEntry`'s freeform `product_kind` string onto
+/// `XStoreProductKind`'s bitmask (`wine/include/xstore.idl`). The strings are displaycatalog's
+/// `ProductKind` verbatim, which uses exactly the same names as the enum. An unrecognized kind
+/// reports as none rather than being guessed at - but the recognized ones matter: a title that
+/// asked for `Durable` and gets back `None` will filter the product straight back out, which is
+/// how a correctly-priced Realms plan still renders blank.
 fn product_kind_flag(kind: &str) -> u32 {
-    if kind.eq_ignore_ascii_case("game") {
-        XSTORE_PRODUCT_KIND_GAME
-    } else {
-        XSTORE_PRODUCT_KIND_NONE
-    }
+    const KINDS: [(&str, u32); 5] = [
+        ("Consumable", XSTORE_PRODUCT_KIND_CONSUMABLE),
+        ("Durable", XSTORE_PRODUCT_KIND_DURABLE),
+        ("Game", XSTORE_PRODUCT_KIND_GAME),
+        ("Pass", XSTORE_PRODUCT_KIND_PASS),
+        ("UnmanagedConsumable", XSTORE_PRODUCT_KIND_UNMANAGED_CONSUMABLE),
+    ];
+
+    KINDS
+        .iter()
+        .find(|(name, _)| kind.eq_ignore_ascii_case(name))
+        .map_or(XSTORE_PRODUCT_KIND_NONE, |(_, flag)| *flag)
 }
 
 /// `XStoreQueryEntitledProductsAsync`'s real backing, via `xodus-service`'s
@@ -222,7 +295,7 @@ fn product_kind_flag(kind: &str) -> u32 {
 /// are not derivable from the "My games" summary payload, so they are always empty/zeroed
 /// rather than guessed at.
 fn query_entitled_products() -> u64 {
-    let products = crate::ipc::get_entitled_products("").unwrap_or_default();
+    let products = crate::ipc::get_entitled_products(&crate::ipc::store_market()).unwrap_or_default();
 
     let entries = products
         .into_iter()
@@ -232,6 +305,10 @@ fn query_entitled_products() -> u64 {
             let title = CString::new(product.title).unwrap_or_default();
 
             let product_kind = product_kind_flag(&product.product_kind);
+
+            // No price in this payload, but an empty string rather than a null `currencyCode`:
+            // a title that reads the field before checking the amount finds "", not a crash.
+            let currency_code = CString::default();
 
             let entry = XStoreProduct {
                 storeId: store_id.as_ptr(),
@@ -248,7 +325,10 @@ fn query_entitled_products() -> u64 {
 
                 productKind: product_kind,
 
-                price: XStorePrice::default(),
+                price: XStorePrice {
+                    currencyCode: currency_code.as_ptr(),
+                    ..XStorePrice::default()
+                },
 
                 hasDigitalDownload: true,
 
@@ -276,6 +356,8 @@ fn query_entitled_products() -> u64 {
 
                 _title: title,
 
+                _currency_code: currency_code,
+
                 product: entry,
             }
         })
@@ -301,9 +383,79 @@ fn query_associated_products(max_items_to_retrieve_per_page: u32) -> u64 {
     let products =
         crate::ipc::get_associated_products(max_items_to_retrieve_per_page).unwrap_or_default();
 
+    build_product_query(products)
+}
+
+/// `XStoreQueryProductsAsync`'s real backing, via `xodus-service`'s `ProductsRequest` handler
+/// (`ipc::get_products`) - a catalog lookup for `StoreId`s the title names outright. This is what
+/// an in-game storefront runs on, so an empty answer is a page with no prices on it rather than
+/// no page: Minecraft's "Choose your plan" screen asks here for the Realms Core and Realms Plus
+/// subscriptions and renders whatever comes back beside "/month".
+///
+/// `productKinds` and `actionFilters` are not applied: the caller already chose the exact
+/// products by id, and `xodus-service` has no per-kind or per-action facet to filter on beyond
+/// the freeform `product_kind` string it returns. Filtering on a guess would drop products the
+/// title explicitly asked for - see `query_associated_products` for the same reasoning.
+///
+/// `isInUserCollection` is `false` for the same reason as `query_associated_products`: these are
+/// catalog entries, not confirmed entitlements.
+fn query_products(store_ids: &[String]) -> u64 {
+    let products = crate::ipc::get_products(store_ids).unwrap_or_default();
+
+    build_product_query(products)
+}
+
+/// Copies a GDK `char**` argument into owned strings.
+///
+/// # Safety
+/// `array` must either be null or point to `count` nul-terminated strings that stay valid for
+/// the duration of the call. Null elements are skipped rather than dereferenced.
+unsafe fn read_string_array(array: *mut *mut c_char, count: u64) -> Vec<String> {
+    if array.is_null() {
+        return Vec::new();
+    }
+    (0..count as usize)
+        .filter_map(|i| {
+            // SAFETY: `i` is within `count`, which the caller promises the array holds.
+            let entry = unsafe { *array.add(i) };
+            if entry.is_null() {
+                return None;
+            }
+            // SAFETY: a non-null element is a nul-terminated string per the caller's contract.
+            Some(unsafe { CStr::from_ptr(entry) }.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// Turns `xodus-service`'s catalog answer into a handle the title can enumerate.
+///
+/// Shared by [`query_associated_products`] and [`query_products`], which differ only in how the
+/// products were chosen. The fields left empty (`description`/`language`/`inAppOfferToken`/
+/// `linkUri`/keywords/skus/images/videos) are not in the `fieldsTemplate=StoreSDK` subset
+/// `xodus-service` asks the catalog for, so they are zeroed rather than guessed at.
+fn build_product_query(products: Vec<CatalogProductEntry>) -> u64 {
+    // Catalog listings, not credentials: the store id, kind and asking price are exactly
+    // what the storefront is meant to render, and an empty `currency_code` here is what
+    // [`format_price`] turns into the blank price the plan picker rejects.
+    for product in &products {
+        diag!(
+            "catalog product: store_id={} kind={} price={} base={} currency={:?}",
+            product.store_id,
+            product.product_kind,
+            product.price,
+            product.base_price,
+            product.currency_code
+        );
+    }
+
     let entries = products
         .into_iter()
         .map(|product| {
+            let currency_code = CString::new(product.currency_code.as_str()).unwrap_or_default();
+
+            // Built before `product`'s strings are moved out into `CString`s below.
+            let price = store_price(&product, &currency_code);
+
             let store_id = CString::new(product.store_id).unwrap_or_default();
 
             let title = CString::new(product.title).unwrap_or_default();
@@ -325,7 +477,7 @@ fn query_associated_products(max_items_to_retrieve_per_page: u32) -> u64 {
 
                 productKind: product_kind,
 
-                price: XStorePrice::default(),
+                price,
 
                 hasDigitalDownload: true,
 
@@ -352,6 +504,8 @@ fn query_associated_products(max_items_to_retrieve_per_page: u32) -> u64 {
                 _store_id: store_id,
 
                 _title: title,
+
+                _currency_code: currency_code,
 
                 product: entry,
             }
@@ -780,8 +934,6 @@ pub struct XStoreObject;
 
 impl IXStore_Impl for XStoreObject_Impl {
     hresult_stub! {
-        unsafe fn XStoreQueryProductsAsync(&self, storeContextHandle: u64, productKinds: u64, storeIds: *mut *mut c_char, storeIdsCount: u64, actionFilters: *mut *mut c_char, actionFiltersCount: u64, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreQueryProductsResult(&self, async_: *mut c_void, productQueryHandle: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryProductForCurrentGameAsync(&self, storeContextHandle: u64, async_: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryProductForCurrentGameResult(&self, async_: *mut c_void, productQueryHandle: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryProductForPackageAsync(&self, storeContextHandle: u64, productKinds: u64, packageIdentifier: *mut c_char, async_: *mut c_void) -> HRESULT;
@@ -801,9 +953,6 @@ impl IXStore_Impl for XStoreObject_Impl {
         unsafe fn XStoreQueryConsumableBalanceRemainingResult(&self, async_: *mut c_void, consumableResult: *mut c_void) -> HRESULT;
         unsafe fn __ReservedSlot35(&self) -> HRESULT;
         unsafe fn XStoreReportConsumableFulfillmentResult(&self, async_: *mut c_void, consumableResult: *mut c_void) -> HRESULT;
-        unsafe fn XStoreGetUserPurchaseIdAsync(&self, storeContextHandle: u64, serviceTicket: *mut c_char, publisherUserId: *mut c_char, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreGetUserPurchaseIdResultSize(&self, async_: *mut c_void, size: *mut usize) -> HRESULT;
-        unsafe fn XStoreGetUserPurchaseIdResult(&self, async_: *mut c_void, size: u64, result: *mut c_char) -> HRESULT;
         unsafe fn __ReservedSlot46(&self) -> HRESULT;
         unsafe fn __ReservedSlot47(&self) -> HRESULT;
         unsafe fn __ReservedSlot48(&self) -> HRESULT;
@@ -824,7 +973,6 @@ impl IXStore_Impl for XStoreObject_Impl {
         unsafe fn XStoreDownloadAndInstallPackagesResultCount(&self, async_: *mut c_void, count: *mut u32) -> HRESULT;
         unsafe fn XStoreDownloadAndInstallPackagesResult(&self, async_: *mut c_void, count: u32, packageIdentifiers: c_char) -> HRESULT;
         unsafe fn XStoreQueryPackageIdentifier(&self, storeId: *mut c_char, size: u64, packageIdentifier: *mut c_char) -> HRESULT;
-        unsafe fn XStoreRegisterGameLicenseChanged(&self, storeContextHandle: u64, queue: u64, context: *mut c_void, callback: *mut c_void, token: *mut c_void) -> HRESULT;
         unsafe fn XStoreRegisterPackageLicenseLost(&self, licenseHandle: u64, queue: u64, context: *mut c_void, callback: *mut c_void, token: *mut c_void) -> HRESULT;
         unsafe fn __ReservedSlot70(&self) -> HRESULT;
         unsafe fn XStoreAcquireLicenseForDurablesAsync(&self, storeContextHandle: u64, storeId: *mut c_char, async_: *mut c_void) -> HRESULT;
@@ -843,7 +991,6 @@ impl IXStore_Impl for XStoreObject_Impl {
     }
     bool_stub! {
         unsafe fn XStoreIsLicenseValid(&self, storeLicenseHandle: u64) -> BOOL;
-        unsafe fn XStoreUnregisterGameLicenseChanged(&self, storeContextHandle: u64, token: u64, wait: BOOL) -> BOOL;
         unsafe fn XStoreUnregisterPackageLicenseLost(&self, licenseHandle: u64, token: u64, wait: BOOL) -> BOOL;
     }
     void_stub! {
@@ -942,6 +1089,56 @@ impl IXStore_Impl for XStoreObject_Impl {
         }
     }
 
+    /// `XStoreQueryProductsAsync`'s real backing - see [`query_products`] for the endpoint
+    /// rationale and for why `productKinds`/`actionFilters` are not applied.
+    unsafe fn XStoreQueryProductsAsync(
+        &self,
+        storeContextHandle: u64,
+        _productKinds: u64,
+        storeIds: *mut *mut c_char,
+        storeIdsCount: u64,
+        _actionFilters: *mut *mut c_char,
+        _actionFiltersCount: u64,
+        async_: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 {
+            return E_POINTER;
+        }
+        // SAFETY: `storeIds` is the caller's array of `storeIdsCount` nul-terminated strings
+        // per the GDK contract, read here and not retained - `read_string_array` copies each
+        // one and tolerates a null array or null elements.
+        let store_ids = unsafe { read_string_array(storeIds, storeIdsCount) };
+        diag!("XStoreQueryProductsAsync(context={storeContextHandle}, ids={store_ids:?})");
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
+        // contract; run_sync itself no-ops on a null pointer.
+        unsafe { xasync::run_sync(async_.cast(), move || Ok(query_products(&store_ids))) }
+    }
+
+    unsafe fn XStoreQueryProductsResult(
+        &self,
+        async_: *mut c_void,
+        productQueryHandle: *mut c_void,
+    ) -> HRESULT {
+        if async_.is_null() || productQueryHandle.is_null() {
+            return E_POINTER;
+        }
+
+        let mut handle = 0u64;
+        // SAFETY: async_ was null-checked above and handle's type (u64) matches
+        // what query_products's run_sync closure stored.
+        match unsafe { get_result(async_.cast(), null_mut(), &mut handle) } {
+            Ok(_) => {
+                // SAFETY: productQueryHandle was null-checked above and is a valid
+                // u64 out-pointer per the GDK contract.
+                unsafe {
+                    *(productQueryHandle as *mut u64) = handle;
+                }
+                S_OK
+            }
+            Err(hr) => hr,
+        }
+    }
+
     /// `XStoreQueryAssociatedProductsAsync`'s real backing - see [`query_associated_products`]
     /// for the endpoint rationale.
     unsafe fn XStoreQueryAssociatedProductsAsync(
@@ -954,6 +1151,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         if storeContextHandle == 0 {
             return E_POINTER;
         }
+        diag!("XStoreQueryAssociatedProductsAsync(context={storeContextHandle})");
         // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
         // contract; run_sync itself no-ops on a null pointer.
         unsafe {
@@ -988,6 +1186,54 @@ impl IXStore_Impl for XStoreObject_Impl {
         }
     }
 
+    /// Accepts a game-license-change listener and hands back a token, without ever calling
+    /// the listener.
+    ///
+    /// The registration itself has to succeed: titles call this while *building* their store
+    /// object, so returning `E_NOTIMPL` here can leave a title without a usable store at all.
+    /// (It does not, on its own, produce Minecraft's "Couldn't access platform store" dialog -
+    /// that is the plan picker's empty-price state, reached with the store object fully built.
+    /// See `docs/xodus/store.md`.)
+    ///
+    /// Never invoking the callback is honest rather than lazy: a game license changes when
+    /// the store grants or revokes one out from under a running title, and nothing here can
+    /// observe that. `XStoreQueryGameLicenseAsync` remains the real source of license state.
+    unsafe fn XStoreRegisterGameLicenseChanged(
+        &self,
+        storeContextHandle: u64,
+        _queue: u64,
+        _context: *mut c_void,
+        callback: *mut c_void,
+        token: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 || callback.is_null() || token.is_null() {
+            return E_POINTER;
+        }
+        // `token` is an `XTaskQueueRegistrationToken*`, a single u64 field. Distinct and
+        // nonzero so a caller that validates the token before unregistering isn't misled.
+        let raw = LICENSE_CHANGE_TOKENS.fetch_add(1, Ordering::Relaxed);
+        diag!("XStoreRegisterGameLicenseChanged(context={storeContextHandle}) -> token={raw}");
+        // SAFETY: `token` was null-checked above and is a valid u64 out-pointer per the
+        // GDK contract.
+        unsafe { *token.cast::<u64>() = raw };
+        S_OK
+    }
+
+    /// The unregister half of [`XStoreRegisterGameLicenseChanged`]. There is nothing to tear
+    /// down - no callback was ever scheduled - so any token this crate handed out
+    /// unregisters successfully.
+    unsafe fn XStoreUnregisterGameLicenseChanged(
+        &self,
+        _storeContextHandle: u64,
+        token: u64,
+        _wait: BOOL,
+    ) -> BOOL {
+        if token == 0 || token >= LICENSE_CHANGE_TOKENS.load(Ordering::Relaxed) {
+            return false.into();
+        }
+        true.into()
+    }
+
     unsafe fn XStoreEnumerateProductsQuery(
         &self,
         productQueryHandle: u64,
@@ -998,8 +1244,15 @@ impl IXStore_Impl for XStoreObject_Impl {
             return E_POINTER;
         }
         let Some(query) = ProductQueryHandleTable::get(productQueryHandle) else {
+            diag!("XStoreEnumerateProductsQuery(handle={productQueryHandle}) -> no such handle");
             return E_INVALIDARG;
         };
+        // The count is the whole point: a storefront that enumerates zero products renders
+        // a page with no prices on it, which is indistinguishable from never having asked.
+        diag!(
+            "XStoreEnumerateProductsQuery(handle={productQueryHandle}) -> {} products",
+            query.entries.len()
+        );
         // SAFETY: GDK guarantees `callback` matches `XStoreProductQueryCallback` when
         // calling `XStoreEnumerateProductsQuery`.
         let callback: XStoreProductQueryCallback =
@@ -1027,8 +1280,7 @@ impl IXStore_Impl for XStoreObject_Impl {
 
     /// `XStoreGetUserCollectionsIdAsync`'s real backing, via `xodus-service`'s
     /// `CollectionsIdRequest` handler (`ipc::get_user_collections_id`) - a real call
-    /// against `collections.mp.microsoft.com/v7.0/beneficiaries/me/keys`, endpoint
-    /// confirmed via static analysis of the real `xgameruntime.dll`. `serviceTicket`/
+    /// against `collections.mp.microsoft.com/v7.0/beneficiaries/me/keys`. `serviceTicket`/
     /// `publisherUserId` are the caller's own opaque values, forwarded verbatim.
     unsafe fn XStoreGetUserCollectionsIdAsync(
         &self,
@@ -1046,6 +1298,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         // SAFETY: publisherUserId is a GDK-caller-supplied pointer that's null or
         // NUL-terminated per the XStoreGetUserCollectionsIdAsync contract.
         let publisher_user_id = unsafe { c_string_or_empty(publisherUserId) };
+        diag!("XStoreGetUserCollectionsIdAsync(context={storeContextHandle})");
         let key = async_ as usize;
         // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
         // contract; run_sync itself no-ops on a null pointer.
@@ -1053,16 +1306,7 @@ impl IXStore_Impl for XStoreObject_Impl {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result =
                     crate::ipc::get_user_collections_id(&service_ticket, &publisher_user_id);
-                let outcome = match &result {
-                    Ok(_) => Ok(()),
-                    Err(hr) => Err(*hr),
-                };
-                COLLECTIONS_ID_RESULTS
-                    .lock()
-                    .expect("collections id results poisoned")
-                    .get_or_insert_with(HashMap::new)
-                    .insert(key, result);
-                outcome
+                store_opaque_result(&COLLECTIONS_ID_RESULTS, key, result)
             })
         }
     }
@@ -1072,23 +1316,9 @@ impl IXStore_Impl for XStoreObject_Impl {
         async_: *mut c_void,
         size: *mut usize,
     ) -> HRESULT {
-        if size.is_null() {
-            return E_POINTER;
-        }
-        let key = async_ as usize;
-        let results = COLLECTIONS_ID_RESULTS
-            .lock()
-            .expect("collections id results poisoned");
-        match results.as_ref().and_then(|results| results.get(&key)) {
-            Some(Ok(value)) => {
-                // SAFETY: size was null-checked above and is a valid usize
-                // out-pointer per the GDK contract.
-                unsafe { *size = value.len() + 1 };
-                S_OK
-            }
-            Some(Err(hr)) => *hr,
-            None => E_ILLEGAL_METHOD_CALL,
-        }
+        // SAFETY: size is the caller's out-pointer per the GDK contract; the helper
+        // null-checks it before writing.
+        unsafe { opaque_result_size("collections-id", &COLLECTIONS_ID_RESULTS, async_, size) }
     }
 
     unsafe fn XStoreGetUserCollectionsIdResult(
@@ -1097,30 +1327,63 @@ impl IXStore_Impl for XStoreObject_Impl {
         size: u64,
         result: *mut c_char,
     ) -> HRESULT {
-        let key = async_ as usize;
-        let results = COLLECTIONS_ID_RESULTS
-            .lock()
-            .expect("collections id results poisoned");
-        match results.as_ref().and_then(|results| results.get(&key)) {
-            Some(Ok(value)) => {
-                let bytes = value.as_bytes();
-                let needed = bytes.len() + 1;
-                if needed > size as usize {
-                    return E_NOT_SUFFICIENT_BUFFER;
-                }
-                if result.is_null() {
-                    return E_POINTER;
-                }
-                // SAFETY: `size >= needed` was checked above.
-                unsafe {
-                    crate::ffi_util::write_out_bytes(bytes, result.cast::<u8>());
-                    *result.cast::<u8>().add(bytes.len()) = 0;
-                }
-                S_OK
-            }
-            Some(Err(hr)) => *hr,
-            None => E_ILLEGAL_METHOD_CALL,
+        // SAFETY: result is the caller's buffer of `size` bytes per the GDK contract; the
+        // helper null-checks it and verifies the buffer is large enough before writing.
+        unsafe { opaque_result("collections-id", &COLLECTIONS_ID_RESULTS, async_, size, result) }
+    }
+
+    /// `XStoreGetUserPurchaseIdAsync`'s real backing, via `xodus-service`'s
+    /// `PurchaseIdRequest` handler (`ipc::get_user_purchase_id`) - the purchase-side twin of
+    /// `XStoreGetUserCollectionsIdAsync` above. The two are not spelled alike - purchase is
+    /// `users/me/keys` where collections is `beneficiaries/me/keys`, and each 404s on the
+    /// other's path. See `xodus::licensing::content::get_purchase_id`.
+    unsafe fn XStoreGetUserPurchaseIdAsync(
+        &self,
+        storeContextHandle: u64,
+        serviceTicket: *mut c_char,
+        publisherUserId: *mut c_char,
+        async_: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 {
+            return E_POINTER;
         }
+        // SAFETY: serviceTicket is a GDK-caller-supplied pointer that's null or
+        // NUL-terminated per the XStoreGetUserPurchaseIdAsync contract.
+        let service_ticket = unsafe { c_string_or_empty(serviceTicket) };
+        // SAFETY: publisherUserId is a GDK-caller-supplied pointer that's null or
+        // NUL-terminated per the XStoreGetUserPurchaseIdAsync contract.
+        let publisher_user_id = unsafe { c_string_or_empty(publisherUserId) };
+        diag!("XStoreGetUserPurchaseIdAsync(context={storeContextHandle})");
+        let key = async_ as usize;
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
+        // contract; run_sync itself no-ops on a null pointer.
+        unsafe {
+            xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
+                let result = crate::ipc::get_user_purchase_id(&service_ticket, &publisher_user_id);
+                store_opaque_result(&PURCHASE_ID_RESULTS, key, result)
+            })
+        }
+    }
+
+    unsafe fn XStoreGetUserPurchaseIdResultSize(
+        &self,
+        async_: *mut c_void,
+        size: *mut usize,
+    ) -> HRESULT {
+        // SAFETY: size is the caller's out-pointer per the GDK contract; the helper
+        // null-checks it before writing.
+        unsafe { opaque_result_size("purchase-id", &PURCHASE_ID_RESULTS, async_, size) }
+    }
+
+    unsafe fn XStoreGetUserPurchaseIdResult(
+        &self,
+        async_: *mut c_void,
+        size: u64,
+        result: *mut c_char,
+    ) -> HRESULT {
+        // SAFETY: result is the caller's buffer of `size` bytes per the GDK contract; the
+        // helper null-checks it and verifies the buffer is large enough before writing.
+        unsafe { opaque_result("purchase-id", &PURCHASE_ID_RESULTS, async_, size, result) }
     }
 
     /// `XStoreQueryLicenseTokenAsync`'s real backing, via `xodus-service`'s
@@ -1161,16 +1424,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result = crate::ipc::get_license_token(&product_ids, &custom_developer_string);
-                let outcome = match &result {
-                    Ok(_) => Ok(()),
-                    Err(hr) => Err(*hr),
-                };
-                LICENSE_TOKEN_RESULTS
-                    .lock()
-                    .expect("license token results poisoned")
-                    .get_or_insert_with(HashMap::new)
-                    .insert(key, result);
-                outcome
+                store_opaque_result(&LICENSE_TOKEN_RESULTS, key, result)
             })
         }
     }
@@ -1180,23 +1434,9 @@ impl IXStore_Impl for XStoreObject_Impl {
         async_: *mut c_void,
         size: *mut usize,
     ) -> HRESULT {
-        if size.is_null() {
-            return E_POINTER;
-        }
-        let key = async_ as usize;
-        let results = LICENSE_TOKEN_RESULTS
-            .lock()
-            .expect("license token results poisoned");
-        match results.as_ref().and_then(|results| results.get(&key)) {
-            Some(Ok(value)) => {
-                // SAFETY: size was null-checked above and is a valid usize
-                // out-pointer per the GDK contract.
-                unsafe { *size = value.len() + 1 };
-                S_OK
-            }
-            Some(Err(hr)) => *hr,
-            None => E_ILLEGAL_METHOD_CALL,
-        }
+        // SAFETY: size is the caller's out-pointer per the GDK contract; the helper
+        // null-checks it before writing.
+        unsafe { opaque_result_size("license-token", &LICENSE_TOKEN_RESULTS, async_, size) }
     }
 
     unsafe fn XStoreQueryLicenseTokenResult(
@@ -1205,41 +1445,120 @@ impl IXStore_Impl for XStoreObject_Impl {
         size: u64,
         result: *mut c_char,
     ) -> HRESULT {
-        let key = async_ as usize;
-        let results = LICENSE_TOKEN_RESULTS
-            .lock()
-            .expect("license token results poisoned");
-        match results.as_ref().and_then(|results| results.get(&key)) {
-            Some(Ok(value)) => {
-                let bytes = value.as_bytes();
-                let needed = bytes.len() + 1;
-                if needed > size as usize {
-                    return E_NOT_SUFFICIENT_BUFFER;
-                }
-                if result.is_null() {
-                    return E_POINTER;
-                }
-                // SAFETY: `size >= needed` was checked above.
-                unsafe {
-                    crate::ffi_util::write_out_bytes(bytes, result.cast::<u8>());
-                    *result.cast::<u8>().add(bytes.len()) = 0;
-                }
-                S_OK
-            }
-            Some(Err(hr)) => *hr,
-            None => E_ILLEGAL_METHOD_CALL,
-        }
+        // SAFETY: result is the caller's buffer of `size` bytes per the GDK contract; the
+        // helper null-checks it and verifies the buffer is large enough before writing.
+        unsafe { opaque_result("license-token", &LICENSE_TOKEN_RESULTS, async_, size, result) }
     }
 }
 
 /// Keyed by the caller's `async_` pointer, same rationale and same leak-on-unread
-/// tradeoff as `xuser.rs`'s `MSA_TOKEN_RESULTS` - both `XStoreGetUserCollectionsIdAsync`
-/// and `XStoreQueryLicenseTokenAsync` return an opaque, variable-length string whose size
-/// has to be answered by a separate `*ResultSize` call before `*Result` is called at all.
-static COLLECTIONS_ID_RESULTS: Mutex<Option<HashMap<usize, Result<String, HRESULT>>>> =
-    Mutex::new(None);
-static LICENSE_TOKEN_RESULTS: Mutex<Option<HashMap<usize, Result<String, HRESULT>>>> =
-    Mutex::new(None);
+/// tradeoff as `xuser.rs`'s `MSA_TOKEN_RESULTS` - each of these APIs returns an opaque,
+/// variable-length string whose size has to be answered by a separate `*ResultSize` call
+/// before `*Result` is called at all.
+type OpaqueResults = Mutex<Option<HashMap<usize, Result<String, HRESULT>>>>;
+
+static COLLECTIONS_ID_RESULTS: OpaqueResults = Mutex::new(None);
+static LICENSE_TOKEN_RESULTS: OpaqueResults = Mutex::new(None);
+static PURCHASE_ID_RESULTS: OpaqueResults = Mutex::new(None);
+
+/// Files an opaque-string fetch's outcome under the caller's `async_` key and reports
+/// whether it succeeded, which is all `xasync::run_sync` needs to complete the block - the
+/// string itself is picked up later by the matching `*ResultSize`/`*Result` pair.
+fn store_opaque_result(
+    results: &OpaqueResults,
+    key: usize,
+    result: Result<String, HRESULT>,
+) -> Result<(), HRESULT> {
+    let outcome = match &result {
+        Ok(_) => Ok(()),
+        Err(hr) => Err(*hr),
+    };
+    results
+        .lock()
+        .expect("opaque store results poisoned")
+        .get_or_insert_with(HashMap::new)
+        .insert(key, result);
+    outcome
+}
+
+/// The shared body of every `*ResultSize` in this file: the NUL-terminated length of the
+/// string filed under `async_`.
+///
+/// # Safety
+/// `size` must be null or a valid `usize` out-pointer, per the GDK `*ResultSize` contract.
+unsafe fn opaque_result_size(
+    label: &str,
+    results: &OpaqueResults,
+    async_: *mut c_void,
+    size: *mut usize,
+) -> HRESULT {
+    if size.is_null() {
+        return E_POINTER;
+    }
+    let results = results.lock().expect("opaque store results poisoned");
+    match results.as_ref().and_then(|map| map.get(&(async_ as usize))) {
+        Some(Ok(value)) => {
+            diag!("{label} ResultSize -> {} bytes", value.len() + 1);
+            // SAFETY: size was null-checked above and is a valid usize out-pointer per
+            // this function's own `# Safety` contract.
+            unsafe { *size = value.len() + 1 };
+            S_OK
+        }
+        Some(Err(hr)) => {
+            diag!("{label} ResultSize -> {hr:?}");
+            *hr
+        }
+        None => {
+            diag!("{label} ResultSize -> no result filed for this async block");
+            E_ILLEGAL_METHOD_CALL
+        }
+    }
+}
+
+/// The shared body of every `*Result` in this file: copies the string filed under `async_`
+/// into the caller's buffer, NUL-terminated.
+///
+/// # Safety
+/// `result` must be null or valid for writes of `size` bytes, per the GDK `*Result`
+/// contract.
+unsafe fn opaque_result(
+    label: &str,
+    results: &OpaqueResults,
+    async_: *mut c_void,
+    size: u64,
+    result: *mut c_char,
+) -> HRESULT {
+    let results = results.lock().expect("opaque store results poisoned");
+    match results.as_ref().and_then(|map| map.get(&(async_ as usize))) {
+        Some(Ok(value)) => {
+            let bytes = value.as_bytes();
+            if bytes.len() + 1 > size as usize {
+                return E_NOT_SUFFICIENT_BUFFER;
+            }
+            if result.is_null() {
+                return E_POINTER;
+            }
+            // The value is a bearer credential, so log only its length - enough to tell an
+            // empty key (what a failed key fetch leaves behind) from a real one.
+            diag!("{label} Result -> {} bytes read by the title", bytes.len());
+            // SAFETY: `result` is non-null and valid for `size` bytes per this function's
+            // own `# Safety` contract, and `size` covers `bytes.len() + 1` as checked above.
+            unsafe {
+                crate::ffi_util::write_out_bytes(bytes, result.cast::<u8>());
+                *result.cast::<u8>().add(bytes.len()) = 0;
+            }
+            S_OK
+        }
+        Some(Err(hr)) => {
+            diag!("{label} Result -> {hr:?}");
+            *hr
+        }
+        None => {
+            diag!("{label} Result -> no result filed for this async block");
+            E_ILLEGAL_METHOD_CALL
+        }
+    }
+}
 
 /// # Safety
 /// `ptr` must be null or a valid, NUL-terminated C string for the duration of this call.
@@ -1258,3 +1577,79 @@ unsafe fn c_string_or_empty(ptr: *mut c_char) -> String {
 impl IXStoreAlias1_Impl for XStoreObject_Impl {}
 impl IXStoreAlias2_Impl for XStoreObject_Impl {}
 impl IXStoreAlias3_Impl for XStoreObject_Impl {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered(price: [c_char; 16]) -> String {
+        // SAFETY: `format_price` always leaves at least the last slot zero, so the array
+        // holds a terminated string.
+        unsafe { CStr::from_ptr(price.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn usd_gets_its_symbol_and_everything_else_gets_its_code() {
+        assert_eq!(rendered(format_price(7.99, "USD")), "$7.99");
+        assert_eq!(rendered(format_price(7.99, "EUR")), "7.99 EUR");
+        assert_eq!(rendered(format_price(46.0, "JPY")), "46.00 JPY");
+    }
+
+    /// A missing currency means the catalog had no purchasable availability. Rendering `0.00`
+    /// there would tell the player the item is free.
+    #[test]
+    fn no_currency_renders_nothing_rather_than_zero() {
+        assert_eq!(rendered(format_price(0.0, "")), "");
+    }
+
+    /// The field is 16 bytes including the terminator; an amount that overruns it has to stay
+    /// a readable, terminated string rather than run off the end.
+    #[test]
+    fn an_overlong_amount_is_truncated_and_still_terminated() {
+        let price = format_price(100_000_000.0, "EUR");
+        assert_eq!(price[15], 0);
+        assert_eq!(rendered(price), "100000000.00 EU");
+    }
+
+    #[test]
+    fn a_discounted_entry_is_on_sale_and_an_undiscounted_one_is_not() {
+        let currency = CString::new("USD").unwrap();
+        let entry = CatalogProductEntry {
+            currency_code: "USD".to_string(),
+            base_price: 7.99,
+            price: 5.99,
+            recurrence_price: 5.99,
+            sale_end_date: 1788220800,
+            ..CatalogProductEntry::default()
+        };
+        let price = store_price(&entry, &currency);
+        assert!(price.isOnSale);
+        assert_eq!(price.saleEndDate, 1788220800);
+        assert_eq!(rendered(price.formattedBasePrice), "$7.99");
+        assert_eq!(rendered(price.formattedPrice), "$5.99");
+        assert_eq!(rendered(price.formattedRecurrencePrice), "$5.99");
+
+        let full = CatalogProductEntry {
+            base_price: 7.99,
+            price: 7.99,
+            ..entry
+        };
+        assert!(!store_price(&full, &currency).isOnSale);
+    }
+
+    #[test]
+    fn every_catalog_product_kind_maps_onto_its_flag() {
+        assert_eq!(product_kind_flag("Durable"), XSTORE_PRODUCT_KIND_DURABLE);
+        assert_eq!(product_kind_flag("game"), XSTORE_PRODUCT_KIND_GAME);
+        assert_eq!(product_kind_flag("Pass"), XSTORE_PRODUCT_KIND_PASS);
+        assert_eq!(product_kind_flag("Consumable"), XSTORE_PRODUCT_KIND_CONSUMABLE);
+        assert_eq!(
+            product_kind_flag("UnmanagedConsumable"),
+            XSTORE_PRODUCT_KIND_UNMANAGED_CONSUMABLE
+        );
+        assert_eq!(product_kind_flag("Application"), XSTORE_PRODUCT_KIND_NONE);
+        assert_eq!(product_kind_flag(""), XSTORE_PRODUCT_KIND_NONE);
+    }
+}

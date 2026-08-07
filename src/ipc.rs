@@ -36,6 +36,7 @@ use std::time::Duration;
 use windows_core::HRESULT;
 
 use crate::diag::diag;
+use crate::results::E_ACCESSDENIED;
 use crate::{E_FAIL, E_NOTIMPL};
 
 mod unixlib;
@@ -94,6 +95,10 @@ const MSG_TYPE_INTERACTIVE_SIGN_IN_REQUEST: u16 = 23;
 const MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE: u16 = 24;
 const MSG_TYPE_GAMER_PICTURE_REQUEST: u16 = 25;
 const MSG_TYPE_GAMER_PICTURE_RESPONSE: u16 = 26;
+const MSG_TYPE_PRODUCTS_REQUEST: u16 = 27;
+const MSG_TYPE_PRODUCTS_RESPONSE: u16 = 28;
+const MSG_TYPE_PURCHASE_ID_REQUEST: u16 = 29;
+const MSG_TYPE_PURCHASE_ID_RESPONSE: u16 = 30;
 /// Mirrors `xodus_service::connection::xml::ERROR_REPLY_TYPE`: sent instead of
 /// `msg_type + 1` when the service hit an internal error handling the request (e.g. a
 /// transient failure talking to a real Microsoft endpoint), with the error's `Display`
@@ -211,12 +216,13 @@ const FULL_TRUST_SCOPE: &str = "service::user.auth.xboxlive.com::MBI_SSL";
 // definitions live in `xodus-ipc-models` (a sub-crate of the `xodus` repo) - the single
 // source of truth both this DLL and xodus-service serialize against, so the two
 // hand-mirrored copies can't drift apart. Names here follow the crate's canonical
-// spelling (`MSATokenRequest`, `AssociatedProductEntry`, ...).
+// spelling (`MSATokenRequest`, `CatalogProductEntry`, ...).
 use xodus_ipc_models::xstore::{
-    AssociatedProductEntry, AssociatedProductsRequest, AssociatedProductsResponse,
+    AssociatedProductsRequest, AssociatedProductsResponse, CatalogProductEntry,
     CollectionsIdRequest, CollectionsIdResponse, EntitledProduct, EntitledProductsRequest,
     EntitledProductsResponse, LicenseRequest, LicenseResponse, LicenseTokenRequest,
-    LicenseTokenResponse, ResolveProductIdRequest, ResolveProductIdResponse,
+    LicenseTokenResponse, ProductsRequest, ProductsResponse, PurchaseIdRequest, PurchaseIdResponse,
+    ResolveProductIdRequest, ResolveProductIdResponse,
 };
 use xodus_ipc_models::xuser::{
     GamerPictureRequest, GamerPictureResponse, InteractiveSignInRequest, InteractiveSignInResponse,
@@ -612,6 +618,33 @@ pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>,
     )))
 }
 
+unsafe extern "system" {
+    fn GetUserDefaultGeoName(geoName: *mut u16, geoNameCount: i32) -> i32;
+}
+
+/// The Store market to price catalog lookups in, as a two-letter region ("US", "DE", ...).
+///
+/// The real GDK takes this from the signed-in account's Store region, which we have no way to
+/// read, so this uses the next best thing: the region Windows itself is configured for, which
+/// under Wine is derived from the host's locale. Empty when that can't be determined, which
+/// `xodus-service` reads as "decide for me" and answers with the `neutral` market - correct
+/// prices in USD rather than no prices at all.
+///
+/// Not cached: it is one call into `kernelbase`, made a handful of times per session.
+pub(crate) fn store_market() -> String {
+    // `GetUserDefaultGeoName` wants room for the terminator, and for the numeric UN M49 codes
+    // ("419" for Latin America) it falls back to when a region has no ISO 3166-1 spelling.
+    let mut name = [0u16; 8];
+    // SAFETY: `name` is a live buffer of exactly the length passed alongside it, which is all
+    // the call requires; a too-small buffer would be a failure return, not a write past the end.
+    let written = unsafe { GetUserDefaultGeoName(name.as_mut_ptr(), name.len() as i32) };
+    if written <= 1 {
+        return String::new();
+    }
+    // The return count includes the terminating null.
+    String::from_utf16_lossy(&name[..written as usize - 1])
+}
+
 /// `XStoreQueryGameLicenseAsync`'s real backing. Returns `(is_active, expiration_date)` for
 /// the package `xodus-cli run` launched (identified by its `ContentId`, published via
 /// [`ENV_CONTENT_ID`]). `Err(E_NOTIMPL)` when that env var is unset - not running under
@@ -625,6 +658,10 @@ pub fn get_game_license() -> Result<(bool, i64), HRESULT> {
         MSG_TYPE_LICENSE_RESPONSE,
         &LicenseRequest {
             content_id,
+            // Deliberately not [`store_market`], unlike the store queries: a license check is
+            // about entitlement, not pricing, and this is the one answer a title refuses to
+            // start over. Leave `xodus-service` on the `neutral` market it has always used
+            // here rather than narrow the catalog lookup behind it to one region.
             market: String::new(),
         },
     )?;
@@ -648,9 +685,8 @@ pub(crate) fn get_entitled_products(market: &str) -> Result<Vec<EntitledProduct>
 
 /// `XStoreGetUserCollectionsIdAsync`'s real backing, via `xodus-service`'s
 /// `CollectionsIdRequest` handler - a real call against
-/// `collections.mp.microsoft.com/v7.0/beneficiaries/me/keys` (endpoint confirmed via
-/// static analysis of the real `xgameruntime.dll`'s embedded service-configuration blob,
-/// not guessed). `service_ticket`/`publisher_user_id` are forwarded verbatim; the result
+/// `collections.mp.microsoft.com/v7.0/beneficiaries/me/keys`.
+/// `service_ticket`/`publisher_user_id` are forwarded verbatim; the result
 /// is an opaque signed blob meant for the title's own backend, returned as-is.
 pub(crate) fn get_user_collections_id(
     service_ticket: &str,
@@ -664,7 +700,40 @@ pub(crate) fn get_user_collections_id(
             publisher_user_id: publisher_user_id.to_string(),
         },
     )?;
-    Ok(response.key)
+    non_empty_store_key("collections-id", response.key)
+}
+
+/// `XStoreGetUserPurchaseIdAsync`'s real backing, via `xodus-service`'s `PurchaseIdRequest`
+/// handler - the purchase-side twin of [`get_user_collections_id`], forwarding the same
+/// caller-supplied opaque values and returning the same kind of opaque blob. The two do not
+/// share a route; see `xodus::licensing::content::get_purchase_id`.
+pub(crate) fn get_user_purchase_id(
+    service_ticket: &str,
+    publisher_user_id: &str,
+) -> Result<String, HRESULT> {
+    let response: PurchaseIdResponse = exchange(
+        MSG_TYPE_PURCHASE_ID_REQUEST,
+        MSG_TYPE_PURCHASE_ID_RESPONSE,
+        &PurchaseIdRequest {
+            service_ticket: service_ticket.to_string(),
+            publisher_user_id: publisher_user_id.to_string(),
+        },
+    )?;
+    non_empty_store_key("purchase-id", response.key)
+}
+
+/// `xodus-service` reports "I could not get this key" as an empty string, its usual stance
+/// on honest absence. The XStore API has no equivalent - `*ResultSize` returning 1 for the
+/// NUL alone reads to the title as a successful fetch of an empty key, and Minecraft's own
+/// store path accepts exactly that (it fails only on `hr < 0` or `size == 0`), so handing
+/// the empty string on would be claiming a success we did not have. Translate it to the
+/// failure the real GDK would have reported.
+fn non_empty_store_key(label: &str, key: String) -> Result<String, HRESULT> {
+    if key.is_empty() {
+        diag!("{label} -> service returned no key; reporting E_ACCESSDENIED");
+        return Err(E_ACCESSDENIED);
+    }
+    Ok(key)
 }
 
 /// `XStoreQueryLicenseTokenAsync`'s real backing, via `xodus-service`'s
@@ -695,24 +764,40 @@ pub(crate) fn get_license_token(
 /// [`ENV_CONTENT_ID`].
 pub(crate) fn get_associated_products(
     max_items: u32,
-) -> Result<Vec<AssociatedProductEntry>, HRESULT> {
+) -> Result<Vec<CatalogProductEntry>, HRESULT> {
     let package_family_name = std::env::var(ENV_PACKAGE_FAMILY_NAME).map_err(|_| E_NOTIMPL)?;
     let response: AssociatedProductsResponse = exchange(
         MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST,
         MSG_TYPE_ASSOCIATED_PRODUCTS_RESPONSE,
         &AssociatedProductsRequest {
             package_family_name,
-            market: String::new(),
+            market: store_market(),
             max_items,
         },
     )?;
     Ok(response.products)
 }
 
+/// `XStoreQueryProductsAsync`'s real backing, via `xodus-service`'s `ProductsRequest` handler -
+/// prices a list of `StoreId`s the title named itself. Unlike [`get_associated_products`] there
+/// is nothing to gate on: the caller supplied the ids, so no `AppxManifest.xml` or
+/// [`ENV_PACKAGE_FAMILY_NAME`] is needed to know what to ask about.
+pub(crate) fn get_products(store_ids: &[String]) -> Result<Vec<CatalogProductEntry>, HRESULT> {
+    let response: ProductsResponse = exchange(
+        MSG_TYPE_PRODUCTS_REQUEST,
+        MSG_TYPE_PRODUCTS_RESPONSE,
+        &ProductsRequest {
+            store_ids: store_ids.to_vec(),
+            market: store_market(),
+        },
+    )?;
+    Ok(response.products)
+}
+
 /// `XPersistentLocalStorageMountForPackage`'s real backing: resolves a `PackageFamilyName`
-/// (the real interface's `packageIdentifier` - confirmed via strings recovered from the real
-/// `xgameruntime.dll`, which implements `XPackageGetCurrentProcessPackageIdentifier` on top of
-/// Win32's own `GetCurrentPackageFamilyName`) to a `StoreId`, via the same
+/// (the real interface's `packageIdentifier`, matching
+/// `XPackageGetCurrentProcessPackageIdentifier`, which is backed by Win32's own
+/// `GetCurrentPackageFamilyName`) to a `StoreId`, via the same
 /// `alternateid=PackageFamilyName` catalog lookup [`get_associated_products`] uses. `Ok(None)`
 /// is a "no such product", not an error - the caller decides what that means.
 pub(crate) fn resolve_product_id(package_family_name: &str) -> Result<Option<String>, HRESULT> {
@@ -721,7 +806,7 @@ pub(crate) fn resolve_product_id(package_family_name: &str) -> Result<Option<Str
         MSG_TYPE_RESOLVE_PRODUCT_ID_RESPONSE,
         &ResolveProductIdRequest {
             package_family_name: package_family_name.to_string(),
-            market: String::new(),
+            market: store_market(),
         },
     )?;
     if response.product_id.is_empty() {
@@ -788,6 +873,22 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// Whatever Wine reports, it has to be something the catalog will accept as a `market`:
+    /// an ISO 3166-1 region or a UN M49 code, never a locale ("en-US") or stray whitespace.
+    /// An empty answer is allowed - that is the documented "let the service decide" case.
+    #[test]
+    fn store_market_is_a_region_code_or_nothing() {
+        let market = store_market();
+        assert!(
+            market.is_empty()
+                || ((2..=3).contains(&market.len())
+                    && market
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())),
+            "unusable market {market:?}"
+        );
+    }
 
     // `get_msa_token_silently` reads `ENV_TCP_PORT`/`ENV_TCP_SECRET`, which are
     // process-global - serialize the tests that touch them so they don't race each other
