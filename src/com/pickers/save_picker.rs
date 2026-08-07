@@ -20,8 +20,9 @@ use windows::windef::HWND;
 use windows_collections::{IMap, IVector};
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, IUnknown_Vtbl, Interface};
 
-use super::async_op::SaveOperation;
-use super::dialog::SaveRequest;
+use super::async_op::PickOperation;
+use super::dialog::{SaveRequest, show_save_dialog};
+use super::storage_file::PickedFile;
 use super::{E_NOINTERFACE, E_POINTER, IID_IAGILE_OBJECT, S_OK, spy_get_iids, spy_get_trust_level};
 use crate::diag::stub;
 
@@ -291,7 +292,7 @@ unsafe extern "system" fn PickSaveFileAsync(this: *mut c_void, out: *mut *mut c_
             request.suggested_name,
             request.file_types.len()
         );
-        *out = SaveOperation::start(request);
+        *out = PickOperation::<PickedFile>::start(Box::new(move || show_save_dialog(request)));
     }
     S_OK
 }

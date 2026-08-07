@@ -10,6 +10,7 @@
 //! Unlike the pickers, `windows-rs` does generate `_Impl` traits for these interfaces, so the
 //! vtables come from `#[implement]` rather than by hand.
 
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use windows::Storage::FileProperties::BasicProperties;
@@ -29,9 +30,10 @@ use windows::Storage::{
     IStorageItemPropertiesWithProvider_Impl, NameCollisionOption, StorageDeleteOption, StorageFile,
     StorageFolder, StorageItemTypes, StorageOpenOptions, StorageProvider, StorageStreamTransaction,
 };
-use windows_core::{HSTRING, Ref, Result, implement};
+use windows_core::{GUID, HSTRING, Interface, Ref, Result, implement};
 use windows_future::{IAsyncAction, IAsyncOperation};
 
+use super::async_op::PickOutcome;
 use crate::diag::stub;
 
 /// Ticks between the Windows epoch (1601-01-01) and the Unix epoch, in 100ns units - the
@@ -384,5 +386,24 @@ impl IStorageFilePropertiesWithAvailability_Impl for PickedFile_Impl {
     fn IsAvailable(&self) -> Result<bool> {
         // The file is on local disk by construction: a dialog cannot name anything else here.
         Ok(true)
+    }
+}
+
+/// What an operation producing a `StorageFile` completes with - a save pick, or a lookup by path.
+impl PickOutcome for PickedFile {
+    const LABEL: &'static str = "StorageFileOperation";
+    const OPERATION_IID: GUID = IAsyncOperation::<StorageFile>::IID;
+    const RUNTIME_CLASS_NAME: &'static str =
+        "Windows.Foundation.IAsyncOperation`1<Windows.Storage.StorageFile>";
+
+    fn create_result(path: PathBuf) -> *mut c_void {
+        let file = PickedFile::create(path);
+        // SAFETY: `StorageFile` is a `repr(transparent)` interface pointer, and the reference it
+        // holds passes to the caller rather than being dropped here.
+        unsafe {
+            let raw = std::mem::transmute_copy(&file);
+            std::mem::forget(file);
+            raw
+        }
     }
 }
