@@ -7,6 +7,7 @@
 #![allow(clippy::upper_case_acronyms)]
 
 pub(crate) mod handle_table;
+pub(crate) mod pickers;
 
 pub mod xaccessibility;
 pub mod xappcapture;

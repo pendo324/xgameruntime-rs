@@ -251,3 +251,17 @@ pub extern "system" fn DllGetClassObject(
     );
     CLASS_E_CLASSNOTAVAILABLE
 }
+
+/// WinRT activation, which this runtime serves only the file save picker through. See
+/// [`com::pickers`] for what is and is not answered.
+///
+/// The class id arrives as an `HSTRING` the caller still owns, so it is wrapped in
+/// `ManuallyDrop`: dropping it here would release a string `combase` goes on to use.
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "system" fn DllGetActivationFactory(
+    class_id: std::mem::ManuallyDrop<windows_core::HSTRING>,
+    factory: *mut *mut c_void,
+) -> HRESULT {
+    com::pickers::get_activation_factory(&class_id, factory)
+}
