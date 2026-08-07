@@ -683,7 +683,10 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             unsafe { std::slice::from_raw_parts(body_buffer.cast::<u8>(), body_size) }.to_vec()
         };
 
-        diag!("XUserGetTokenAndSignatureAsync(method={method:?}, url={url:?})");
+        diag!(
+            "XUserGetTokenAndSignatureAsync(method={method:?}, url={url:?}) body={:?}",
+            String::from_utf8_lossy(&body)
+        );
         let key = async_ as usize;
         // SAFETY: the GDK's XUserGetTokenAndSignatureAsync contract guarantees `async_`
         // is a valid, caller-owned `XAsyncBlock*` for the duration of this call.
