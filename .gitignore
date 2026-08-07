@@ -8,9 +8,12 @@
 # Local toolchain overrides (WINE_MSVC_LIB_DIR).
 /.env
 
-# Working notes and launch helpers kept out of version control. build-release.sh is the
-# exception: it is the supported way to build the DLL (a plain `cargo build` produces a file
-# that will not load), so the README cannot reference it unless it ships.
+# Working notes and launch helpers kept out of version control. Two scripts are exceptions:
+# build-release.sh is the supported way to build the DLL (a plain `cargo build` produces a file
+# that will not load), so the README cannot reference it unless it ships, and
+# generate-appsdk-bindings.sh is how a committed generated file was produced, which is worth no
+# less than the file itself.
 /PLAN.md
 /scripts/*
 !/scripts/build-release.sh
+!/scripts/generate-appsdk-bindings.sh

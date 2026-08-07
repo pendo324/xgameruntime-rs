@@ -1,0 +1,3 @@
+# Machine-written files, so diffs of them collapse by default and their churn stays out of
+# language statistics and review.
+src/com/pickers/appsdk/bindings.rs linguist-generated=true

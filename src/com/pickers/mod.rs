@@ -10,8 +10,10 @@
 //! that module and calls its `DllGetActivationFactory`. That key has to point at this DLL for
 //! any of this to be reached; without it the lookup fails with `REGDB_E_CLASSNOTREG` first.
 //!
-//! Only the save picker is implemented. The open picker is a separate interface with its own
-//! result shape, and nothing that runs here has asked for it yet.
+//! Two class families live here. `Windows.Storage.Pickers` is the classic one, and only its save
+//! picker is implemented - its open picker has a separate interface with its own result shape,
+//! and nothing that runs here has asked for it. The Windows App SDK's own pickers, which a title
+//! built against that SDK asks for instead, are in [`appsdk`].
 
 use std::ffi::c_void;
 
@@ -19,6 +21,7 @@ use windows_core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, IUnknown_Vtbl, Int
 
 use crate::diag::stub;
 
+mod appsdk;
 mod async_op;
 mod deferred;
 mod dialog;
@@ -186,7 +189,10 @@ static FACTORY_VTABLE: ActivationFactoryVtbl = ActivationFactoryVtbl {
     ActivateInstance: factory_activate_instance,
 };
 
-/// Serves the activation factory for the save picker, and logs every class asked for.
+/// The classic class this module serves, spelled the way a title asks for it.
+const FILE_SAVE_PICKER: &str = "Windows.Storage.Pickers.FileSavePicker";
+
+/// Serves the activation factories for the pickers, and logs every class asked for.
 ///
 /// Classes this runtime has nothing to say about are refused with `CLASS_E_CLASSNOTAVAILABLE`
 /// rather than served something half-built: Wine's own implementations of the classes it does
@@ -200,7 +206,13 @@ pub(crate) fn get_activation_factory(class_id: &HSTRING, factory: *mut *mut c_vo
     unsafe { *factory = std::ptr::null_mut() };
 
     let name = class_id.to_string_lossy();
-    if name != "Windows.Storage.Pickers.FileSavePicker" {
+    if let Some(served) = appsdk::activation_factory(&name) {
+        // SAFETY: `factory` is non-null and writable, checked above; the reference the App SDK
+        // factory carries passes to the caller.
+        unsafe { *factory = served };
+        return S_OK;
+    }
+    if name != FILE_SAVE_PICKER {
         stub!("DllGetActivationFactory({name:?}) -> CLASS_E_CLASSNOTAVAILABLE");
         return CLASS_E_CLASSNOTAVAILABLE;
     }
