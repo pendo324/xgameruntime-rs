@@ -187,6 +187,21 @@ fn title_client_id() -> String {
     read_game_msa_app_id().unwrap_or_else(|| XBOX_LIVE_CLIENT_ID.to_string())
 }
 
+/// The launched title's `<TitleId>` as the decimal string xodus-service expects, or `""`
+/// when no `MicrosoftGame.config` could be read.
+///
+/// The service needs this to run the SISU flow, which authenticates as the title itself and
+/// so yields a *title* token. Without a title claim on the XSTS token, endpoints phrased in
+/// terms of "the current title" - notably the presence write to
+/// `/devices/current/titles/current`, which is why the player showed as offline while
+/// playing - answer `400 ArgumentError`. An empty string tells the service to skip the SISU
+/// round trip and mint the plain user-only token, which is all older clients ever sent.
+fn title_id() -> String {
+    crate::com::xgame::read_game_title_id()
+        .map(|id| id.to_string())
+        .unwrap_or_default()
+}
+
 /// The literal scope GDK games pass to request a full-trust (`MBI_SSL`) token, per
 /// `xodus-service/src/connection/xml.rs`'s handling of `MSATokenRequest::msa_full_trust`.
 /// Anything else is treated as an ordinary sign-in scope request.
@@ -528,6 +543,7 @@ fn get_token_and_signature_once(
             body: base64_encode(body),
             force_refresh: false,
             client_id: title_client_id(),
+            title_id: title_id(),
         },
     )?;
     diag!(
@@ -548,6 +564,7 @@ pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
         MSG_TYPE_USER_INFO_RESPONSE,
         &UserInfoRequest {
             client_id: title_client_id(),
+            title_id: title_id(),
         },
     )?;
     diag!(
@@ -579,6 +596,7 @@ pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>,
         MSG_TYPE_INTERACTIVE_SIGN_IN_RESPONSE,
         &InteractiveSignInRequest {
             client_id: title_client_id(),
+            title_id: title_id(),
         },
         INTERACTIVE_SIGN_IN_TIMEOUT,
     )?;

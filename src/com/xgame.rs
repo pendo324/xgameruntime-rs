@@ -37,7 +37,10 @@ pub struct XGame;
 /// Parses the real `<TitleId>` out of the launched title's `MicrosoftGame.Config`, walking up
 /// from the game executable (the file lives next to the exe, occasionally a parent directory) -
 /// not hardcoded, so the title id is the launched title's own rather than baked in.
-fn read_game_title_id() -> Option<u32> {
+///
+/// Also used by `ipc.rs`, which sends the title id to xodus-service so it can obtain a
+/// *title* token - the claim Xbox Live needs to resolve "the current title".
+pub(crate) fn read_game_title_id() -> Option<u32> {
     static TITLE_ID: OnceLock<Option<u32>> = OnceLock::new();
     *TITLE_ID.get_or_init(|| {
         let exe = std::env::current_exe().ok()?;
