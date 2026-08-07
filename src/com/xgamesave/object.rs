@@ -28,7 +28,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             return E_POINTER;
         }
         let configuration_id = unsafe { read_cstr(configurationId) };
-        let user_id = unsafe { crate::com::xuser::user_id_for_handle(requestingUser) };
+        let user_id = crate::com::xuser::user_id_for_handle(requestingUser);
         match initialize_provider(user_id, configuration_id) {
             Ok(handle) => {
                 unsafe { *provider = handle };
@@ -47,7 +47,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
     ) -> HRESULT {
         let _ = syncOnDemand;
         let configuration_id = unsafe { read_cstr(configurationId) };
-        let user_id = unsafe { crate::com::xuser::user_id_for_handle(requestingUser) };
+        let user_id = crate::com::xuser::user_id_for_handle(requestingUser);
         unsafe {
             xasync::run_sync(async_, move || {
                 initialize_provider(user_id, configuration_id.clone())
@@ -70,7 +70,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
     }
 
     unsafe fn XGameSaveCloseProvider(&self, provider: XGameSaveProviderHandle) {
-        unsafe { ProviderHandleTable::close(provider) };
+        ProviderHandleTable::close(provider);
     }
 
     unsafe fn XGameSaveGetRemainingQuota(
@@ -81,10 +81,10 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         if remainingQuota.is_null() {
             return E_POINTER;
         }
-        let Some(root) = (unsafe { ProviderHandleTable::get(provider) }) else {
+        let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
-        unsafe { *remainingQuota = remaining_quota(root) };
+        unsafe { *remainingQuota = remaining_quota(&root) };
         S_OK
     }
 
@@ -93,7 +93,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         provider: XGameSaveProviderHandle,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
-        let root = unsafe { ProviderHandleTable::get(provider) }.cloned();
+        let root = ProviderHandleTable::get(provider);
         unsafe {
             xasync::run_sync(async_, move || {
                 root.as_deref().map(remaining_quota).ok_or(E_INVALIDARG)
@@ -120,11 +120,11 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         provider: XGameSaveProviderHandle,
         containerName: *const c_char,
     ) -> HRESULT {
-        let Some(root) = (unsafe { ProviderHandleTable::get(provider) }) else {
+        let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
         let container_name = unsafe { read_cstr(containerName) };
-        match delete_container(root, container_name) {
+        match delete_container(&root, container_name) {
             Ok(()) => S_OK,
             Err(hr) => hr,
         }
@@ -136,7 +136,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         containerName: *const c_char,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
-        let root = unsafe { ProviderHandleTable::get(provider) }.cloned();
+        let root = ProviderHandleTable::get(provider);
         let container_name = unsafe { read_cstr(containerName) };
         unsafe {
             xasync::run_sync(async_, move || {
@@ -160,7 +160,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         context: *mut c_void,
         callback: Option<XGameSaveContainerInfoCallback>,
     ) -> HRESULT {
-        let Some(root) = (unsafe { ProviderHandleTable::get(provider) }) else {
+        let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
         let Some(callback) = callback else {
@@ -172,7 +172,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         // A container that doesn't exist yet has nothing to report - the callback is simply
         // never invoked, same as an empty result from an enumeration, not an error.
         if let Some((name, display_name, blob_count, total_size, last_modified)) =
-            container_info(root, &name)
+            container_info(&root, &name)
         {
             let name_c = std::ffi::CString::new(name).unwrap_or_default();
             let display_name_c = std::ffi::CString::new(display_name).unwrap_or_default();
@@ -195,13 +195,13 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         context: *mut c_void,
         callback: Option<XGameSaveContainerInfoCallback>,
     ) -> HRESULT {
-        let Some(root) = (unsafe { ProviderHandleTable::get(provider) }) else {
+        let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
         let Some(callback) = callback else {
             return E_POINTER;
         };
-        enumerate_containers(root, None, context, callback);
+        enumerate_containers(&root, None, context, callback);
         S_OK
     }
 
@@ -212,14 +212,14 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         context: *mut c_void,
         callback: Option<XGameSaveContainerInfoCallback>,
     ) -> HRESULT {
-        let Some(root) = (unsafe { ProviderHandleTable::get(provider) }) else {
+        let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
         let Some(callback) = callback else {
             return E_POINTER;
         };
         let prefix = unsafe { read_cstr(containerNamePrefix) };
-        enumerate_containers(root, prefix.as_deref(), context, callback);
+        enumerate_containers(&root, prefix.as_deref(), context, callback);
         S_OK
     }
 
@@ -232,13 +232,13 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         if containerContext.is_null() {
             return E_POINTER;
         }
-        let Some(root) = (unsafe { ProviderHandleTable::get(provider) }) else {
+        let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
         let Some(name) = (unsafe { read_cstr(containerName) }) else {
             return E_INVALIDARG;
         };
-        let dir = container_dir(root, &name);
+        let dir = container_dir(&root, &name);
         if std::fs::create_dir_all(&dir).is_err() {
             return E_FAIL;
         }
@@ -248,7 +248,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
     }
 
     unsafe fn XGameSaveCloseContainer(&self, context: XGameSaveContainerHandle) {
-        unsafe { ContainerHandleTable::close(context) };
+        ContainerHandleTable::close(context);
     }
 
     unsafe fn XGameSaveEnumerateBlobInfo(
@@ -257,7 +257,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         context: *mut c_void,
         callback: Option<XGameSaveBlobInfoCallback>,
     ) -> HRESULT {
-        let Some(state) = (unsafe { ContainerHandleTable::get(container) }) else {
+        let Some(state) = ContainerHandleTable::get(container) else {
             return E_INVALIDARG;
         };
         let Some(callback) = callback else {
@@ -274,7 +274,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         context: *mut c_void,
         callback: Option<XGameSaveBlobInfoCallback>,
     ) -> HRESULT {
-        let Some(state) = (unsafe { ContainerHandleTable::get(container) }) else {
+        let Some(state) = ContainerHandleTable::get(container) else {
             return E_INVALIDARG;
         };
         let Some(callback) = callback else {
@@ -301,7 +301,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         if countOfBlobs.is_null() {
             return E_POINTER;
         }
-        let Some(state) = (unsafe { ContainerHandleTable::get(container) }) else {
+        let Some(state) = ContainerHandleTable::get(container) else {
             return E_INVALIDARG;
         };
         let requested = unsafe { *countOfBlobs } as usize;
@@ -380,7 +380,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             return hr;
         }
         let (container, names) = payload;
-        let Some(state) = (unsafe { ContainerHandleTable::get(container) }) else {
+        let Some(state) = ContainerHandleTable::get(container) else {
             return E_INVALIDARG;
         };
         if blobsSize < names.len() || blobData.is_null() {
@@ -423,7 +423,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         if updateContext.is_null() {
             return E_POINTER;
         }
-        let Some(state) = (unsafe { ContainerHandleTable::get(container) }) else {
+        let Some(state) = ContainerHandleTable::get(container) else {
             return E_INVALIDARG;
         };
         let display_name = unsafe { read_cstr(containerDisplayName) }.unwrap_or_default();
@@ -440,7 +440,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
     unsafe fn XGameSaveCloseUpdate(&self, context: XGameSaveUpdateHandle) {
         // An update that was never submitted is simply discarded - no partial writes ever
         // touched disk, since `SubmitBlobWrite`/`Delete` only buffer in `UpdateState`.
-        unsafe { UpdateHandleTable::close(context) };
+        UpdateHandleTable::close(context);
     }
 
     unsafe fn XGameSaveSubmitBlobWrite(
@@ -450,9 +450,10 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         data: *mut u8,
         byteCount: usize,
     ) -> HRESULT {
-        let Some(state) = (unsafe { UpdateHandleTable::get(updateContext) }) else {
+        let Some(state) = UpdateHandleTable::get(updateContext) else {
             return E_INVALIDARG;
         };
+        let mut state = state.lock().expect("update state poisoned");
         let Some(name) = (unsafe { read_cstr(blobName) }) else {
             return E_INVALIDARG;
         };
@@ -475,9 +476,10 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         updateContext: XGameSaveUpdateHandle,
         blobName: *const c_char,
     ) -> HRESULT {
-        let Some(state) = (unsafe { UpdateHandleTable::get(updateContext) }) else {
+        let Some(state) = UpdateHandleTable::get(updateContext) else {
             return E_INVALIDARG;
         };
+        let mut state = state.lock().expect("update state poisoned");
         let Some(name) = (unsafe { read_cstr(blobName) }) else {
             return E_INVALIDARG;
         };
@@ -487,9 +489,10 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
     }
 
     unsafe fn XGameSaveSubmitUpdate(&self, updateContext: XGameSaveUpdateHandle) -> HRESULT {
-        let Some(state) = (unsafe { UpdateHandleTable::get(updateContext) }) else {
+        let Some(state) = UpdateHandleTable::get(updateContext) else {
             return E_INVALIDARG;
         };
+        let mut state = state.lock().expect("update state poisoned");
         if std::fs::create_dir_all(&state.container_root).is_err() {
             return E_FAIL;
         }
@@ -572,7 +575,7 @@ impl IXGameSaveImpl2_Impl for XGameSaveObject_Impl {
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
         let configuration_id = unsafe { read_cstr(configurationId) };
-        let user_id = unsafe { crate::com::xuser::user_id_for_handle(requestingUser) };
+        let user_id = crate::com::xuser::user_id_for_handle(requestingUser);
         unsafe {
             xasync::run_sync(async_, move || {
                 let configuration_id = configuration_id.clone().ok_or(E_INVALIDARG)?;
@@ -627,7 +630,7 @@ impl IXGameSaveImpl2_Impl for XGameSaveObject_Impl {
         let Some(configuration_id) = (unsafe { read_cstr(configurationId) }) else {
             return E_INVALIDARG;
         };
-        let Some(user_id) = (unsafe { crate::com::xuser::user_id_for_handle(userContext) }) else {
+        let Some(user_id) = crate::com::xuser::user_id_for_handle(userContext) else {
             return E_INVALIDARG;
         };
         let root = provider_root(user_id, &configuration_id);

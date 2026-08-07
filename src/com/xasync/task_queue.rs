@@ -16,8 +16,9 @@
 //! of Microsoft's; the observable contract is the ordering and cancellation rules
 //! encoded in the tests at the bottom of this file.
 
+use crate::com::handle_table::HandleTable;
 use crate::diag::{diag, now_ms};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -713,64 +714,6 @@ impl Queue {
     pub fn terminate(&self, wait: bool) {
         self.work.terminate(wait);
         self.completion.terminate(wait);
-    }
-}
-
-/// A checked table from opaque `u64` handles to reference-counted objects.
-///
-/// Handles used to be raw pointers cast to `u64` (`Box::into_raw(Box::new(Arc<T>))`),
-/// which trusts the caller never to hand back a stale, foreign, or otherwise-garbage
-/// value - a real risk here, since the handle crosses the FFI boundary into game code we
-/// do not control. A bad value there does not fail cleanly; it dereferences whatever
-/// bytes happen to live at that address as an `Arc<T>`, which is memory corruption, not
-/// an error. Handing out small sequential IDs instead means a bad handle is just a failed
-/// hash-map lookup.
-struct HandleTable<T> {
-    next: AtomicU64,
-    entries: OnceLock<Mutex<HashMap<u64, T>>>,
-}
-
-impl<T: Clone> HandleTable<T> {
-    const fn new() -> Self {
-        Self {
-            // 0 is reserved for "no handle" throughout this API, so IDs start at 1.
-            next: AtomicU64::new(1),
-            entries: OnceLock::new(),
-        }
-    }
-
-    fn entries(&self) -> &Mutex<HashMap<u64, T>> {
-        self.entries.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    fn create(&self, value: T) -> u64 {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.entries()
-            .lock()
-            .expect("handle table poisoned")
-            .insert(id, value);
-        id
-    }
-
-    fn get(&self, handle: u64) -> Option<T> {
-        if handle == 0 {
-            return None;
-        }
-        self.entries()
-            .lock()
-            .expect("handle table poisoned")
-            .get(&handle)
-            .cloned()
-    }
-
-    fn close(&self, handle: u64) {
-        if handle == 0 {
-            return;
-        }
-        self.entries()
-            .lock()
-            .expect("handle table poisoned")
-            .remove(&handle);
     }
 }
 

@@ -4,11 +4,13 @@
 
 use super::*;
 use crate::E_FAIL;
+use crate::com::handle_table;
 use crate::results::*;
 
 use std::env::temp_dir;
 use std::ffi::c_char;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 pub(crate) fn provider_root(user_id: u64, configuration_id: &str) -> PathBuf {
@@ -74,32 +76,24 @@ pub(crate) unsafe fn read_cstr(ptr: *const c_char) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Handle tables - same leaked-`Box` scheme as `com.rs`'s `XPackageMountHandleTable`.
+// Handle tables, backed by the checked `handle_table::HandleTable`.
 // ---------------------------------------------------------------------------------------
 
 pub(crate) struct ProviderHandleTable;
 
+static PROVIDER_HANDLES: handle_table::HandleTable<PathBuf> = handle_table::HandleTable::new();
+
 impl ProviderHandleTable {
     pub(crate) fn create(root: PathBuf) -> u64 {
-        Box::into_raw(Box::new(root)) as u64
+        PROVIDER_HANDLES.create(root)
     }
 
-    /// # Safety
-    /// `handle` must be zero or a handle from [`Self::create`] that has not been closed.
-    pub(crate) unsafe fn get<'a>(handle: u64) -> Option<&'a PathBuf> {
-        if handle == 0 {
-            return None;
-        }
-        Some(unsafe { &*(handle as *const PathBuf) })
+    pub(crate) fn get(handle: u64) -> Option<PathBuf> {
+        PROVIDER_HANDLES.get(handle)
     }
 
-    /// # Safety
-    /// `handle` must be an open handle from [`Self::create`]; it is invalid afterwards.
-    pub(crate) unsafe fn close(handle: u64) {
-        if handle == 0 {
-            return;
-        }
-        drop(unsafe { Box::from_raw(handle as *mut PathBuf) });
+    pub(crate) fn close(handle: u64) {
+        PROVIDER_HANDLES.close(handle);
     }
 }
 
@@ -109,27 +103,20 @@ pub(crate) struct ContainerState {
 
 pub(crate) struct ContainerHandleTable;
 
+static CONTAINER_HANDLES: handle_table::HandleTable<Arc<ContainerState>> =
+    handle_table::HandleTable::new();
+
 impl ContainerHandleTable {
     pub(crate) fn create(state: ContainerState) -> u64 {
-        Box::into_raw(Box::new(state)) as u64
+        CONTAINER_HANDLES.create(Arc::new(state))
     }
 
-    /// # Safety
-    /// `handle` must be zero or a handle from [`Self::create`] that has not been closed.
-    pub(crate) unsafe fn get<'a>(handle: u64) -> Option<&'a ContainerState> {
-        if handle == 0 {
-            return None;
-        }
-        Some(unsafe { &*(handle as *const ContainerState) })
+    pub(crate) fn get(handle: u64) -> Option<Arc<ContainerState>> {
+        CONTAINER_HANDLES.get(handle)
     }
 
-    /// # Safety
-    /// `handle` must be an open handle from [`Self::create`]; it is invalid afterwards.
-    pub(crate) unsafe fn close(handle: u64) {
-        if handle == 0 {
-            return;
-        }
-        drop(unsafe { Box::from_raw(handle as *mut ContainerState) });
+    pub(crate) fn close(handle: u64) {
+        CONTAINER_HANDLES.close(handle);
     }
 }
 
@@ -144,27 +131,24 @@ pub(crate) struct UpdateState {
 
 pub(crate) struct UpdateHandleTable;
 
+/// `Mutex`-wrapped, unlike the other tables here: callers mutate `UpdateState` in place
+/// (buffering blob writes/deletes) rather than just reading it, and [`handle_table::HandleTable::get`]
+/// hands out clones of what it stores - a `Mutex` makes that clone a shared handle onto the
+/// same underlying state instead of an independent copy.
+static UPDATE_HANDLES: handle_table::HandleTable<Arc<Mutex<UpdateState>>> =
+    handle_table::HandleTable::new();
+
 impl UpdateHandleTable {
     pub(crate) fn create(state: UpdateState) -> u64 {
-        Box::into_raw(Box::new(state)) as u64
+        UPDATE_HANDLES.create(Arc::new(Mutex::new(state)))
     }
 
-    /// # Safety
-    /// `handle` must be zero or a handle from [`Self::create`] that has not been closed.
-    pub(crate) unsafe fn get<'a>(handle: u64) -> Option<&'a mut UpdateState> {
-        if handle == 0 {
-            return None;
-        }
-        Some(unsafe { &mut *(handle as *mut UpdateState) })
+    pub(crate) fn get(handle: u64) -> Option<Arc<Mutex<UpdateState>>> {
+        UPDATE_HANDLES.get(handle)
     }
 
-    /// # Safety
-    /// `handle` must be an open handle from [`Self::create`]; it is invalid afterwards.
-    pub(crate) unsafe fn close(handle: u64) {
-        if handle == 0 {
-            return;
-        }
-        drop(unsafe { Box::from_raw(handle as *mut UpdateState) });
+    pub(crate) fn close(handle: u64) {
+        UPDATE_HANDLES.close(handle);
     }
 }
 

@@ -267,7 +267,7 @@ mod tests {
         let (user_id, configuration_id) = unique_scope(tag);
         let handle =
             initialize_provider(Some(user_id), Some(configuration_id)).expect("initialize");
-        let root = unsafe { ProviderHandleTable::get(handle) }.unwrap().clone();
+        let root = ProviderHandleTable::get(handle).unwrap();
         (handle, root)
     }
 
@@ -284,7 +284,7 @@ mod tests {
     fn initialize_provider_creates_a_real_directory_that_close_leaves_on_disk() {
         let (handle, root) = open_provider("init");
         assert!(containers_dir(&root).is_dir());
-        unsafe { ProviderHandleTable::close(handle) };
+        ProviderHandleTable::close(handle);
         // Closing the provider handle is bookkeeping only - the store itself must survive,
         // since that's the entire point of a *persistent* container store.
         assert!(containers_dir(&root).is_dir());
@@ -571,11 +571,9 @@ mod tests {
         assert_eq!(hr, S_OK);
         assert_ne!(provider, 0);
 
-        let root = unsafe { ProviderHandleTable::get(provider) }
-            .unwrap()
-            .clone();
+        let root = ProviderHandleTable::get(provider).unwrap();
         assert!(containers_dir(&root).is_dir());
-        unsafe { ProviderHandleTable::close(provider) };
+        ProviderHandleTable::close(provider);
         // `XUserCloseHandle` is a private trait method outside `xuser`'s own module - this
         // test-only user handle is deliberately leaked rather than closed.
         let _ = user_handle;

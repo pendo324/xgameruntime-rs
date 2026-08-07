@@ -1,10 +1,11 @@
 use super::E_NOTIMPL;
+use crate::com::handle_table;
 use crate::com::xasync::{self, get_result};
 use crate::results::*;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 use windows_sys::core::BOOL;
 
@@ -163,32 +164,35 @@ struct ProductQuery {
     entries: Vec<ProductQueryEntry>,
 }
 
+// Raw pointers in `XStoreProduct` only ever point into `CString`s owned by the same
+// `ProductQueryEntry`, are read-only after construction, and the `Arc` in
+// `ProductQueryHandleTable` never hands out anything but shared access - safe to move or
+// share across threads on the same footing as the `CString`/`String` data behind them.
+unsafe impl Send for ProductQuery {}
+unsafe impl Sync for ProductQuery {}
+
 /// Handle table for `XStoreQueryEntitledProductsAsync`/`XStoreEnumerateProductsQuery`/
-/// `XStoreCloseProductsQueryHandle`, same leaked-`Box` scheme as `xuser.rs`'s
-/// `UserHandleTable`.
+/// `XStoreCloseProductsQueryHandle`. Stores an `Arc` rather than the bare `ProductQuery`
+/// because [`HandleTable::get`] hands out clones - `ProductQuery`'s entries are
+/// self-referential (each `XStoreProduct`'s raw pointers point into its own `CString`
+/// storage), so a deep clone would leave those pointers dangling into the original's
+/// allocations.
 struct ProductQueryHandleTable;
+
+static PRODUCT_QUERY_HANDLES: handle_table::HandleTable<Arc<ProductQuery>> =
+    handle_table::HandleTable::new();
 
 impl ProductQueryHandleTable {
     fn create(query: ProductQuery) -> u64 {
-        Box::into_raw(Box::new(query)) as u64
+        PRODUCT_QUERY_HANDLES.create(Arc::new(query))
     }
 
-    /// # Safety
-    /// `handle` must be zero or a handle from [`Self::create`] that has not been closed.
-    unsafe fn get<'a>(handle: u64) -> Option<&'a ProductQuery> {
-        if handle == 0 {
-            return None;
-        }
-        Some(unsafe { &*(handle as *const ProductQuery) })
+    fn get(handle: u64) -> Option<Arc<ProductQuery>> {
+        PRODUCT_QUERY_HANDLES.get(handle)
     }
 
-    /// # Safety
-    /// `handle` must be an open handle from [`Self::create`]; it is invalid afterwards.
-    unsafe fn close(handle: u64) {
-        if handle == 0 {
-            return;
-        }
-        drop(unsafe { Box::from_raw(handle as *mut ProductQuery) });
+    fn close(handle: u64) {
+        PRODUCT_QUERY_HANDLES.close(handle);
     }
 }
 
@@ -969,7 +973,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         if callback.is_null() {
             return E_POINTER;
         }
-        let Some(query) = (unsafe { ProductQueryHandleTable::get(productQueryHandle) }) else {
+        let Some(query) = ProductQueryHandleTable::get(productQueryHandle) else {
             return E_INVALIDARG;
         };
         let callback: XStoreProductQueryCallback = unsafe { std::mem::transmute(callback) };
@@ -988,7 +992,7 @@ impl IXStore_Impl for XStoreObject_Impl {
     }
 
     unsafe fn XStoreCloseProductsQueryHandle(&self, productQueryHandle: u64) {
-        unsafe { ProductQueryHandleTable::close(productQueryHandle) };
+        ProductQueryHandleTable::close(productQueryHandle);
     }
 
     /// `XStoreGetUserCollectionsIdAsync`'s real backing, via `xodus-service`'s

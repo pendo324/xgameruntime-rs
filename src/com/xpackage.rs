@@ -229,7 +229,7 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
         mount: XPackageMountHandle,
         pathSize: *mut usize,
     ) -> HRESULT {
-        let Some(path) = (unsafe { XPackageMountHandleTable::get(mount) }) else {
+        let Some(path) = XPackageMountHandleTable::get(mount) else {
             return E_INVALIDARG;
         };
         if pathSize.is_null() {
@@ -247,7 +247,7 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
         pathSize: usize,
         path: *mut c_char,
     ) -> HRESULT {
-        let Some(mount_path) = (unsafe { XPackageMountHandleTable::get(mount) }) else {
+        let Some(mount_path) = XPackageMountHandleTable::get(mount) else {
             return E_INVALIDARG;
         };
         if path.is_null() {
@@ -269,7 +269,7 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
     }
 
     unsafe fn XPackageCloseMountHandle(&self, mount: XPackageMountHandle) {
-        unsafe { XPackageMountHandleTable::close(mount) };
+        XPackageMountHandleTable::close(mount);
     }
 }
 

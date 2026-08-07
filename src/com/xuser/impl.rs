@@ -284,7 +284,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if duplicated_handle.is_null() {
             return E_POINTER;
         }
-        let Some(user) = (unsafe { UserHandleTable::get(handle) }) else {
+        let Some(user) = UserHandleTable::get(handle) else {
             return E_INVALIDARG;
         };
         unsafe { *duplicated_handle = UserHandleTable::create(user) };
@@ -292,12 +292,12 @@ impl IXUserImpl_Impl for XUserObject_Impl {
     }
 
     unsafe fn XUserCloseHandle(&self, user: u64) {
-        unsafe { UserHandleTable::close(user) };
+        UserHandleTable::close(user);
     }
 
     unsafe fn XUserCompare(&self, user1: u64, user2: u64) -> i32 {
-        let a = unsafe { UserHandleTable::get(user1) };
-        let b = unsafe { UserHandleTable::get(user2) };
+        let a = UserHandleTable::get(user1);
+        let b = UserHandleTable::get(user2);
         match (a, b) {
             (None, None) => 0,
             (Some(a), Some(b)) if Arc::ptr_eq(&a, &b) => 0,
@@ -381,7 +381,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if user_local_id.is_null() {
             return E_POINTER;
         }
-        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+        let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
         unsafe { *user_local_id = user.local_id };
@@ -413,7 +413,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if user_id.is_null() {
             return E_POINTER;
         }
-        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+        let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
         unsafe { *user_id = user.user_id };
@@ -441,7 +441,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if is_guest.is_null() {
             return E_POINTER;
         }
-        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+        let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
         unsafe { *is_guest = if user.is_guest { TRUE } else { FALSE } };
@@ -452,7 +452,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if state.is_null() {
             return E_POINTER;
         }
-        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+        let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
         let value = *user.state.lock().expect("user state poisoned");
@@ -470,7 +470,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         picture_size: u32,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
-        if (unsafe { UserHandleTable::get(user) }).is_none() {
+        if UserHandleTable::get(user).is_none() {
             return E_INVALIDARG;
         }
         // XUserGamerPictureSize (Small/Medium/Large/ExtraLarge) is accepted but not
@@ -610,7 +610,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if age_group.is_null() {
             return E_POINTER;
         }
-        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+        let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
         unsafe { *age_group = user.age_group };
@@ -629,7 +629,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         body_buffer: *const c_void,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
-        if (unsafe { UserHandleTable::get(user) }).is_none() {
+        if UserHandleTable::get(user).is_none() {
             return E_INVALIDARG;
         }
         if method.is_null() || url.is_null() {
@@ -767,7 +767,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         body_buffer: *const c_void,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
-        if (unsafe { UserHandleTable::get(user) }).is_none() {
+        if UserHandleTable::get(user).is_none() {
             return E_INVALIDARG;
         }
         if method.is_null() || url.is_null() {
@@ -901,7 +901,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if has_privilege.is_null() {
             return E_POINTER;
         }
-        if (unsafe { UserHandleTable::get(user) }).is_none() {
+        if UserHandleTable::get(user).is_none() {
             return E_INVALIDARG;
         }
         // Grant the common privileges initially. Real per-privilege answers need XSTS
@@ -1037,7 +1037,7 @@ impl IXUserImpl3_Impl for XUserObject_Impl {
         scope: *const c_char,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
-        if (unsafe { UserHandleTable::get(user) }).is_none() {
+        if UserHandleTable::get(user).is_none() {
             return E_INVALIDARG;
         }
         let scope = if scope.is_null() {
@@ -1136,7 +1136,7 @@ impl IXUserImpl4_Impl for XUserObject_Impl {
         // second, non-store identity provider modeled here for this to distinguish against.
         // An unknown handle reports FALSE rather than a stub that returns TRUE unconditionally
         // without checking the handle at all.
-        if (unsafe { UserHandleTable::get(user) }).is_some() {
+        if UserHandleTable::get(user).is_some() {
             TRUE
         } else {
             FALSE
@@ -1190,7 +1190,7 @@ impl IXUserImpl6_Impl for XUserObject_Impl {
     }
 
     unsafe fn XUserSignOutAsync(&self, user: u64, async_: *mut XAsyncBlock) -> HRESULT {
-        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+        let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
         unsafe {
@@ -1227,7 +1227,7 @@ impl IXUserGamertagImpl_Impl for XUserObject_Impl {
         gamertag: *mut c_char,
         gamertag_used: *mut usize,
     ) -> HRESULT {
-        let Some(user) = (unsafe { UserHandleTable::get(user) }) else {
+        let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
         let value = if component == GAMERTAG_COMPONENT_MODERN && !user.gamertag_modern.is_empty() {
@@ -1405,12 +1405,9 @@ singleton! {
 
 /// Resolves an `XUserHandle` to the xuid it was signed in with, for callers outside this
 /// module (`XGameSave`'s provider initialization namespaces save containers per user).
-/// `None` for a null or unrecognized handle.
-///
-/// # Safety
-/// `handle` must be zero or a handle from [`UserHandleTable::create`] that has not been closed.
-pub unsafe fn user_id_for_handle(handle: u64) -> Option<u64> {
-    unsafe { UserHandleTable::get(handle) }.map(|user| user.user_id)
+/// `None` for a null, stale, or otherwise unrecognized handle.
+pub fn user_id_for_handle(handle: u64) -> Option<u64> {
+    UserHandleTable::get(handle).map(|user| user.user_id)
 }
 
 /// A real, `UserHandleTable`-backed handle for `xgamesave`'s cross-module tests to pass to

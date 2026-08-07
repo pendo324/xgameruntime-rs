@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::E_FAIL;
+use crate::com::handle_table::HandleTable;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -88,32 +89,24 @@ pub(crate) fn user_handle_from_info(
     Ok(UserHandleTable::create(user))
 }
 
-/// A handle table keyed by leaked `Box<Arc<UserState>>` pointers - the same scheme as
-/// `task_queue::QueueHandle`. `XUserDuplicateHandle`/`XUserCloseHandle` are the game's
-/// refcounting, distinct from (and in addition to) the `Arc`'s own.
+/// Handles are `u64` on the wire, checked against [`HandleTable`] - see its doc comment
+/// for why. `XUserDuplicateHandle`/`XUserCloseHandle` are the game's refcounting, distinct
+/// from (and in addition to) the `Arc`'s own.
 pub(crate) struct UserHandleTable;
+
+static USER_HANDLES: HandleTable<Arc<UserState>> = HandleTable::new();
 
 impl UserHandleTable {
     pub(crate) fn create(user: Arc<UserState>) -> u64 {
-        Box::into_raw(Box::new(user)) as u64
+        USER_HANDLES.create(user)
     }
 
-    /// # Safety
-    /// `handle` must be zero or a handle from [`Self::create`] that has not been closed.
-    pub(crate) unsafe fn get(handle: u64) -> Option<Arc<UserState>> {
-        if handle == 0 {
-            return None;
-        }
-        Some(unsafe { (*(handle as *const Arc<UserState>)).clone() })
+    pub(crate) fn get(handle: u64) -> Option<Arc<UserState>> {
+        USER_HANDLES.get(handle)
     }
 
-    /// # Safety
-    /// `handle` must be an open handle from [`Self::create`]; it is invalid afterwards.
-    pub(crate) unsafe fn close(handle: u64) {
-        if handle == 0 {
-            return;
-        }
-        drop(unsafe { Box::from_raw(handle as *mut Arc<UserState>) });
+    pub(crate) fn close(handle: u64) {
+        USER_HANDLES.close(handle);
     }
 }
 

@@ -6,6 +6,8 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::upper_case_acronyms)]
 
+pub(crate) mod handle_table;
+
 pub mod xaccessibility;
 pub mod xappcapture;
 pub mod xappcapturemetadata;
@@ -84,27 +86,19 @@ pub type XPackageMountHandle = u64;
 
 struct XPackageMountHandleTable;
 
+static XPACKAGE_MOUNT_HANDLES: handle_table::HandleTable<String> = handle_table::HandleTable::new();
+
 impl XPackageMountHandleTable {
     fn create(path: String) -> u64 {
-        Box::into_raw(Box::new(path)) as u64
+        XPACKAGE_MOUNT_HANDLES.create(path)
     }
 
-    /// # Safety
-    /// `handle` must be zero or a handle from [`Self::create`] that has not been closed.
-    unsafe fn get<'a>(handle: u64) -> Option<&'a String> {
-        if handle == 0 {
-            return None;
-        }
-        Some(unsafe { &*(handle as *const String) })
+    fn get(handle: u64) -> Option<String> {
+        XPACKAGE_MOUNT_HANDLES.get(handle)
     }
 
-    /// # Safety
-    /// `handle` must be an open handle from [`Self::create`]; it is invalid afterwards.
-    unsafe fn close(handle: u64) {
-        if handle == 0 {
-            return;
-        }
-        drop(unsafe { Box::from_raw(handle as *mut String) });
+    fn close(handle: u64) {
+        XPACKAGE_MOUNT_HANDLES.close(handle);
     }
 }
 
