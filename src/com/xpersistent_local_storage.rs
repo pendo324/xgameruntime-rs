@@ -138,9 +138,9 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
         let _ = unsafe { get_result::<()>(async_block, null_mut(), &mut ()) };
     }
 
-    /// `packageIdentifier` is a `PackageFamilyName` (confirmed via strings recovered from the
-    /// real `xgameruntime.dll` - `XPackageGetCurrentProcessPackageIdentifier` is implemented on
-    /// top of Win32's own `GetCurrentPackageFamilyName`). Two cases are answerable:
+    /// `packageIdentifier` is a `PackageFamilyName`, matching
+    /// `XPackageGetCurrentProcessPackageIdentifier`, which is backed by Win32's own
+    /// `GetCurrentPackageFamilyName`. Two cases are answerable:
     /// self-mount (the running title's own PFN, `ENV_PACKAGE_FAMILY_NAME`) maps to this
     /// title's own persistent-storage root, and any other PFN is resolved to a `StoreId` via
     /// `xodus-service` and checked against this title's own declared `RelatedProducts`
