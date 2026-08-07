@@ -762,9 +762,7 @@ pub(crate) fn get_license_token(
 /// unset (not running under `xodus-cli run`, or `xodus-cli run` couldn't find/parse an
 /// `AppxManifest.xml`) - same "nothing to resolve" stance as [`get_game_license`]'s gate on
 /// [`ENV_CONTENT_ID`].
-pub(crate) fn get_associated_products(
-    max_items: u32,
-) -> Result<Vec<CatalogProductEntry>, HRESULT> {
+pub(crate) fn get_associated_products(max_items: u32) -> Result<Vec<CatalogProductEntry>, HRESULT> {
     let package_family_name = std::env::var(ENV_PACKAGE_FAMILY_NAME).map_err(|_| E_NOTIMPL)?;
     let response: AssociatedProductsResponse = exchange(
         MSG_TYPE_ASSOCIATED_PRODUCTS_REQUEST,

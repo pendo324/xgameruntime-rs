@@ -276,7 +276,10 @@ fn product_kind_flag(kind: &str) -> u32 {
         ("Durable", XSTORE_PRODUCT_KIND_DURABLE),
         ("Game", XSTORE_PRODUCT_KIND_GAME),
         ("Pass", XSTORE_PRODUCT_KIND_PASS),
-        ("UnmanagedConsumable", XSTORE_PRODUCT_KIND_UNMANAGED_CONSUMABLE),
+        (
+            "UnmanagedConsumable",
+            XSTORE_PRODUCT_KIND_UNMANAGED_CONSUMABLE,
+        ),
     ];
 
     KINDS
@@ -295,7 +298,8 @@ fn product_kind_flag(kind: &str) -> u32 {
 /// are not derivable from the "My games" summary payload, so they are always empty/zeroed
 /// rather than guessed at.
 fn query_entitled_products() -> u64 {
-    let products = crate::ipc::get_entitled_products(&crate::ipc::store_market()).unwrap_or_default();
+    let products =
+        crate::ipc::get_entitled_products(&crate::ipc::store_market()).unwrap_or_default();
 
     let entries = products
         .into_iter()
@@ -428,7 +432,11 @@ unsafe fn read_string_array(array: *mut *mut c_char, count: u64) -> Vec<String> 
                 return None;
             }
             // SAFETY: a non-null element is a nul-terminated string per the caller's contract.
-            Some(unsafe { CStr::from_ptr(entry) }.to_string_lossy().into_owned())
+            Some(
+                unsafe { CStr::from_ptr(entry) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         })
         .collect()
 }
@@ -1335,7 +1343,15 @@ impl IXStore_Impl for XStoreObject_Impl {
     ) -> HRESULT {
         // SAFETY: result is the caller's buffer of `size` bytes per the GDK contract; the
         // helper null-checks it and verifies the buffer is large enough before writing.
-        unsafe { opaque_result("collections-id", &COLLECTIONS_ID_RESULTS, async_, size, result) }
+        unsafe {
+            opaque_result(
+                "collections-id",
+                &COLLECTIONS_ID_RESULTS,
+                async_,
+                size,
+                result,
+            )
+        }
     }
 
     /// `XStoreGetUserPurchaseIdAsync`'s real backing, via `xodus-service`'s
@@ -1453,7 +1469,15 @@ impl IXStore_Impl for XStoreObject_Impl {
     ) -> HRESULT {
         // SAFETY: result is the caller's buffer of `size` bytes per the GDK contract; the
         // helper null-checks it and verifies the buffer is large enough before writing.
-        unsafe { opaque_result("license-token", &LICENSE_TOKEN_RESULTS, async_, size, result) }
+        unsafe {
+            opaque_result(
+                "license-token",
+                &LICENSE_TOKEN_RESULTS,
+                async_,
+                size,
+                result,
+            )
+        }
     }
 }
 
@@ -1650,7 +1674,10 @@ mod tests {
         assert_eq!(product_kind_flag("Durable"), XSTORE_PRODUCT_KIND_DURABLE);
         assert_eq!(product_kind_flag("game"), XSTORE_PRODUCT_KIND_GAME);
         assert_eq!(product_kind_flag("Pass"), XSTORE_PRODUCT_KIND_PASS);
-        assert_eq!(product_kind_flag("Consumable"), XSTORE_PRODUCT_KIND_CONSUMABLE);
+        assert_eq!(
+            product_kind_flag("Consumable"),
+            XSTORE_PRODUCT_KIND_CONSUMABLE
+        );
         assert_eq!(
             product_kind_flag("UnmanagedConsumable"),
             XSTORE_PRODUCT_KIND_UNMANAGED_CONSUMABLE
