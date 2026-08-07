@@ -14,6 +14,10 @@
 //! picker is implemented - its open picker has a separate interface with its own result shape,
 //! and nothing that runs here has asked for it. The Windows App SDK's own pickers, which a title
 //! built against that SDK asks for instead, are in [`appsdk`].
+//!
+//! [`storage_statics`] rides along: a title that picks a file to read turns the path it got back
+//! into a `StorageFile`, and the class that does that is registered to a Wine module which does
+//! not implement it, so it fails the same way a picker does.
 
 use std::ffi::c_void;
 
@@ -27,6 +31,7 @@ mod deferred;
 mod dialog;
 mod save_picker;
 mod storage_file;
+mod storage_statics;
 
 const S_OK: HRESULT = HRESULT(0);
 const E_FAIL: HRESULT = HRESULT(0x80004005u32 as i32);
@@ -210,6 +215,12 @@ pub(crate) fn get_activation_factory(class_id: &HSTRING, factory: *mut *mut c_vo
         // SAFETY: `factory` is non-null and writable, checked above; the reference the App SDK
         // factory carries passes to the caller.
         unsafe { *factory = served };
+        return S_OK;
+    }
+    if name == storage_statics::STORAGE_FILE {
+        // SAFETY: `factory` is non-null and writable, checked above. The factory is static, so
+        // the pointer stays valid for the life of the process however the caller refcounts it.
+        unsafe { *factory = storage_statics::activation_factory() };
         return S_OK;
     }
     if name != FILE_SAVE_PICKER {
