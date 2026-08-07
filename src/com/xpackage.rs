@@ -7,6 +7,7 @@ use windows_sys::core::BOOL;
 use super::bool_stub;
 use super::hresult_stub;
 use super::void_stub;
+use crate::diag::diag;
 
 pub const CLSID_XPACKAGE: GUID = GUID::from_u128(0xaf406016_e850_4aa8_a88d_2f3dcb9dac7e);
 /// `wine/include/xpackage.idl`'s `IXPackageImpl`, `__PADDING__`/`__PADDING_2__`/.../`__PADDING_5__`
@@ -190,7 +191,6 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
         unsafe fn XPackageGetCurrentProcessPackageIdentifier(&self, bufferSize: usize, buffer: *mut c_char) -> HRESULT;
         unsafe fn XPackageCreateInstallationMonitor(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, minimumUpdateIntervalMs: u32, queue: *mut c_void, installationMonitor: *mut c_void) -> HRESULT;
         unsafe fn XPackageRegisterInstallationProgressChanged(&self, installationMonitor: u64, context: *mut c_void, callback: *mut c_void, token: *mut c_void) -> HRESULT;
-        unsafe fn XPackageGetUserLocale(&self, localeSize: usize, locale: *mut c_char) -> HRESULT;
         unsafe fn XPackageFindChunkAvailability(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, availability: *mut c_void) -> HRESULT;
         unsafe fn XPackageEnumerateChunkAvailability(&self, packageIdentifier: *const c_char, selectorType: u32, context: *mut c_void, callback: *mut c_void) -> HRESULT;
         unsafe fn XPackageChangeChunkInstallOrder(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void) -> HRESULT;
@@ -274,6 +274,47 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
 
     unsafe fn XPackageCloseMountHandle(&self, mount: XPackageMountHandle) {
         XPackageMountHandleTable::close(mount);
+    }
+
+    unsafe fn XPackageGetUserLocale(&self, localeSize: usize, locale: *mut c_char) -> HRESULT {
+        if locale.is_null() {
+            return E_POINTER;
+        }
+        let tag = user_locale();
+        let bytes = tag.as_bytes();
+        if bytes.len() + 1 > localeSize {
+            return E_NOT_SUFFICIENT_BUFFER;
+        }
+        diag!("XPackageGetUserLocale -> {tag}");
+        // SAFETY: `locale` is non-null and valid for `localeSize` bytes per the GDK
+        // contract, and `localeSize` covers `bytes.len() + 1` as checked above.
+        unsafe {
+            crate::ffi_util::write_out_bytes(bytes, locale.cast::<u8>());
+            *locale.cast::<u8>().add(bytes.len()) = 0;
+        }
+        S_OK
+    }
+}
+
+/// The BCP-47 locale the title should present itself in, as `XPackageGetUserLocale` reports
+/// it - derived from the POSIX locale environment the process was launched with, since
+/// there is no Windows user profile behind this to ask.
+///
+/// A stubbed-out locale is not harmless: it is what the store catalog is queried with, so
+/// getting it wrong is how prices come back in the wrong currency (or not at all).
+fn user_locale() -> String {
+    let raw = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .unwrap_or_default();
+    // POSIX spells locales `ll_CC.charset[@modifier]`; BCP-47 wants `ll-CC`.
+    let base = raw.split(['.', '@']).next().unwrap_or_default();
+    let tag = base.replace('_', "-");
+    // `C` and `POSIX` are the "no locale configured" values, and neither is a language tag.
+    if tag.is_empty() || tag == "C" || tag == "POSIX" {
+        "en-US".to_string()
+    } else {
+        tag
     }
 }
 
