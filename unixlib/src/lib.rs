@@ -23,6 +23,8 @@
 //! forever: a wedged service would otherwise hang a game thread inside a syscall frame,
 //! where Wine cannot interrupt it. Every socket carries `SO_SNDTIMEO`/`SO_RCVTIMEO`.
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -98,6 +100,7 @@ struct ParkedReply {
 /// # Safety
 /// `args` must point to a valid [`ExchangeParams`].
 unsafe extern "C" fn exchange(args: *mut c_void) -> NtStatus {
+    // SAFETY: `args` is `exchange`'s own `# Safety` precondition.
     let Some(params) = (unsafe { (args as *mut ExchangeParams).as_mut() }) else {
         return STATUS_INVALID_PARAMETER;
     };
@@ -111,7 +114,11 @@ unsafe extern "C" fn exchange(args: *mut c_void) -> NtStatus {
     if params.request_len > MAX_MESSAGE_SIZE || (params.request_len > 0 && params.request == 0) {
         return STATUS_INVALID_PARAMETER;
     }
+    // SAFETY: `params.socket_path` was checked non-zero above, and `ExchangeParams`'s own
+    // contract is that it points to a nul-terminated path.
     let path = unsafe { CStr::from_ptr(params.socket_path as *const c_char) };
+    // SAFETY: `params.request`/`request_len` were checked consistent (null iff zero-length,
+    // within `MAX_MESSAGE_SIZE`) above.
     let request =
         unsafe { std::slice::from_raw_parts(params.request as *const u8, params.request_len as _) };
 
@@ -157,12 +164,15 @@ unsafe extern "C" fn exchange(args: *mut c_void) -> NtStatus {
 /// `args` must point to a valid [`FetchReplyParams`] whose `reply_handle` came from a
 /// successful [`exchange`] and has not been fetched already.
 unsafe extern "C" fn fetch_reply(args: *mut c_void) -> NtStatus {
+    // SAFETY: `args` is `fetch_reply`'s own `# Safety` precondition.
     let Some(params) = (unsafe { (args as *mut FetchReplyParams).as_mut() }) else {
         return STATUS_INVALID_PARAMETER;
     };
     if params.reply_handle == 0 {
         return STATUS_INVALID_PARAMETER;
     }
+    // SAFETY: `params.reply_handle` is `fetch_reply`'s own `# Safety` precondition - it
+    // must come from a successful `exchange` and not have been fetched already.
     // Reclaimed unconditionally: every path below this point frees it, so a caller that
     // sized its buffer wrong retries with a fresh exchange rather than leaking this one.
     let parked = unsafe { Box::from_raw(params.reply_handle as *mut ParkedReply) };
@@ -177,6 +187,7 @@ unsafe extern "C" fn fetch_reply(args: *mut c_void) -> NtStatus {
     if params.buffer == 0 {
         return STATUS_INVALID_PARAMETER;
     }
+    // SAFETY: `params.buffer_len >= parked.body.len()` was checked above.
     unsafe {
         std::ptr::copy_nonoverlapping(
             parked.body.as_ptr(),
@@ -222,6 +233,8 @@ extern "C" fn publish_handle() {
     let (Ok(name), Ok(value)) = (CString::new(ENV_UNIXLIB_HANDLE), CString::new(address)) else {
         return;
     };
+    // SAFETY: `name`/`value` are valid, nul-terminated `CString`s and this runs
+    // single-threaded (an ELF constructor, before any other code in the process).
     unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) };
 }
 
@@ -238,6 +251,7 @@ struct Socket(c_int);
 impl Socket {
     fn connect(path: &CStr, timeout_ms: u64) -> Result<Self, NtStatus> {
         let bytes = path.to_bytes();
+        // SAFETY: an all-zero `sockaddr_un` is a valid value of that type.
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         // The final byte must stay NUL, hence the strict `>=`.
         if bytes.len() >= addr.sun_path.len() {
@@ -248,6 +262,7 @@ impl Socket {
             *slot = *byte as c_char;
         }
 
+        // SAFETY: `libc::socket` has no pointer arguments to uphold invariants for.
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(STATUS_UNEXPECTED_IO_ERROR);
@@ -259,6 +274,8 @@ impl Socket {
             tv_usec: ((timeout_ms % 1000) * 1000) as _,
         };
         for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            // SAFETY: `timeout` is a valid `libc::timeval` and its size matches the `optlen`
+            // passed alongside it.
             unsafe {
                 libc::setsockopt(
                     fd,
@@ -271,6 +288,8 @@ impl Socket {
         }
 
         loop {
+            // SAFETY: `addr` is a valid `sockaddr_un` and its size matches the `addrlen`
+            // passed alongside it.
             let ret = unsafe {
                 libc::connect(
                     fd,
@@ -299,6 +318,7 @@ impl Socket {
 
     fn write_all(&self, mut buf: &[u8]) -> Result<(), NtStatus> {
         while !buf.is_empty() {
+            // SAFETY: `buf` is a valid, live `&[u8]` for the duration of this call.
             let written = unsafe {
                 libc::send(
                     self.0,
@@ -323,6 +343,7 @@ impl Socket {
 
     fn read_exact(&self, mut buf: &mut [u8]) -> Result<(), NtStatus> {
         while !buf.is_empty() {
+            // SAFETY: `buf` is a valid, live `&mut [u8]` for the duration of this call.
             let read = unsafe { libc::recv(self.0, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
             if read > 0 {
                 buf = &mut buf[read as usize..];
@@ -345,11 +366,14 @@ impl Socket {
 
 impl Drop for Socket {
     fn drop(&mut self) {
+        // SAFETY: `self.0` is `Socket`'s only owner and closed exactly once, here.
         unsafe { libc::close(self.0) };
     }
 }
 
 fn errno() -> c_int {
+    // SAFETY: `__errno_location` always returns a valid pointer to the calling thread's
+    // errno.
     unsafe { *libc::__errno_location() }
 }
 

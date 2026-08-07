@@ -76,12 +76,14 @@ impl IXGameImpl_Impl for XGame_Impl {
         }
         match read_game_title_id() {
             Some(id) => {
+                // SAFETY: `value` was checked non-null above.
                 unsafe {
                     *value = id;
                 }
                 S_OK
             }
             None => {
+                // SAFETY: `value` was checked non-null above.
                 unsafe {
                     *value = 0;
                 }

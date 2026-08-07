@@ -244,6 +244,10 @@ pub unsafe trait IXGameSaveImpl2: IXGameSaveImpl {
 pub unsafe trait IXGameSaveImpl3: IXGameSaveImpl2 {}
 
 #[cfg(test)]
+// Test code exercises this crate's own already-documented internal APIs against
+// synthetic, controlled inputs, not untrusted FFI callers - a per-site SAFETY comment
+// here would just restate the production contract already documented at each fn.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use std::path::PathBuf;
     use std::ptr::null_mut;

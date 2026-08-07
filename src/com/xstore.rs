@@ -168,7 +168,11 @@ struct ProductQuery {
 // `ProductQueryEntry`, are read-only after construction, and the `Arc` in
 // `ProductQueryHandleTable` never hands out anything but shared access - safe to move or
 // share across threads on the same footing as the `CString`/`String` data behind them.
+// SAFETY: see above - the raw pointers are read-only and always outlived by their
+// owning `CString`s, so moving a `ProductQuery` across threads is sound.
 unsafe impl Send for ProductQuery {}
+// SAFETY: see above - the raw pointers are read-only after construction, so
+// shared (`&ProductQuery`) access across threads is sound.
 unsafe impl Sync for ProductQuery {}
 
 /// Handle table for `XStoreQueryEntitledProductsAsync`/`XStoreEnumerateProductsQuery`/
@@ -849,6 +853,8 @@ impl IXStore_Impl for XStoreObject_Impl {
 
     unsafe fn XStoreCreateContext(&self, _user: u64, storeContextHandle: *mut u64) -> HRESULT {
         diag!("XStoreCreateContext(user={_user}) -> handle=1");
+        // SAFETY: storeContextHandle is a valid u64 out-pointer per the
+        // XStoreCreateContext GDK contract.
         unsafe {
             *storeContextHandle = 1;
         };
@@ -864,6 +870,8 @@ impl IXStore_Impl for XStoreObject_Impl {
         if storeContextHandle == 0 {
             return E_POINTER;
         }
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
+        // contract; run_sync itself no-ops on a null pointer.
         unsafe { xasync::run_sync(async_.cast(), move || Ok(query_game_license())) }
     }
 
@@ -879,8 +887,12 @@ impl IXStore_Impl for XStoreObject_Impl {
         let mut payload = XStoreQueryGameLicenseAsyncResultPayload {
             license: XStoreGameLicense::default(),
         };
+        // SAFETY: async_ was null-checked above and payload's type matches the T
+        // that XStoreQueryGameLicenseAsync's run_sync closure stored.
         match unsafe { get_result(async_.cast(), null_mut(), &mut payload) } {
             Ok(_) => {
+                // SAFETY: license was null-checked above and is a valid
+                // XStoreGameLicense out-pointer per the GDK contract.
                 unsafe {
                     *(license as *mut XStoreGameLicense) = payload.license;
                 }
@@ -900,6 +912,8 @@ impl IXStore_Impl for XStoreObject_Impl {
         if storeContextHandle == 0 {
             return E_POINTER;
         }
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
+        // contract; run_sync itself no-ops on a null pointer.
         unsafe { xasync::run_sync(async_.cast(), move || Ok(query_entitled_products())) }
     }
 
@@ -913,8 +927,12 @@ impl IXStore_Impl for XStoreObject_Impl {
         }
 
         let mut handle = 0u64;
+        // SAFETY: async_ was null-checked above and handle's type (u64) matches
+        // what query_entitled_products's run_sync closure stored.
         match unsafe { get_result(async_.cast(), null_mut(), &mut handle) } {
             Ok(_) => {
+                // SAFETY: productQueryHandle was null-checked above and is a valid
+                // u64 out-pointer per the GDK contract.
                 unsafe {
                     *(productQueryHandle as *mut u64) = handle;
                 }
@@ -936,6 +954,8 @@ impl IXStore_Impl for XStoreObject_Impl {
         if storeContextHandle == 0 {
             return E_POINTER;
         }
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
+        // contract; run_sync itself no-ops on a null pointer.
         unsafe {
             xasync::run_sync(async_.cast(), move || {
                 Ok(query_associated_products(maxItemsToRetrievePerPage))
@@ -953,8 +973,12 @@ impl IXStore_Impl for XStoreObject_Impl {
         }
 
         let mut handle = 0u64;
+        // SAFETY: async_ was null-checked above and handle's type (u64) matches
+        // what query_associated_products's run_sync closure stored.
         match unsafe { get_result(async_.cast(), null_mut(), &mut handle) } {
             Ok(_) => {
+                // SAFETY: productQueryHandle was null-checked above and is a valid
+                // u64 out-pointer per the GDK contract.
                 unsafe {
                     *(productQueryHandle as *mut u64) = handle;
                 }
@@ -981,6 +1005,9 @@ impl IXStore_Impl for XStoreObject_Impl {
         let callback: XStoreProductQueryCallback =
             unsafe { crate::ffi_util::fn_ptr_cast(callback) };
         for entry in &query.entries {
+            // SAFETY: callback was validated as XStoreProductQueryCallback above;
+            // XStoreEnumerateProductsQuery's contract is that it's valid to invoke
+            // for the duration of this enumeration loop.
             let keep_going = unsafe { callback(&entry.product as *const XStoreProduct, context) };
             if keep_going == 0 {
                 break;
@@ -1013,9 +1040,15 @@ impl IXStore_Impl for XStoreObject_Impl {
         if storeContextHandle == 0 {
             return E_POINTER;
         }
+        // SAFETY: serviceTicket is a GDK-caller-supplied pointer that's null or
+        // NUL-terminated per the XStoreGetUserCollectionsIdAsync contract.
         let service_ticket = unsafe { c_string_or_empty(serviceTicket) };
+        // SAFETY: publisherUserId is a GDK-caller-supplied pointer that's null or
+        // NUL-terminated per the XStoreGetUserCollectionsIdAsync contract.
         let publisher_user_id = unsafe { c_string_or_empty(publisherUserId) };
         let key = async_ as usize;
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
+        // contract; run_sync itself no-ops on a null pointer.
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result =
@@ -1048,6 +1081,8 @@ impl IXStore_Impl for XStoreObject_Impl {
             .expect("collections id results poisoned");
         match results.as_ref().and_then(|results| results.get(&key)) {
             Some(Ok(value)) => {
+                // SAFETY: size was null-checked above and is a valid usize
+                // out-pointer per the GDK contract.
                 unsafe { *size = value.len() + 1 };
                 S_OK
             }
@@ -1107,13 +1142,22 @@ impl IXStore_Impl for XStoreObject_Impl {
         let product_ids: Vec<String> = if productIds.is_null() {
             Vec::new()
         } else {
+            // SAFETY: productIds is non-null (checked above) and productIdsCount is
+            // the caller's contractual element count for it per the
+            // XStoreQueryLicenseTokenAsync GDK contract.
             unsafe { std::slice::from_raw_parts(productIds, productIdsCount as usize) }
                 .iter()
+                // SAFETY: each ptr is a GDK-caller-supplied pointer that's null or
+                // NUL-terminated per XStoreQueryLicenseTokenAsync's productIds contract.
                 .map(|&ptr| unsafe { c_string_or_empty(ptr) })
                 .collect()
         };
+        // SAFETY: customDeveloperString is a GDK-caller-supplied pointer that's
+        // null or NUL-terminated per the XStoreQueryLicenseTokenAsync contract.
         let custom_developer_string = unsafe { c_string_or_empty(customDeveloperString) };
         let key = async_ as usize;
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK
+        // contract; run_sync itself no-ops on a null pointer.
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result = crate::ipc::get_license_token(&product_ids, &custom_developer_string);
@@ -1145,6 +1189,8 @@ impl IXStore_Impl for XStoreObject_Impl {
             .expect("license token results poisoned");
         match results.as_ref().and_then(|results| results.get(&key)) {
             Some(Ok(value)) => {
+                // SAFETY: size was null-checked above and is a valid usize
+                // out-pointer per the GDK contract.
                 unsafe { *size = value.len() + 1 };
                 S_OK
             }
@@ -1201,6 +1247,8 @@ unsafe fn c_string_or_empty(ptr: *mut c_char) -> String {
     if ptr.is_null() {
         String::new()
     } else {
+        // SAFETY: ptr is non-null here (checked above) and NUL-terminated per
+        // this function's own `# Safety` contract.
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()

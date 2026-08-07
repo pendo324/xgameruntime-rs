@@ -27,10 +27,12 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         if provider.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `configurationId` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let configuration_id = unsafe { read_cstr(configurationId) };
         let user_id = crate::com::xuser::user_id_for_handle(requestingUser);
         match initialize_provider(user_id, configuration_id) {
             Ok(handle) => {
+                // SAFETY: `provider` was null-checked above.
                 unsafe { *provider = handle };
                 S_OK
             }
@@ -46,8 +48,10 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
         let _ = syncOnDemand;
+        // SAFETY: `configurationId` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let configuration_id = unsafe { read_cstr(configurationId) };
         let user_id = crate::com::xuser::user_id_for_handle(requestingUser);
+        // SAFETY: `async_` is the caller's async block per the GDK contract; `run_sync` no-ops on null.
         unsafe {
             xasync::run_sync(async_, move || {
                 initialize_provider(user_id, configuration_id.clone())
@@ -63,6 +67,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         if provider.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `provider` was null-checked above; `async_` is the caller's async block per the GDK contract.
         match unsafe { get_result::<XGameSaveProviderHandle>(async_, null_mut(), provider) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -84,6 +89,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `remainingQuota` was null-checked above.
         unsafe { *remainingQuota = remaining_quota(&root) };
         S_OK
     }
@@ -94,6 +100,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
         let root = ProviderHandleTable::get(provider);
+        // SAFETY: `async_` is the caller's async block per the GDK contract; `run_sync` no-ops on null.
         unsafe {
             xasync::run_sync(async_, move || {
                 root.as_deref().map(remaining_quota).ok_or(E_INVALIDARG)
@@ -109,6 +116,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         if remainingQuota.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `remainingQuota` was null-checked above; `async_` is the caller's async block per the GDK contract.
         match unsafe { get_result::<i64>(async_, null_mut(), remainingQuota) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -123,6 +131,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `containerName` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let container_name = unsafe { read_cstr(containerName) };
         match delete_container(&root, container_name) {
             Ok(()) => S_OK,
@@ -137,7 +146,9 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
         let root = ProviderHandleTable::get(provider);
+        // SAFETY: `containerName` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let container_name = unsafe { read_cstr(containerName) };
+        // SAFETY: `async_` is the caller's async block per the GDK contract; `run_sync` no-ops on null.
         unsafe {
             xasync::run_sync(async_, move || {
                 let root = root.clone().ok_or(E_INVALIDARG)?;
@@ -147,6 +158,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
     }
 
     unsafe fn XGameSaveDeleteContainerResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
+        // SAFETY: `async_` is the caller's async block per the GDK contract; the `()` out param has no payload to corrupt.
         match unsafe { get_result::<()>(async_, null_mut(), &mut ()) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -166,6 +178,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let Some(callback) = callback else {
             return E_POINTER;
         };
+        // SAFETY: `containerName` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let Some(name) = (unsafe { read_cstr(containerName) }) else {
             return E_INVALIDARG;
         };
@@ -184,6 +197,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
                 lastModifiedTime: last_modified,
                 needsSync: FALSE,
             };
+            // SAFETY: `callback` was unwrapped from `Option` above, so it's non-null; `info` is a fully-initialized struct built just above.
             unsafe { callback(&info, context) };
         }
         S_OK
@@ -218,6 +232,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let Some(callback) = callback else {
             return E_POINTER;
         };
+        // SAFETY: `containerNamePrefix` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let prefix = unsafe { read_cstr(containerNamePrefix) };
         enumerate_containers(&root, prefix.as_deref(), context, callback);
         S_OK
@@ -235,6 +250,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let Some(root) = ProviderHandleTable::get(provider) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `containerName` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let Some(name) = (unsafe { read_cstr(containerName) }) else {
             return E_INVALIDARG;
         };
@@ -243,6 +259,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             return E_FAIL;
         }
         let handle = ContainerHandleTable::create(ContainerState { root: dir });
+        // SAFETY: `containerContext` was null-checked above.
         unsafe { *containerContext = handle };
         S_OK
     }
@@ -280,6 +297,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let Some(callback) = callback else {
             return E_POINTER;
         };
+        // SAFETY: `blobNamePrefix` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let prefix = unsafe { read_cstr(blobNamePrefix) };
         enumerate_blobs(&state.root, prefix.as_deref(), context, callback);
         S_OK
@@ -304,6 +322,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let Some(state) = ContainerHandleTable::get(container) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `countOfBlobs` was null-checked above.
         let requested = unsafe { *countOfBlobs } as usize;
         if blobNames.is_null() || requested == 0 {
             return E_INVALIDARG;
@@ -313,7 +332,9 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         }
 
         for index in 0..requested {
+            // SAFETY: `index < requested`, and `blobNames` was checked non-null with `blobsSize >= requested` above.
             let name_ptr = unsafe { *blobNames.add(index) };
+            // SAFETY: `name_ptr` is a GDK-caller-supplied blob name pointer, NUL-terminated or null per the `blobNames` array contract.
             let Some(name) = (unsafe { read_cstr(name_ptr) }) else {
                 return E_INVALIDARG;
             };
@@ -327,6 +348,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             let leaked = data.as_mut_ptr();
             std::mem::forget(data);
             let name_c = std::ffi::CString::new(name).unwrap_or_default();
+            // SAFETY: `index < requested <= blobsSize` and `blobData` was checked non-null above.
             unsafe {
                 *blobData.add(index) = XGameSaveBlob {
                     info: XGameSaveBlobInfo {
@@ -337,6 +359,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
                 };
             }
         }
+        // SAFETY: `countOfBlobs` was null-checked above.
         unsafe { *countOfBlobs = requested as u32 };
         S_OK
     }
@@ -352,9 +375,11 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         // `blobsSize`/`blobData` buffer, not known yet here) - this just validates eagerly and
         // stashes the request, same shape as `XStoreQueryGameLicenseAsync` stashing nothing but
         // succeeding unconditionally when there's no real async work to do.
+        // SAFETY: `blobNames` is a GDK-caller-supplied array of `countOfBlobs` C-string pointers per the API contract; `index < countOfBlobs`.
         let names: Vec<Option<String>> = (0..countOfBlobs)
             .map(|index| unsafe { read_cstr(*blobNames.add(index as usize)) })
             .collect();
+        // SAFETY: `async_` is the caller's async block per the GDK contract; `run_sync` no-ops on null.
         unsafe {
             xasync::run_sync(async_, move || {
                 if names.iter().any(Option::is_none) {
@@ -376,6 +401,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             return E_POINTER;
         }
         let mut payload: (XGameSaveContainerHandle, Vec<Option<String>>) = (0, Vec::new());
+        // SAFETY: `async_` is the caller's async block per the GDK contract; `payload` is local storage sized for the stashed tuple.
         if let Err(hr) = unsafe { get_result(async_, null_mut(), &mut payload) } {
             return hr;
         }
@@ -400,6 +426,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             let leaked = data.as_mut_ptr();
             std::mem::forget(data);
             let name_c = std::ffi::CString::new(name).unwrap_or_default();
+            // SAFETY: `index < names.len() <= blobsSize` and `blobData` was checked non-null above.
             unsafe {
                 *blobData.add(index) = XGameSaveBlob {
                     info: XGameSaveBlobInfo {
@@ -409,6 +436,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
                     data: leaked,
                 };
             }
+            // SAFETY: `countOfBlobs` was null-checked above.
             unsafe { *countOfBlobs = (index + 1) as u32 };
         }
         S_OK
@@ -426,6 +454,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let Some(state) = ContainerHandleTable::get(container) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `containerDisplayName` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let display_name = unsafe { read_cstr(containerDisplayName) }.unwrap_or_default();
         let handle = UpdateHandleTable::create(UpdateState {
             container_root: state.root.clone(),
@@ -433,6 +462,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             writes: Vec::new(),
             deletes: Vec::new(),
         });
+        // SAFETY: `updateContext` was null-checked above.
         unsafe { *updateContext = handle };
         S_OK
     }
@@ -454,6 +484,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             return E_INVALIDARG;
         };
         let mut state = state.lock().expect("update state poisoned");
+        // SAFETY: `blobName` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let Some(name) = (unsafe { read_cstr(blobName) }) else {
             return E_INVALIDARG;
         };
@@ -463,6 +494,8 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         let bytes = if byteCount == 0 {
             Vec::new()
         } else {
+            // SAFETY: `data` is non-null here (the null+nonzero case returned above) and `byteCount`
+            // bytes are valid per the GDK `XGameSaveSubmitBlobWrite` contract.
             unsafe { std::slice::from_raw_parts(data, byteCount) }.to_vec()
         };
         state.deletes.retain(|deleted| deleted != &name);
@@ -480,6 +513,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
             return E_INVALIDARG;
         };
         let mut state = state.lock().expect("update state poisoned");
+        // SAFETY: `blobName` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let Some(name) = (unsafe { read_cstr(blobName) }) else {
             return E_INVALIDARG;
         };
@@ -518,7 +552,10 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
         let this = XGameSaveObject_Impl::XGameSaveSubmitUpdate;
+        // SAFETY: `XGameSaveSubmitUpdate` is this crate's own method; `self`/`updateContext` are the
+        // same valid arguments already passed to this fn.
         let result = unsafe { this(self, updateContext) };
+        // SAFETY: `async_` is the caller's async block per the GDK contract; `run_sync` no-ops on null.
         unsafe {
             xasync::run_sync(
                 async_,
@@ -528,6 +565,7 @@ impl IXGameSaveImpl_Impl for XGameSaveObject_Impl {
     }
 
     unsafe fn XGameSaveSubmitUpdateResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
+        // SAFETY: `async_` is the caller's async block per the GDK contract; the `()` out param has no payload to corrupt.
         match unsafe { get_result::<()>(async_, null_mut(), &mut ()) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -574,8 +612,10 @@ impl IXGameSaveImpl2_Impl for XGameSaveObject_Impl {
         configurationId: *const c_char,
         async_: *mut XAsyncBlock,
     ) -> HRESULT {
+        // SAFETY: `configurationId` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let configuration_id = unsafe { read_cstr(configurationId) };
         let user_id = crate::com::xuser::user_id_for_handle(requestingUser);
+        // SAFETY: `async_` is the caller's async block per the GDK contract; `run_sync` no-ops on null.
         unsafe {
             xasync::run_sync(async_, move || {
                 let configuration_id = configuration_id.clone().ok_or(E_INVALIDARG)?;
@@ -600,6 +640,7 @@ impl IXGameSaveImpl2_Impl for XGameSaveObject_Impl {
             len: 0,
             bytes: [0u8; PATH_PAYLOAD_CAPACITY],
         };
+        // SAFETY: `async_` is the caller's async block per the GDK contract; `payload` is local storage sized for `PathPayload`.
         if let Err(hr) = unsafe { get_result(async_, null_mut(), &mut payload) } {
             return hr;
         }
@@ -627,6 +668,7 @@ impl IXGameSaveImpl2_Impl for XGameSaveObject_Impl {
         if remainingQuota.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `configurationId` is a GDK-caller-supplied, NUL-terminated C string pointer (or null).
         let Some(configuration_id) = (unsafe { read_cstr(configurationId) }) else {
             return E_INVALIDARG;
         };
@@ -634,6 +676,7 @@ impl IXGameSaveImpl2_Impl for XGameSaveObject_Impl {
             return E_INVALIDARG;
         };
         let root = provider_root(user_id, &configuration_id);
+        // SAFETY: `remainingQuota` was null-checked above.
         unsafe { *remainingQuota = remaining_quota(&root) };
         S_OK
     }

@@ -62,6 +62,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
     ) -> HRESULT {
         let block = async_block as *mut XAsyncBlock;
         if !identity_name.is_null() {
+            // SAFETY: GDK-caller-supplied `identityName` is contractually a NUL-terminated
+            // C string, checked non-null just above.
             let name = unsafe { std::ffi::CStr::from_ptr(identity_name) }.to_string_lossy();
             let name = async_core::intern(&name);
             name_block(block, name);
@@ -73,12 +75,16 @@ impl IXAsync_Impl for XAsyncObject_Impl {
                 );
             }
         }
+        // SAFETY: `block` is the caller-supplied `asyncBlock` cast to `*mut XAsyncBlock`,
+        // and is checked non-null via the `Some` match here before any dereference.
         let Some(block_ref) = (unsafe { block.as_mut() }) else {
             return E_POINTER;
         };
         if provider.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `state_of` requires `block` be null or a valid `XAsyncBlock`; it was just
+        // dereferenced above via `block.as_mut()`, so it is valid.
         if unsafe { state_of(block) }.is_some() {
             diag!(
                 "XAsyncBegin REJECT block={block:p} queue={:#x} reason=block-in-use",
@@ -172,6 +178,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
     }
 
     unsafe fn XAsyncSchedule(&self, async_block: *mut c_void, delay_in_ms: u32) -> HRESULT {
+        // SAFETY: `state_of` requires `async_block` be null or a valid `XAsyncBlock`; GDK
+        // guarantees the caller passes back the block it obtained from `XAsyncBegin`.
         let Some(state) = (unsafe { state_of(async_block as *mut XAsyncBlock) }) else {
             return E_ILLEGAL_METHOD_CALL;
         };
@@ -197,6 +205,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
                 Arc::as_ptr(&state.queue),
                 Arc::as_ptr(state.queue.port(PortKind::Work))
             );
+            // SAFETY: `context` is the `Arc::into_raw` pointer just above; the failed
+            // `submit` means the queue never took ownership, so this is its only reclaim.
             drop(unsafe { Arc::from_raw(context as *const AsyncState) });
             complete_state(&state, E_ABORT, 0);
             E_ABORT
@@ -209,6 +219,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         result: i32,
         required_buffer_size: u64,
     ) {
+        // SAFETY: `state_of` requires `async_block` be null or a valid `XAsyncBlock`, which
+        // GDK guarantees for a block obtained from `XAsyncBegin`.
         let Some(state) = (unsafe { state_of(async_block as *mut XAsyncBlock) }) else {
             return;
         };
@@ -216,6 +228,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
     }
 
     unsafe fn XAsyncGetStatus(&self, async_block: *mut c_void, wait: BOOL) -> HRESULT {
+        // SAFETY: `state_of` requires `async_block` be null or a valid `XAsyncBlock`, which
+        // GDK guarantees for a block obtained from `XAsyncBegin`.
         let Some(state) = (unsafe { state_of(async_block as *mut XAsyncBlock) }) else {
             return E_ILLEGAL_METHOD_CALL;
         };
@@ -262,9 +276,13 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         async_block: *mut c_void,
         buffer_size: *mut usize,
     ) -> HRESULT {
+        // SAFETY: `buffer_size` is the caller-supplied out-pointer for `XAsyncGetResultSize`,
+        // checked non-null via the `Some` match here before any dereference.
         let Some(size_out) = (unsafe { buffer_size.as_mut() }) else {
             return E_POINTER;
         };
+        // SAFETY: `state_of` requires `async_block` be null or a valid `XAsyncBlock`, which
+        // GDK guarantees for a block obtained from `XAsyncBegin`.
         let Some(state) = (unsafe { state_of(async_block as *mut XAsyncBlock) }) else {
             return E_ILLEGAL_METHOD_CALL;
         };
@@ -289,6 +307,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         buffer: *mut c_void,
         buffer_used: *mut usize,
     ) -> HRESULT {
+        // SAFETY: `state_of` requires `async_block` be null or a valid `XAsyncBlock`, which
+        // GDK guarantees for a block obtained from `XAsyncBegin`.
         let Some(state) = (unsafe { state_of(async_block as *mut XAsyncBlock) }) else {
             return E_ILLEGAL_METHOD_CALL;
         };
@@ -332,6 +352,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         }
 
         let hr = state.invoke(XAsyncOp::GetResult, buffer, buffer_size as usize);
+        // SAFETY: `buffer_used` is the caller-supplied out-pointer for `XAsyncGetResult`,
+        // and `as_mut` handles a null one by yielding `None`.
         if let Some(used) = unsafe { buffer_used.as_mut() } {
             *used = result_size;
         }
@@ -348,6 +370,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
             async_block,
             std::thread::current().id()
         );
+        // SAFETY: `state_of` requires `async_block` be null or a valid `XAsyncBlock`, which
+        // GDK guarantees for a block obtained from `XAsyncBegin`.
         let Some(state) = (unsafe { state_of(async_block as *mut XAsyncBlock) }) else {
             return;
         };
@@ -372,6 +396,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
                 .queue
                 .submit(PortKind::Work, context, work_callback, Duration::ZERO)
             {
+                // SAFETY: `context` is the `Arc::into_raw` pointer just above; the failed
+                // `submit` means the queue never took ownership, so this is its only reclaim.
                 drop(unsafe { Arc::from_raw(context as *const AsyncState) });
                 complete_state(&state, E_ABORT, 0);
             }
@@ -382,6 +408,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         if work.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `XAsyncRun`'s own contract forwards to `XAsyncBegin` with `run_provider`,
+        // whose signature matches the required `XAsyncProvider` type.
         unsafe {
             self.XAsyncBegin(
                 async_block,
@@ -399,6 +427,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         completion_dispatch_mode: u64,
         queue: *mut u64,
     ) -> HRESULT {
+        // SAFETY: `queue` is the caller-supplied out-pointer for `XTaskQueueCreate`, checked
+        // non-null via the `Some` match here before any dereference.
         let Some(out) = (unsafe { queue.as_mut() }) else {
             return E_POINTER;
         };
@@ -425,6 +455,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         completion_port: u64,
         queue: *mut u64,
     ) -> HRESULT {
+        // SAFETY: `queue` is the caller-supplied out-pointer for `XTaskQueueCreateComposite`,
+        // checked non-null via the `Some` match here before any dereference.
         let Some(out) = (unsafe { queue.as_mut() }) else {
             return E_POINTER;
         };
@@ -445,6 +477,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
 
     unsafe fn XTaskQueueGetPort(&self, queue: u64, port: u64, port_handle: *mut u64) -> HRESULT {
         let queue_orig_for_log = queue;
+        // SAFETY: `port_handle` is the caller-supplied out-pointer for `XTaskQueueGetPort`,
+        // checked non-null via the `Some` match here before any dereference.
         let Some(out) = (unsafe { port_handle.as_mut() }) else {
             return E_POINTER;
         };
@@ -466,6 +500,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         queue_handle: u64,
         duplicated_handle: *mut u64,
     ) -> HRESULT {
+        // SAFETY: `duplicated_handle` is the caller-supplied out-pointer for
+        // `XTaskQueueDuplicateHandle`, checked non-null via the `Some` match before use.
         let Some(out) = (unsafe { duplicated_handle.as_mut() }) else {
             return E_POINTER;
         };
@@ -508,6 +544,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         callback_context: *mut c_void,
         callback: *mut c_void,
     ) -> HRESULT {
+        // SAFETY: forwards this call's own arguments unchanged to
+        // `XTaskQueueSubmitDelayedCallback` with `delay_ms: 0`; that fn re-validates them.
         unsafe { self.XTaskQueueSubmitDelayedCallback(queue, port, 0, callback_context, callback) }
     }
 
@@ -556,6 +594,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         callback: *mut c_void,
         token: *mut u64,
     ) -> HRESULT {
+        // SAFETY: `token` is the caller-supplied out-pointer for `XTaskQueueRegisterWaiter`,
+        // checked non-null via the `Some` match here before any dereference.
         let Some(out) = (unsafe { token.as_mut() }) else {
             return E_POINTER;
         };
@@ -573,6 +613,9 @@ impl IXAsync_Impl for XAsyncObject_Impl {
     }
 
     unsafe fn XTaskQueueUnregisterWaiter(&self, _queue: u64, token: u64) {
+        // SAFETY: `waiter::unregister`'s own contract requires `token` come from `register`
+        // and not have been unregistered already; GDK's `XTaskQueueUnregisterWaiter`
+        // contract requires the same of its caller.
         unsafe { waiter::unregister(token) };
     }
 
@@ -599,6 +642,9 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         if wait != 0 {
             queue.terminate(true);
             if let Some(terminated) = terminated {
+                // SAFETY: `terminated` was caller-registered via `XTaskQueueTerminate`'s
+                // `callback` argument, cast above to `TerminatedCallback`; `callback_context`
+                // is the matching caller-supplied context.
                 unsafe { terminated(callback_context) };
             }
             return S_OK;
@@ -608,12 +654,17 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         // has to fire after everything has actually drained - so the waiting moves to a
         // thread of our own.
         struct Context(*mut c_void);
+        // SAFETY: `callback_context` is an opaque pointer the caller owns and is responsible
+        // for keeping valid until the termination callback fires; the GDK contract allows
+        // touching it from another thread.
         unsafe impl Send for Context {}
         let context = Context(callback_context);
         std::thread::spawn(move || {
             let context = context;
             queue.terminate(true);
             if let Some(terminated) = terminated {
+                // SAFETY: `terminated` was caller-registered via `XTaskQueueTerminate`'s
+                // `callback` argument; `context.0` is the matching caller-supplied context.
                 unsafe { terminated(context.0) };
             }
         });
@@ -627,6 +678,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         callback: *mut c_void,
         token: *mut u64,
     ) -> HRESULT {
+        // SAFETY: `token` is the caller-supplied out-pointer for `XTaskQueueRegisterMonitor`,
+        // checked non-null via the `Some` match here before any dereference.
         let Some(out) = (unsafe { token.as_mut() }) else {
             return E_POINTER;
         };
@@ -650,6 +703,8 @@ impl IXAsync_Impl for XAsyncObject_Impl {
     }
 
     unsafe fn XTaskQueueGetCurrentProcessTaskQueue(&self, queue: *mut u64) -> BOOL {
+        // SAFETY: `queue` is the caller-supplied out-pointer for
+        // `XTaskQueueGetCurrentProcessTaskQueue`, checked non-null via the `Some` match here.
         let Some(out) = (unsafe { queue.as_mut() }) else {
             return 0;
         };
@@ -720,6 +775,8 @@ thread_local! {
 
 /// The provider behind `XAsyncRun`: run the caller's function once, on the work port.
 unsafe extern "system" fn run_provider(op: XAsyncOp, data: *const XAsyncProviderData) -> HRESULT {
+    // SAFETY: XAsync always passes a non-null `data` to provider callbacks; checked here
+    // defensively before dereferencing.
     let Some(data) = (unsafe { data.as_ref() }) else {
         return E_POINTER;
     };
@@ -728,6 +785,8 @@ unsafe extern "system" fn run_provider(op: XAsyncOp, data: *const XAsyncProvider
     let work: XAsyncWork = unsafe { crate::ffi_util::fn_ptr_cast(data.context) };
     match op {
         XAsyncOp::Begin => {
+            // SAFETY: `state_of` requires `data.async_` be null or a valid `XAsyncBlock`;
+            // XAsync always supplies the block this provider is driving.
             let Some(state) = (unsafe { state_of(data.async_) }) else {
                 return E_ILLEGAL_METHOD_CALL;
             };
@@ -738,10 +797,14 @@ unsafe extern "system" fn run_provider(op: XAsyncOp, data: *const XAsyncProvider
             {
                 S_OK
             } else {
+                // SAFETY: `context` is the `Arc::into_raw` pointer just above; the failed
+                // `submit` means the queue never took ownership, so this is its only reclaim.
                 drop(unsafe { Arc::from_raw(context as *const AsyncState) });
                 E_ABORT
             }
         }
+        // SAFETY: `work` was set to an `XAsyncWork` by `XAsyncRun`'s caller (cast above from
+        // `data.context`); `data.async_` is the block XAsync supplied to this callback.
         XAsyncOp::DoWork => unsafe { work(data.async_) },
         XAsyncOp::GetResult | XAsyncOp::Cancel | XAsyncOp::Cleanup => S_OK,
     }
@@ -760,6 +823,8 @@ mod waiter {
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
+    // SAFETY: `cancel` is a HANDLE owned solely by this `Waiter` and only ever signalled or
+    // closed from `unregister`, and `thread`'s `JoinHandle` is already `Send`.
     unsafe impl Send for Waiter {}
 
     /// Returns the token the caller passes back to [`unregister`].
@@ -771,6 +836,8 @@ mod waiter {
         callback: TaskCallback,
     ) -> u64 {
         // Manual reset: once cancelled, stay cancelled.
+        // SAFETY: all arguments are valid: `None` security attributes, plain bools for
+        // manual-reset/initial-state, and a null name.
         let cancel = unsafe { CreateEventW(None, true, false, PCWSTR::null()) };
 
         struct Handles {
@@ -778,6 +845,9 @@ mod waiter {
             cancel: HANDLE,
             context: *mut c_void,
         }
+        // SAFETY: `wait` is the caller's handle and `context` an opaque caller-owned
+        // pointer - the GDK `XTaskQueueRegisterWaiter` contract requires both stay valid for
+        // this waiter's lifetime, which is safe to touch from the spawned wait thread.
         unsafe impl Send for Handles {}
         let handles = Handles {
             wait: HANDLE(wait_handle),
@@ -794,6 +864,9 @@ mod waiter {
             loop {
                 // WAIT_OBJECT_0 is 0, so index 0 means the caller's handle signalled
                 // and index 1 means we were unregistered.
+                // SAFETY: `objects` holds two live handles (`handles.wait` owned by the
+                // caller, `handles.cancel` owned by this waiter), `false` (wait-any) and
+                // `u32::MAX` (infinite) are plain values.
                 let signalled = unsafe { WaitForMultipleObjects(&objects, false, u32::MAX) };
                 if signalled != 0 {
                     break;
@@ -821,15 +894,22 @@ mod waiter {
         // it is unregistered at most once.
         let mut waiter =
             unsafe { crate::com::xasync::ctx_box_from_raw::<Waiter>(token as *mut c_void) };
+        // SAFETY: `waiter.cancel` is a live handle owned by this waiter, just reclaimed above.
         let _ = unsafe { SetEvent(waiter.cancel) };
         if let Some(thread) = waiter.thread.take() {
             let _ = thread.join();
         }
+        // SAFETY: `waiter.cancel` is still live here; the wait thread has already exited
+        // (joined above) so nothing else can be using it.
         let _ = unsafe { CloseHandle(waiter.cancel) };
     }
 }
 
 #[cfg(test)]
+// Test code exercises this crate's own already-documented internal APIs against
+// synthetic, controlled inputs, not untrusted FFI callers - a per-site SAFETY comment
+// here would just restate the production contract already documented at each fn.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use super::*;
     use crate::com::xasync::{XAsyncBlock, get_result, get_result_size, get_status, run_sync};

@@ -287,6 +287,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         let Some(user) = UserHandleTable::get(handle) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `duplicated_handle` non-null was checked above.
         unsafe { *duplicated_handle = UserHandleTable::create(user) };
         S_OK
     }
@@ -311,6 +312,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         }
         // One local, non-guest user at a time - matches the "single local user" scope
         // this milestone targets.
+        // SAFETY: `max_users` non-null was checked above.
         unsafe { *max_users = 1 };
         S_OK
     }
@@ -321,7 +323,10 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         diag!(
             "XUserAddAsync called options={options:#x} async_block={:p} callback_set={} queue={:?}",
             async_,
+            // SAFETY: the GDK's XUserAddAsync contract guarantees `async_` is a valid
+            // `XAsyncBlock*` or null; `as_ref` handles the null case.
             (unsafe { async_.as_ref() }).is_some_and(|b| b.callback.is_some()),
+            // SAFETY: same as above - `async_` is a valid `XAsyncBlock*` or null.
             (unsafe { async_.as_ref() }).map(|b| b.queue)
         );
         if options & 0b101 == 0 {
@@ -330,6 +335,8 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         }
         let allow_ui = options & 0x04 != 0;
 
+        // SAFETY: the GDK's XUserAddAsync contract guarantees `async_` is a valid,
+        // caller-owned `XAsyncBlock*` for the duration of this call.
         let hr = unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<u64, HRESULT> {
                 match crate::ipc::get_user_info() {
@@ -369,6 +376,8 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             diag!("XUserAddResult: new_user is null -> E_POINTER");
             return E_POINTER;
         }
+        // SAFETY: `async_` is the GDK-contracted `XAsyncBlock*` from the matching
+        // `XUserAddAsync` call, and `new_user` non-null was checked above.
         let hr = match unsafe { xasync::get_result(async_, std::ptr::null(), new_user) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -384,6 +393,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `user_local_id` non-null was checked above.
         unsafe { *user_local_id = user.local_id };
         S_OK
     }
@@ -402,9 +412,11 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             .filter_map(Weak::upgrade)
             .find(|user| user.local_id == user_local_id)
         else {
+            // SAFETY: `handle` non-null was checked above.
             unsafe { *handle = 0 };
             return E_INVALIDARG;
         };
+        // SAFETY: `handle` non-null was checked above.
         unsafe { *handle = UserHandleTable::create(user) };
         S_OK
     }
@@ -416,6 +428,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `user_id` non-null was checked above.
         unsafe { *user_id = user.user_id };
         S_OK
     }
@@ -430,9 +443,11 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             .filter_map(Weak::upgrade)
             .find(|user| user.user_id == user_id)
         else {
+            // SAFETY: `handle` non-null was checked above.
             unsafe { *handle = 0 };
             return E_INVALIDARG;
         };
+        // SAFETY: `handle` non-null was checked above.
         unsafe { *handle = UserHandleTable::create(user) };
         S_OK
     }
@@ -444,6 +459,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `is_guest` non-null was checked above.
         unsafe { *is_guest = if user.is_guest { TRUE } else { FALSE } };
         S_OK
     }
@@ -456,6 +472,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             return E_INVALIDARG;
         };
         let value = *user.state.lock().expect("user state poisoned");
+        // SAFETY: `state` non-null was checked above.
         unsafe { *state = value as u32 };
         S_OK
     }
@@ -481,6 +498,8 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         let _ = picture_size;
 
         let key = async_ as usize;
+        // SAFETY: the GDK's XUserGetGamerPictureAsync contract guarantees `async_` is a
+        // valid, caller-owned `XAsyncBlock*` for the duration of this call.
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result =
@@ -513,6 +532,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             .expect("gamer picture results poisoned");
         match results.as_ref().and_then(|results| results.get(&key)) {
             Some(Ok(picture)) => {
+                // SAFETY: `buffer_size` non-null was checked above.
                 unsafe { *buffer_size = picture.len() };
                 S_OK
             }
@@ -540,10 +560,11 @@ impl IXUserImpl_Impl for XUserObject_Impl {
                 if buffer.is_null() && !picture.is_empty() {
                     return E_POINTER;
                 }
+                // SAFETY: `buffer_size >= picture.len()` and non-null (for the non-empty
+                // case) were checked above; `buffer_used` is only dereferenced after its
+                // own null check.
                 unsafe {
                     if !picture.is_empty() {
-                        // SAFETY: `buffer_size >= picture.len()` was checked above, and
-                        // non-null was checked for the non-empty case.
                         crate::ffi_util::write_out_bytes(picture, buffer.cast::<u8>());
                     }
                     if !buffer_used.is_null() {
@@ -567,6 +588,8 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         let url = if url.is_null() {
             "<null>".to_string()
         } else {
+            // SAFETY: `url` is non-null here, and the GDK's XUserResolveIssueWithUiAsync
+            // contract guarantees it's a valid, NUL-terminated C string.
             unsafe { std::ffi::CStr::from_ptr(url) }
                 .to_string_lossy()
                 .into_owned()
@@ -591,7 +614,13 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         let url = if url.is_null() {
             "<null>".to_string()
         } else {
+            // SAFETY: `url` is non-null here, and the GDK's
+            // XUserResolveIssueWithUiUtf16Async contract guarantees it's a valid,
+            // nul-terminated UTF-16 string, so scanning forward for a 0 code unit stays
+            // in bounds.
             let len = (0..).take_while(|&i| unsafe { *url.add(i) } != 0).count();
+            // SAFETY: `len` code units starting at `url` were just scanned above without
+            // hitting an out-of-bounds access, so the slice is in bounds.
             String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(url, len) })
         };
         stub!("XUserResolveIssueWithUiUtf16Async(url={url:?}) -> E_NOTIMPL");
@@ -611,6 +640,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
+        // SAFETY: `age_group` non-null was checked above.
         unsafe { *age_group = user.age_group };
         S_OK
     }
@@ -633,20 +663,30 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if method.is_null() || url.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `method` is non-null (checked above), and the GDK's
+        // XUserGetTokenAndSignatureAsync contract guarantees it's a valid, NUL-terminated
+        // C string.
         let method = unsafe { std::ffi::CStr::from_ptr(method) }
             .to_string_lossy()
             .into_owned();
+        // SAFETY: `url` is non-null (checked above), and the GDK's
+        // XUserGetTokenAndSignatureAsync contract guarantees it's a valid, NUL-terminated
+        // C string.
         let url = unsafe { std::ffi::CStr::from_ptr(url) }
             .to_string_lossy()
             .into_owned();
         let body = if body_size == 0 || body_buffer.is_null() {
             Vec::new()
         } else {
+            // SAFETY: `body_buffer` is non-null here, and the GDK contract guarantees it
+            // points to at least `body_size` readable bytes.
             unsafe { std::slice::from_raw_parts(body_buffer.cast::<u8>(), body_size) }.to_vec()
         };
 
         diag!("XUserGetTokenAndSignatureAsync(method={method:?}, url={url:?})");
         let key = async_ as usize;
+        // SAFETY: the GDK's XUserGetTokenAndSignatureAsync contract guarantees `async_`
+        // is a valid, caller-owned `XAsyncBlock*` for the duration of this call.
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result = crate::ipc::get_token_and_signature(&method, &url, &body);
@@ -682,6 +722,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             .expect("token and signature results poisoned");
         match results.as_ref().and_then(|results| results.get(&key)) {
             Some(Ok((token, signature))) => {
+                // SAFETY: `buffer_size` non-null was checked above.
                 unsafe {
                     *buffer_size = size_of::<XUserGetTokenAndSignatureData>()
                         + token.len()
@@ -769,15 +810,25 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         if method.is_null() || url.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `method` is non-null (checked above), and the GDK's
+        // XUserGetTokenAndSignatureUtf16Async contract guarantees it's a valid,
+        // nul-terminated UTF-16 string.
         let method = unsafe { read_utf16_cstr(method) };
+        // SAFETY: `url` is non-null (checked above), and the GDK's
+        // XUserGetTokenAndSignatureUtf16Async contract guarantees it's a valid,
+        // nul-terminated UTF-16 string.
         let url = unsafe { read_utf16_cstr(url) };
         let body = if body_size == 0 || body_buffer.is_null() {
             Vec::new()
         } else {
+            // SAFETY: `body_buffer` is non-null here, and the GDK contract guarantees it
+            // points to at least `body_size` readable bytes.
             unsafe { std::slice::from_raw_parts(body_buffer.cast::<u8>(), body_size) }.to_vec()
         };
 
         let key = async_ as usize;
+        // SAFETY: the GDK's XUserGetTokenAndSignatureUtf16Async contract guarantees
+        // `async_` is a valid, caller-owned `XAsyncBlock*` for the duration of this call.
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result = crate::ipc::get_token_and_signature(&method, &url, &body);
@@ -811,6 +862,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             Some(Ok((token, signature))) => {
                 let token_count = token.encode_utf16().count() + 1;
                 let signature_count = signature.encode_utf16().count() + 1;
+                // SAFETY: `buffer_size` non-null was checked above.
                 unsafe {
                     *buffer_size = size_of::<XUserGetTokenAndSignatureUtf16Data>()
                         + (token_count + signature_count) * size_of::<u16>();
@@ -904,8 +956,10 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         }
         // Grant the common privileges initially. Real per-privilege answers need XSTS
         // display claims, which need the IPC client.
+        // SAFETY: `has_privilege` non-null was checked above.
         unsafe { *has_privilege = TRUE };
         if !reason.is_null() {
+            // SAFETY: `reason` non-null was just checked above.
             unsafe { *reason = 0 }; // XUserPrivilegeDenyReason_None
         }
         S_OK
@@ -922,11 +976,15 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             "XUserResolvePrivilegeWithUiAsync(user={user}, options={options:#x}, privilege={privilege:#x})"
         );
         // Every privilege is already granted, so there is nothing to resolve.
+        // SAFETY: the GDK's XUserResolvePrivilegeWithUiAsync contract guarantees `async_`
+        // is a valid, caller-owned `XAsyncBlock*` for the duration of this call.
         unsafe { xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> { Ok(()) }) }
     }
 
     unsafe fn XUserResolvePrivilegeWithUiResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
         diag!("XUserResolvePrivilegeWithUiResult");
+        // SAFETY: `async_` is the GDK-contracted `XAsyncBlock*` from the matching
+        // `XUserResolvePrivilegeWithUiAsync` call; the local `()` out-param is always valid.
         match unsafe { xasync::get_result::<()>(async_, std::ptr::null(), &mut () as *mut ()) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -947,6 +1005,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             return E_POINTER;
         }
         let raw = register_change_event(context, callback);
+        // SAFETY: `token` non-null was checked above.
         unsafe { *token = XTaskQueueRegistrationToken { token: raw } };
         S_OK
     }
@@ -972,6 +1031,7 @@ impl IXUserImpl_Impl for XUserObject_Impl {
         // asking for a deferral just gets a handle it can close once it's done, same as if
         // it had actually held one up. A distinct nonzero handle, not zero, so a caller that
         // checks the handle for validity before closing it isn't misled.
+        // SAFETY: `deferral` non-null was checked above.
         unsafe { *deferral = 1 };
         S_OK
     }
@@ -989,6 +1049,8 @@ impl IXUserImpl2_Impl for XUserObject_Impl {
         // rather than fabricating an account-preselection feature that doesn't exist here.
         let _ = user_id;
 
+        // SAFETY: the GDK's XUserAddByIdWithUiAsync contract guarantees `async_` is a
+        // valid, caller-owned `XAsyncBlock*` for the duration of this call.
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<u64, HRESULT> {
                 match crate::ipc::interactive_sign_in()? {
@@ -1010,6 +1072,8 @@ impl IXUserImpl2_Impl for XUserObject_Impl {
         if new_user.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `async_` is the GDK-contracted `XAsyncBlock*` from the matching
+        // `XUserAddByIdWithUiAsync` call, and `new_user` non-null was checked above.
         match unsafe { xasync::get_result(async_, std::ptr::null(), new_user) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -1042,12 +1106,17 @@ impl IXUserImpl3_Impl for XUserObject_Impl {
             None
         } else {
             Some(
+                // SAFETY: `scope` is non-null here, and the GDK's
+                // XUserGetMsaTokenSilentlyAsync contract guarantees it's a valid,
+                // NUL-terminated C string.
                 unsafe { std::ffi::CStr::from_ptr(scope) }
                     .to_string_lossy()
                     .into_owned(),
             )
         };
         let key = async_ as usize;
+        // SAFETY: the GDK's XUserGetMsaTokenSilentlyAsync contract guarantees `async_` is
+        // a valid, caller-owned `XAsyncBlock*` for the duration of this call.
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 let result = crate::ipc::get_msa_token_silently(scope.as_deref());
@@ -1079,6 +1148,7 @@ impl IXUserImpl3_Impl for XUserObject_Impl {
             .expect("msa token results poisoned");
         match results.as_ref().and_then(|results| results.get(&key)) {
             Some(Ok((token, _))) => {
+                // SAFETY: `token_size` non-null was checked above.
                 unsafe { *token_size = token.len() + 1 };
                 S_OK
             }
@@ -1114,6 +1184,7 @@ impl IXUserImpl3_Impl for XUserObject_Impl {
                     *result_token.cast::<u8>().add(bytes.len()) = 0;
                 }
                 if !result_token_used.is_null() {
+                    // SAFETY: `result_token_used` non-null was just checked above.
                     unsafe { *result_token_used = needed };
                 }
                 S_OK
@@ -1151,6 +1222,9 @@ impl IXUserImpl5_Impl for XUserObject_Impl {
         let mut registry = REMOTE_CONNECT_HANDLERS
             .lock()
             .expect("remote connect handlers poisoned");
+        // SAFETY: `handlers` non-null was checked above, and the GDK's
+        // XUserPlatformRemoteConnectSetEventHandlers contract guarantees it points to a
+        // valid, fully-initialized `XUserPlatformRemoteConnectEventHandlers`.
         *registry = Some(unsafe {
             RemoteConnectHandlers {
                 show: (*handlers).show,
@@ -1168,6 +1242,9 @@ impl IXUserImpl5_Impl for XUserObject_Impl {
             .as_ref()
             && let Some(close) = handlers.close
         {
+            // SAFETY: `close` is a GDK-supplied callback stored verbatim from a prior
+            // `XUserPlatformRemoteConnectSetEventHandlers` call, valid for the caller's
+            // process lifetime per that contract, and takes no arguments to get wrong.
             unsafe { close() };
         }
         S_OK
@@ -1188,6 +1265,8 @@ impl IXUserImpl6_Impl for XUserObject_Impl {
         let Some(user) = UserHandleTable::get(user) else {
             return E_INVALIDARG;
         };
+        // SAFETY: the GDK's XUserSignOutAsync contract guarantees `async_` is a valid,
+        // caller-owned `XAsyncBlock*` for the duration of this call.
         unsafe {
             xasync::run_sync(async_.cast(), move || -> Result<(), HRESULT> {
                 *user.state.lock().expect("user state poisoned") = XUserStateValue::SigningOut;
@@ -1200,6 +1279,8 @@ impl IXUserImpl6_Impl for XUserObject_Impl {
     }
 
     unsafe fn XUserSignOutResult(&self, async_: *mut XAsyncBlock) -> HRESULT {
+        // SAFETY: `async_` is the GDK-contracted `XAsyncBlock*` from the matching
+        // `XUserSignOutAsync` call; the local `()` out-param is always valid.
         match unsafe { xasync::get_result::<()>(async_, std::ptr::null(), &mut () as *mut ()) } {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -1233,6 +1314,7 @@ impl IXUserGamertagImpl_Impl for XUserObject_Impl {
         let bytes = value.as_bytes();
         let needed = bytes.len() + 1;
         if !gamertag_used.is_null() {
+            // SAFETY: `gamertag_used` non-null was just checked above.
             unsafe { *gamertag_used = needed };
         }
         if gamertag.is_null() || gamertag_size == 0 {
@@ -1257,7 +1339,12 @@ struct RemoteConnectHandlers {
     context: *mut c_void,
 }
 
+// SAFETY: `context` is an opaque token handed back verbatim to the GDK-supplied `show`/
+// `close` callbacks; this crate never dereferences it, so sending it across threads is
+// sound.
 unsafe impl Send for RemoteConnectHandlers {}
+// SAFETY: same reasoning as the `Send` impl above - `context` is only ever passed through,
+// never dereferenced, so shared access across threads is sound.
 unsafe impl Sync for RemoteConnectHandlers {}
 
 static REMOTE_CONNECT_HANDLERS: Mutex<Option<RemoteConnectHandlers>> = Mutex::new(None);
@@ -1342,9 +1429,11 @@ impl IXUserDeviceImpl_Impl for XUserDeviceObject_Impl {
         let Some(user) = registry.iter().filter_map(Weak::upgrade).find(|user| {
             *user.state.lock().expect("user state poisoned") == XUserStateValue::SignedIn
         }) else {
+            // SAFETY: `handle` non-null was checked above.
             unsafe { *handle = 0 };
             return E_INVALIDARG;
         };
+        // SAFETY: `handle` non-null was checked above.
         unsafe { *handle = UserHandleTable::create(user) };
         S_OK
     }
@@ -1359,6 +1448,7 @@ impl IXUserDeviceImpl_Impl for XUserDeviceObject_Impl {
         if callback.is_none() || token.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `token` non-null was checked above.
         unsafe {
             *token = XTaskQueueRegistrationToken {
                 token: NEXT_CHANGE_EVENT_TOKEN.fetch_add(1, Ordering::Relaxed),

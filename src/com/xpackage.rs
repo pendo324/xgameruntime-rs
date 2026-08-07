@@ -235,6 +235,7 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
         if pathSize.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `pathSize` was checked non-null above.
         unsafe {
             *pathSize = path.len() + 1;
         }
@@ -256,11 +257,14 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
         let bytes = mount_path.as_bytes();
         let len = bytes.len().min(pathSize.saturating_sub(1));
         for (index, byte) in bytes.iter().copied().take(len).enumerate() {
+            // SAFETY: `path` was checked non-null above, and `index < len <= pathSize - 1`.
             unsafe {
                 *path.add(index) = byte as c_char;
             }
         }
         if pathSize != 0 {
+            // SAFETY: `pathSize != 0` was checked above, and `len <= pathSize - 1`, so
+            // `path.add(len)` is in bounds.
             unsafe {
                 *path.add(len) = 0;
             }

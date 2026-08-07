@@ -85,9 +85,10 @@ struct Transport {
     socket_path: CString,
 }
 
-// The three fields are a code pointer, an integer, and an immutable string: shared use from
-// any thread is what the Wine dispatcher already assumes.
+// SAFETY: the three fields are a code pointer, an integer, and an immutable string: shared
+// use from any thread is what the Wine dispatcher already assumes.
 unsafe impl Send for Transport {}
+// SAFETY: same reasoning as the `Send` impl above - nothing here is mutated after `resolve`.
 unsafe impl Sync for Transport {}
 
 fn transport() -> Option<&'static Transport> {
@@ -143,11 +144,15 @@ fn resolve() -> Option<Transport> {
 fn wine_unix_call() -> Option<WineUnixCall> {
     use windows_sys::libloaderapi::{GetModuleHandleA, GetProcAddress};
 
+    // SAFETY: `c"ntdll.dll"` is a valid, NUL-terminated static string; ntdll is always
+    // already loaded in a Wine process.
     let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8) };
     if ntdll.is_null() {
         return None;
     }
 
+    // SAFETY: `ntdll` is the non-null handle just returned by `GetModuleHandleA` above, and
+    // `c"__wine_unix_call"` is a valid, NUL-terminated static string.
     if let Some(proc) = unsafe { GetProcAddress(ntdll, c"__wine_unix_call".as_ptr() as *const u8) }
     {
         diag!("unixlib: using ntdll!__wine_unix_call");
@@ -156,6 +161,8 @@ fn wine_unix_call() -> Option<WineUnixCall> {
         return Some(unsafe { crate::ffi_util::fn_ptr_cast::<_, WineUnixCall>(proc) });
     }
 
+    // SAFETY: `ntdll` is the non-null handle from `GetModuleHandleA` above, and
+    // `c"__wine_unix_call_dispatcher"` is a valid, NUL-terminated static string.
     let slot =
         unsafe { GetProcAddress(ntdll, c"__wine_unix_call_dispatcher".as_ptr() as *const u8) };
     let slot = slot.or_else(|| {
@@ -164,6 +171,8 @@ fn wine_unix_call() -> Option<WineUnixCall> {
     })?;
     // A data export: the symbol's address is where the function pointer lives, not the
     // function. Wine fills this in during ntdll init, so a null here means we ran too early.
+    // SAFETY: `slot` is the non-null address of the `__wine_unix_call_dispatcher` data export
+    // just resolved above, which Wine defines as a pointer-sized function pointer.
     let dispatcher = unsafe { *(slot as *const *const c_void) };
     if dispatcher.is_null() {
         diag!("unixlib: __wine_unix_call_dispatcher is null - falling back to TCP");
@@ -207,6 +216,8 @@ fn handle_from_builtin_query() -> Option<u64> {
     ) -> i32;
 
     let mut module = std::ptr::null_mut();
+    // SAFETY: `handle_from_builtin_query` is a live function pointer in this module, and
+    // `module` is a valid local to receive the out-handle.
     let ok = unsafe {
         GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -220,10 +231,14 @@ fn handle_from_builtin_query() -> Option<u64> {
 
     let query: NtQueryVirtualMemory = {
         use windows_sys::libloaderapi::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: `c"ntdll.dll"` is a valid, NUL-terminated static string; ntdll is always
+        // already loaded in a Wine process.
         let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8) };
         if ntdll.is_null() {
             return None;
         }
+        // SAFETY: `ntdll` is the non-null handle just returned above, and
+        // `c"NtQueryVirtualMemory"` is a valid, NUL-terminated static string.
         let proc = unsafe { GetProcAddress(ntdll, c"NtQueryVirtualMemory".as_ptr() as *const u8) }?;
         // SAFETY: resolved via `GetProcAddress("NtQueryVirtualMemory")`, whose signature
         // is the documented ntdll ABI.
@@ -232,6 +247,8 @@ fn handle_from_builtin_query() -> Option<u64> {
 
     let mut handle: u64 = 0;
     let mut result_len: usize = 0;
+    // SAFETY: `query` was resolved via `GetProcAddress("NtQueryVirtualMemory")` and matches
+    // the documented ntdll ABI; `handle` is a valid 8-byte local sized for the class queried.
     let status = unsafe {
         query(
             (-1isize) as *mut c_void, // GetCurrentProcess()
@@ -272,6 +289,8 @@ pub(crate) fn request_with_timeout(
         reply_handle: 0,
     };
 
+    // SAFETY: `transport.call`/`transport.handle` were resolved together as a matched pair in
+    // `resolve`, and `params` is a live `ExchangeParams` matching the unix half's layout.
     let status = unsafe {
         (transport.call)(
             transport.handle,
@@ -292,6 +311,9 @@ pub(crate) fn request_with_timeout(
         buffer: body.as_mut_ptr() as u64,
         buffer_len: body.len() as u64,
     };
+    // SAFETY: `transport.call`/`transport.handle` were resolved together as a matched pair in
+    // `resolve`, and `fetch` is a live `FetchReplyParams` whose `buffer`/`buffer_len` describe
+    // the just-allocated `body` vec.
     let status = unsafe {
         (transport.call)(
             transport.handle,
@@ -313,6 +335,10 @@ pub(crate) fn request_with_timeout(
 }
 
 #[cfg(test)]
+// Test code exercises this crate's own already-documented internal APIs against
+// synthetic, controlled inputs, not untrusted FFI callers - a per-site SAFETY comment
+// here would just restate the production contract already documented at each fn.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use super::{ExchangeParams, FetchReplyParams};
 

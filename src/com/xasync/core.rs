@@ -42,7 +42,11 @@ pub(crate) struct AsyncState {
 // The block and the provider context belong to the caller, who is responsible for
 // keeping them alive for the duration of the call; the GDK contract explicitly allows
 // the runtime to touch them from its own threads.
+// SAFETY: see comment above - the caller-owned block/context are safe to touch from any
+// thread per the GDK contract.
 unsafe impl Send for AsyncState {}
+// SAFETY: see comment above - the caller-owned block/context are safe to touch from any
+// thread per the GDK contract.
 unsafe impl Sync for AsyncState {}
 
 impl AsyncState {
@@ -61,6 +65,9 @@ impl AsyncState {
 
     pub(crate) fn invoke(&self, op: XAsyncOp, buffer: *mut c_void, buffer_size: usize) -> HRESULT {
         let data = self.provider_data(buffer, buffer_size);
+        // SAFETY: `self.provider` is the fn the caller registered via `XAsyncBegin`'s
+        // `provider` argument, matching the required `XAsyncProvider` signature; `&data` is
+        // a valid pointer to the freshly built `XAsyncProviderData`.
         unsafe { (self.provider)(op, &data) }
     }
 }
@@ -70,11 +77,16 @@ impl AsyncState {
 /// # Safety
 /// `block` must be null or point at a valid `XAsyncBlock`.
 pub(crate) unsafe fn state_of(block: *mut XAsyncBlock) -> Option<Arc<AsyncState>> {
+    // SAFETY: caller upholds this fn's documented precondition that `block` is null or a
+    // valid `XAsyncBlock`.
     let block = unsafe { block.as_mut() }?;
     let (signature, pointer) = read_internal(block);
     if signature != SIGNATURE || pointer.is_null() {
         return None;
     }
+    // SAFETY: `pointer` is the `Arc::into_raw` value `write_internal` stored in
+    // `block.internal`; this doesn't consume the block's reference since the `Arc` is
+    // immediately cloned and forgotten below.
     let state = unsafe { Arc::from_raw(pointer) };
     // The block keeps its reference; hand the caller a new one.
     let clone = state.clone();
@@ -137,12 +149,17 @@ pub(crate) fn is_lhc_internal(name: &str) -> bool {
 
 /// Detach the state from the block, taking the block's reference with it.
 pub(crate) unsafe fn take_state(block: *mut XAsyncBlock) -> Option<Arc<AsyncState>> {
+    // SAFETY: caller upholds this fn's contract, matching `state_of`'s: `block` is null or a
+    // valid `XAsyncBlock`.
     let block = unsafe { block.as_mut() }?;
     let (signature, pointer) = read_internal(block);
     if signature != SIGNATURE || pointer.is_null() {
         return None;
     }
     block.internal.fill(0);
+    // SAFETY: `pointer` is the `Arc::into_raw` value `write_internal` stored in
+    // `block.internal`; zeroing `block.internal` just above means this is the block's only
+    // reclaim of it.
     Some(unsafe { Arc::from_raw(pointer) })
 }
 
@@ -176,11 +193,16 @@ pub(crate) fn cleanup(state: &Arc<AsyncState>) {
     let _ = state.invoke(XAsyncOp::Cleanup, std::ptr::null_mut(), 0);
     // Drops the block's reference; any callback still holding one keeps the allocation
     // alive until it returns.
+    // SAFETY: `cleaned_up` is checked-and-set under the lock above, so `cleanup` runs its
+    // `take_state` exactly once per block; `state.block` is the live block this `AsyncState`
+    // was built from.
     unsafe { take_state(state.block) };
 }
 
 /// Runs on the work port. One `DoWork` pass.
 pub(crate) unsafe extern "system" fn work_callback(context: *mut c_void, canceled: bool) {
+    // SAFETY: `context` is the `Arc::into_raw` pointer submitted to the work port for this
+    // call, and the queue invokes a work callback exactly once per submission.
     let state = unsafe { Arc::from_raw(context as *const AsyncState) };
     let name = block_name(state.block);
     diag!(
@@ -235,6 +257,8 @@ pub(crate) unsafe extern "system" fn completion_callback(context: *mut c_void, _
     );
     let prev = current_identity();
     set_current_identity(name);
+    // SAFETY: `completion.callback` was copied from the caller's `XAsyncBlock::callback`
+    // field in `complete_state`, and `completion.state.block` is that same still-live block.
     unsafe { (completion.callback)(completion.state.block) };
     set_current_identity(prev);
 }
@@ -275,6 +299,7 @@ pub(crate) fn complete_state(
     // a block with no callback: its owner is entitled to wait on XAsyncGetStatus and
     // then drop the block, and with nothing to invoke there is no reason to touch it
     // again at all.
+    // SAFETY: `state.block` is still alive at this point per the reasoning above.
     let callback = unsafe { state.block.as_ref() }.and_then(|block| block.callback);
     state.completed.notify_all();
 
@@ -307,6 +332,8 @@ pub(crate) fn complete_state(
     if !submitted {
         // The completion port is gone. The game still has to hear about the call, so
         // deliver it here rather than dropping it on the floor.
+        // SAFETY: `context` is the `Completion` just boxed via `ctx_box_into_raw` above; the
+        // failed `submit` means the queue never took ownership, so this is its only consumer.
         unsafe { completion_callback(context, true) };
     }
 }

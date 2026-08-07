@@ -144,6 +144,10 @@ pub struct XUserPlatformRemoteConnectEventHandlers {
 // ---------------------------------------------------------------------------------------
 
 #[cfg(test)]
+// Test code exercises this crate's own already-documented internal APIs against
+// synthetic, controlled inputs, not untrusted FFI callers - a per-site SAFETY comment
+// here would just restate the production contract already documented at each fn.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use std::collections::HashMap;
     use std::ffi::c_void;

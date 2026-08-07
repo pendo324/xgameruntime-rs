@@ -119,11 +119,13 @@ pub(crate) struct ChangeEventRegistration {
     callback: XUserChangeEventCallback,
 }
 
-// The context and callback are only ever read back and invoked on whatever thread fires
-// the event, exactly like `XAsyncWaker` elsewhere in this crate - the game is the one
+// SAFETY: the context and callback are only ever read back and invoked on whatever thread
+// fires the event, exactly like `XAsyncWaker` elsewhere in this crate - the game is the one
 // asserting these are safe to move by handing them to a registration API in the first
 // place.
 unsafe impl Send for ChangeEventRegistration {}
+// SAFETY: same reasoning as the `Send` impl above - the context/callback pair is only ever
+// read and invoked, never mutated concurrently in a way that would require exclusion.
 unsafe impl Sync for ChangeEventRegistration {}
 
 /// Accepted registrations for `XUserChangeEvent` notifications. `XUserAddAsync` fires
@@ -147,6 +149,9 @@ pub(crate) fn fire_change_event(local_id: XUserLocalId, event: u32) {
         .expect("change registry poisoned");
     if let Some(registry) = registry.as_ref() {
         for registration in registry.values() {
+            // SAFETY: `callback`/`context` were handed to us as a pair by the GDK caller
+            // via `XUserRegisterForChangeEvent`, which contracts them to remain valid and
+            // callable for as long as the registration is held.
             unsafe { (registration.callback)(registration.context, local_id, event) };
         }
     }
@@ -180,6 +185,8 @@ pub(crate) fn unregister_change_event(token: u64) -> bool {
 /// point at a valid null-terminated `u16` sequence - callers check `is_null()` first.
 pub(crate) unsafe fn read_utf16_cstr(ptr: *const u16) -> String {
     let mut len = 0usize;
+    // SAFETY: this fn's own doc comment is the precondition callers must uphold - `ptr` is
+    // non-null and points at a valid nul-terminated `u16` sequence.
     unsafe {
         while *ptr.add(len) != 0 {
             len += 1;

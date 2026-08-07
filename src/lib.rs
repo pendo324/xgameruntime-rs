@@ -6,6 +6,7 @@
 //! annotate each binding. This is the same convention the `winapi`/`windows` crates use.
 
 #![allow(non_snake_case)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr::null_mut;
@@ -43,6 +44,8 @@ pub struct InitializeOptions;
 static INIT_REF_COUNT: Mutex<usize> = Mutex::new(0);
 
 unsafe extern "system" fn find_window(hwnd: HWND, lp: LPARAM) -> windows_core::BOOL {
+    // SAFETY: `lp` was built from `&mut search as *mut HWND` in `show` below and is still
+    // live for the duration of the `EnumWindows` call that produced this callback.
     unsafe {
         let result: &mut HWND = &mut *(lp.0 as *mut HWND);
         *result = hwnd;
@@ -59,6 +62,8 @@ unsafe extern "system" fn show(
     _qr_code_size: usize,
     _qr_code: *const c_char,
 ) {
+    // SAFETY: `url` and `code` are NUL-terminated C strings supplied by the caller through the
+    // `XUserPlatformRemoteConnectSetEventHandlers` show-callback contract.
     unsafe {
         let url = CStr::from_ptr(url);
         let code = CStr::from_ptr(code);
@@ -124,6 +129,8 @@ fn initialize(
     // be shown by the shell has to come from us.
     let mut out: *mut c_void = null_mut();
     if com::query_api_impl(&crate::com::xuser::CLSID_XUSER, &IXUserImpl5::IID, &mut out) == S_OK
+        // SAFETY: `out` was just populated with a successful `IXUserImpl5` COM pointer by the
+        // `query_api_impl` call above.
         && let Some(platform) = unsafe { IXUserImpl5::from_raw_borrowed(&out) }
     {
         let handlers = XUserPlatformRemoteConnectEventHandlers {
@@ -131,6 +138,8 @@ fn initialize(
             close: Some(hide),
             context: null_mut(),
         };
+        // SAFETY: `platform` is the live interface pointer just QI'd above, and `handlers` is
+        // a valid, fully-initialized struct of function pointers for the call's lifetime.
         let _ = unsafe { platform.XUserPlatformRemoteConnectSetEventHandlers(0, &handlers) };
     }
 
@@ -228,9 +237,12 @@ pub extern "system" fn DllGetClassObject(
     if out.is_null() {
         return windows_core::HRESULT(0x80004003u32 as i32); // E_POINTER
     }
+    // SAFETY: `out.is_null()` was just checked above, so `out` is valid for a single write.
     unsafe {
         *out = null_mut();
     }
+    // SAFETY: `clsid`/`iid` are COM activation parameters that GDK may pass as null; `as_ref`
+    // (rather than a deref) accounts for that instead of assuming non-null.
     let (clsid, iid) = unsafe { (clsid.as_ref(), iid.as_ref()) };
     stub!(
         "DllGetClassObject: clsid {:?}, iid {:?}",

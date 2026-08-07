@@ -158,6 +158,8 @@ pub struct XNetworkingSecurityInformation {
 // thread boundary. Sound here because both producers below report zero thumbprints and a
 // null `thumbprints` pointer - there is no pointee to race over. Should this ever return a
 // real thumbprint array, revisit: the array's ownership would have to cross with it.
+// SAFETY: see above - `thumbprints` is always null with a zero count, so there is no
+// pointee to race over when this crosses to the run_sync worker thread.
 unsafe impl Send for XNetworkingSecurityInformation {}
 
 type OnChanged =
@@ -185,6 +187,8 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         if connectivityHint.is_null() {
             return E_POINTER;
         }
+        // SAFETY: connectivityHint was null-checked above and is a valid
+        // XNetworkingConnectivityHint out-pointer per the GDK contract.
         unsafe {
             *connectivityHint = XNetworkingConnectivityHint {
                 connectivity_level: XNetworkingConnectivityLevelHint::InternetAccess,
@@ -215,6 +219,9 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         _token: *mut c_void,
     ) -> HRESULT {
         if let Some(callback) = callback {
+            // SAFETY: callback is a caller-supplied function pointer registered
+            // via XNetworkingRegisterConnectivityHintChanged, matching OnChanged's
+            // signature per that registration's contract.
             unsafe {
                 callback(
                     context,
@@ -238,7 +245,11 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         url: *mut c_char,
         asyncBlock: *mut c_void,
     ) -> HRESULT {
+        // SAFETY: url is a GDK-caller-supplied, NUL-terminated C string per the
+        // XNetworkingQuerySecurityInformationForUrlAsync contract.
         let _url = unsafe { CStr::from_ptr(url) };
+        // SAFETY: asyncBlock is the caller's XAsyncBlock pointer per the XAsync
+        // GDK contract; run_sync itself no-ops on a null pointer.
         unsafe {
             xasync::run_sync(asyncBlock.cast(), move || {
                 Ok(XNetworkingSecurityInformation {
@@ -258,8 +269,12 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         asyncBlock: *mut c_void,
         securityInformationBufferByteCount: *mut usize,
     ) -> HRESULT {
+        // SAFETY: asyncBlock is the caller's live XAsyncBlock pointer per the
+        // XAsync GDK contract for this ResultSize call.
         let r = unsafe { xasync::get_result_size(asyncBlock.cast()) };
         match r {
+            // SAFETY: securityInformationBufferByteCount is a valid usize
+            // out-pointer per the GDK contract.
             Ok(size) => unsafe {
                 *securityInformationBufferByteCount = size;
                 S_OK
@@ -280,8 +295,13 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
             return E_FAIL;
         }
         if !securityInformationBufferByteCountUsed.is_null() {
+            // SAFETY: securityInformationBufferByteCountUsed was null-checked
+            // above and is a valid usize out-pointer per the GDK contract.
             unsafe { *securityInformationBufferByteCountUsed = 0 };
         }
+        // SAFETY: securityInformationBufferByteCount was checked above to be at
+        // least size_of::<XNetworkingSecurityInformation>(), so
+        // securityInformationBuffer is large enough for get_result's write.
         match unsafe {
             get_result(
                 asyncBlock.cast(),
@@ -291,11 +311,16 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         } {
             Ok(_) => {
                 if !securityInformationBufferByteCountUsed.is_null() {
+                    // SAFETY: securityInformationBufferByteCountUsed was
+                    // null-checked above and is a valid usize out-pointer per the
+                    // GDK contract.
                     unsafe {
                         *securityInformationBufferByteCountUsed =
                             size_of::<XNetworkingSecurityInformation>()
                     };
                 }
+                // SAFETY: securityInformation is a valid out-pointer per the GDK
+                // contract, and securityInformationBuffer was just populated above.
                 unsafe { *securityInformation = securityInformationBuffer.cast() };
                 S_OK
             }
@@ -308,6 +333,8 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         _url: *mut u16,
         asyncBlock: *mut c_void,
     ) -> HRESULT {
+        // SAFETY: asyncBlock is the caller's XAsyncBlock pointer per the XAsync
+        // GDK contract; run_sync itself no-ops on a null pointer.
         unsafe {
             xasync::run_sync(asyncBlock.cast(), move || {
                 Ok(XNetworkingSecurityInformation {
@@ -327,8 +354,12 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         asyncBlock: *mut c_void,
         securityInformationBufferByteCount: *mut usize,
     ) -> HRESULT {
+        // SAFETY: asyncBlock is the caller's live XAsyncBlock pointer per the
+        // XAsync GDK contract for this ResultSize call.
         let r = unsafe { xasync::get_result_size(asyncBlock.cast()) };
         match r {
+            // SAFETY: securityInformationBufferByteCount is a valid usize
+            // out-pointer per the GDK contract.
             Ok(size) => unsafe {
                 *securityInformationBufferByteCount = size;
                 S_OK
@@ -349,8 +380,13 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
             return E_FAIL;
         }
         if !securityInformationBufferByteCountUsed.is_null() {
+            // SAFETY: securityInformationBufferByteCountUsed was null-checked
+            // above and is a valid usize out-pointer per the GDK contract.
             unsafe { *securityInformationBufferByteCountUsed = 0 };
         }
+        // SAFETY: securityInformationBufferByteCount was checked above to be at
+        // least size_of::<XNetworkingSecurityInformation>(), so
+        // securityInformationBuffer is large enough for get_result's write.
         match unsafe {
             get_result(
                 asyncBlock.cast(),
@@ -360,11 +396,16 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         } {
             Ok(_) => {
                 if !securityInformationBufferByteCountUsed.is_null() {
+                    // SAFETY: securityInformationBufferByteCountUsed was
+                    // null-checked above and is a valid usize out-pointer per the
+                    // GDK contract.
                     unsafe {
                         *securityInformationBufferByteCountUsed =
                             size_of::<XNetworkingSecurityInformation>()
                     };
                 }
+                // SAFETY: securityInformation is a valid out-pointer per the GDK
+                // contract, and securityInformationBuffer was just populated above.
                 unsafe { *securityInformation = securityInformationBuffer.cast() };
                 S_OK
             }

@@ -69,6 +69,8 @@ pub(crate) unsafe fn read_cstr(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
+    // SAFETY: `ptr` is non-null (checked above); this fn's own doc is the precondition callers
+    // must uphold - that it points to a NUL-terminated C string.
     unsafe { CStr::from_ptr(ptr) }
         .to_str()
         .ok()
@@ -258,6 +260,8 @@ pub(crate) fn enumerate_containers(
             lastModifiedTime: last_modified,
             needsSync: FALSE,
         };
+        // SAFETY: `callback` was unwrapped from `Option` by the caller in object.rs, so it's
+        // non-null; `info` is a fully-initialized struct built just above.
         let keep_going = unsafe { callback(&info, context) };
         if keep_going == FALSE {
             break;
@@ -286,6 +290,8 @@ pub(crate) fn enumerate_blobs(
             name: name_c.as_ptr(),
             size,
         };
+        // SAFETY: `callback` was unwrapped from `Option` by the caller in object.rs, so it's
+        // non-null; `info` is a fully-initialized struct built just above.
         let keep_going = unsafe { callback(&info, context) };
         if keep_going == FALSE {
             break;

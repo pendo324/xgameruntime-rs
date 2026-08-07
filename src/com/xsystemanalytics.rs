@@ -64,6 +64,7 @@ impl IXSystemAnalyticsImpl_Impl for XSystemAnalytics_Impl {
             build: 19045,
             revision: 0,
         };
+        // SAFETY: `result` was checked non-null above.
         unsafe {
             (*result).os_version = version;
             (*result).hosting_os_version = version;

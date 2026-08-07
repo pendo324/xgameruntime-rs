@@ -62,6 +62,8 @@ impl IXGameInviteImpl_Impl for XGameInvite_Impl {
         token: *mut c_void,
     ) -> HRESULT {
         if !token.is_null() {
+            // SAFETY: `token` was checked non-null above; XGameInviteRegisterForEvent's GDK
+            // contract declares it a `*mut u64` out-param.
             unsafe {
                 *(token as *mut u64) = 0;
             }
@@ -81,6 +83,8 @@ impl IXGameInviteImpl2_Impl for XGameInvite_Impl {
         token: *mut c_void,
     ) -> HRESULT {
         if !token.is_null() {
+            // SAFETY: `token` was checked non-null above; XGameInviteRegisterForPendingEvent's
+            // GDK contract declares it a `*mut u64` out-param.
             unsafe {
                 *(token as *mut u64) = 0;
             }

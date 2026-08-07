@@ -57,6 +57,8 @@ pub struct XPersistentLocalStorage {
 
 impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
     unsafe fn x_persistent_local_storage_get_path_size(&self, path_size: *mut usize) {
+        // SAFETY: `path_size` is an out-pointer per XPersistentLocalStorageGetPathSize's GDK
+        // contract; the caller is required to pass a valid pointer.
         unsafe {
             *path_size = self.tmp_path.len() + 1;
         }
@@ -71,15 +73,21 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
         let bytes = self.tmp_path.as_bytes();
         let len = bytes.len().min(path_size.saturating_sub(1));
         for (index, byte) in bytes.iter().copied().take(len).enumerate() {
+            // SAFETY: `index < len <= path_size - 1`, and `path` is a caller-supplied buffer
+            // of `path_size` bytes per the GDK contract.
             unsafe {
                 *path.add(index) = byte as c_char;
             }
         }
         if path_size != 0 {
+            // SAFETY: `path_size != 0` was checked above, and `len <= path_size - 1`, so
+            // `path.add(len)` is in bounds.
             unsafe {
                 *path.add(len) = 0;
             }
         }
+        // SAFETY: `path_used` is an out-pointer per XPersistentLocalStorageGetPath's GDK
+        // contract; the caller is required to pass a valid pointer.
         unsafe {
             *path_used = len + 1;
         }
@@ -95,6 +103,8 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
     ) {
         let (total_bytes, growable_to_bytes) = crate::ipc::persistent_local_storage_space()
             .unwrap_or((1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024));
+        // SAFETY: `info` is an out-pointer per XPersistentLocalStorageGetSpaceInfo's GDK
+        // contract; the caller is required to pass a valid pointer.
         unsafe {
             *info = XPersistentLocalStorageSpaceInfo {
                 availableFreeBytes: growable_to_bytes.saturating_sub(total_bytes / 2),
@@ -114,6 +124,8 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
         _requested_bytes: u64,
         async_block: *mut XAsyncBlock,
     ) {
+        // SAFETY: `async_block` is the caller-supplied `XAsyncBlock` for this async op,
+        // matching `run_sync`'s own pointer contract.
         let _ = unsafe { xasync::run_sync(async_block, || Ok(())) };
     }
 
@@ -121,6 +133,8 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
         &self,
         async_block: *mut XAsyncBlock,
     ) {
+        // SAFETY: `async_block` is the same `XAsyncBlock` the caller supplied to the matching
+        // `_async` call, matching `get_result`'s pointer contract.
         let _ = unsafe { get_result::<()>(async_block, null_mut(), &mut ()) };
     }
 
@@ -143,6 +157,8 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
         if package_identifier.is_null() || mount_handle.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `package_identifier` was checked non-null above; the GDK contract requires
+        // it be a NUL-terminated C string.
         let Ok(package_identifier) = unsafe { CStr::from_ptr(package_identifier) }.to_str() else {
             return E_INVALIDARG;
         };
@@ -173,6 +189,7 @@ impl IXPersistentLocalStorage_Impl for XPersistentLocalStorage_Impl {
         }
 
         let handle = XPackageMountHandleTable::create(path.to_string_lossy().into_owned());
+        // SAFETY: `mount_handle` was checked non-null above.
         unsafe {
             *mount_handle = handle;
         }

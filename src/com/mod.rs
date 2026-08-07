@@ -151,7 +151,10 @@ pub(crate) use void_stub;
 /// impls below assert that.
 pub(crate) struct GlobalInterface<T>(T);
 
+// SAFETY: every object this crate hands out is free-threaded (plain Rust behind a vtable,
+// with its own interior synchronization), per the doc comment above.
 unsafe impl<T> Send for GlobalInterface<T> {}
+// SAFETY: same reasoning as the `Send` impl above.
 unsafe impl<T> Sync for GlobalInterface<T> {}
 
 /// Defines the process-wide instance of a COM object, built on first request.
@@ -245,11 +248,15 @@ fn query<T: Interface + Clone>(
         return E_POINTER;
     }
     let object = object.clone();
+    // SAFETY: `interface_id.is_null()` was just checked above.
     let interface_id = unsafe { *interface_id };
+    // SAFETY: `out.is_null()` was just checked above, satisfying `Interface::query`'s
+    // contract that `interface` be a non-null, valid pointer for writing.
     if unsafe { object.query(&interface_id, out) }.is_ok() {
         S_OK
     } else {
         diag!("query: no such interface {:#034x}", interface_id.to_u128());
+        // SAFETY: `out.is_null()` was checked above.
         unsafe {
             *out = std::ptr::null_mut();
         }
@@ -266,10 +273,12 @@ pub fn query_api_impl(
         return E_POINTER;
     }
 
+    // SAFETY: `runtime_class_id.is_null()` was just checked above.
     let class_id = unsafe { *runtime_class_id };
     diag!(
         "query_api_impl: class {:#034x} interface {:#034x}",
         class_id.to_u128(),
+        // SAFETY: `interface_id.is_null()` was just checked above.
         unsafe { *interface_id }.to_u128()
     );
     match class_id {
@@ -316,6 +325,7 @@ pub fn query_api_impl(
                 "query_api_impl: unimplemented class {:#034x}",
                 class_id.to_u128()
             );
+            // SAFETY: `out.is_null()` was checked above.
             unsafe {
                 *out = std::ptr::null_mut();
             }
@@ -325,6 +335,10 @@ pub fn query_api_impl(
 }
 
 #[cfg(test)]
+// Test code exercises this crate's own already-documented internal APIs against
+// synthetic, controlled inputs, not untrusted FFI callers - a per-site SAFETY comment
+// here would just restate the production contract already documented at each fn.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use std::ffi::{c_char, c_void};
 

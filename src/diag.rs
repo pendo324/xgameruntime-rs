@@ -37,6 +37,7 @@ pub(crate) fn emit(line: &str) {
 
     static HAS_STDERR: OnceLock<bool> = OnceLock::new();
     let has_stderr = *HAS_STDERR.get_or_init(|| {
+        // SAFETY: `STD_ERROR_HANDLE` is the fixed, well-known Win32 constant `-12`.
         let handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
         handle != 0 && handle != INVALID_HANDLE_VALUE
     });
@@ -49,6 +50,7 @@ pub(crate) fn emit(line: &str) {
         let mut bytes = line.replace('\0', "?").into_bytes();
         bytes.push(b'\n');
         bytes.push(0);
+        // SAFETY: `bytes` is a live local buffer, just NUL-terminated by the push above.
         unsafe { OutputDebugStringA(bytes.as_ptr()) };
     }
 }

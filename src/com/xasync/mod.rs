@@ -164,6 +164,7 @@ fn interface() -> Result<IXAsync, HRESULT> {
     if hr != S_OK {
         return Err(hr);
     }
+    // SAFETY: `hr == S_OK` above guarantees `out` is a valid `IXAsync` COM pointer from `query_api_impl`.
     Ok(unsafe { IXAsync::from_raw(out) })
 }
 
@@ -179,6 +180,8 @@ pub unsafe fn begin(
     provider: XAsyncProvider,
 ) -> Result<(), HRESULT> {
     let xasync = interface()?;
+    // SAFETY: `begin`'s own contract requires valid caller-supplied `async_block`, `context`,
+    // `identity`, `identity_name`, and `provider`, forwarded unchanged to `XAsyncBegin`.
     let hr = unsafe {
         xasync.XAsyncBegin(
             async_block.cast(),
@@ -197,6 +200,7 @@ pub unsafe fn complete(
     required_buffer_size: usize,
 ) -> Result<(), HRESULT> {
     let xasync = interface()?;
+    // SAFETY: `complete`'s own contract requires `async_block` be a live, caller-owned `XAsyncBlock`.
     unsafe { xasync.XAsyncComplete(async_block.cast(), result.0, required_buffer_size as u64) };
     Ok(())
 }
@@ -208,6 +212,9 @@ pub unsafe fn get_result<T>(
 ) -> Result<(), HRESULT> {
     let xasync = interface()?;
     let mut buffer_used = 0usize;
+    // SAFETY: `get_result`'s own contract requires valid `async_block`/`identity`; `out` is
+    // sized for `T` via `size_of::<T>()` passed as `bufferSize`, and `buffer_used` is a valid
+    // local out-pointer.
     let hr = unsafe {
         xasync.XAsyncGetResult(
             async_block.cast(),
@@ -225,6 +232,8 @@ pub unsafe fn get_result<T>(
 #[cfg(test)]
 pub unsafe fn get_status(async_block: *mut XAsyncBlock, wait: bool) -> Result<(), HRESULT> {
     let xasync = interface()?;
+    // SAFETY: `interface()` returns a live, already-QI'd XAsync vtable pointer, and this
+    // fn's own doc note says only tests call it, on a block they own.
     let hr = unsafe { xasync.XAsyncGetStatus(async_block.cast(), wait.into()) };
     result((), hr)
 }
@@ -232,6 +241,8 @@ pub unsafe fn get_status(async_block: *mut XAsyncBlock, wait: bool) -> Result<()
 pub unsafe fn get_result_size(async_block: *mut XAsyncBlock) -> Result<usize, HRESULT> {
     let xasync = interface()?;
     let mut buffer_size: usize = 0;
+    // SAFETY: `get_result_size`'s own contract requires a valid `async_block`; `buffer_size`
+    // is a valid local out-pointer.
     let hr = unsafe { xasync.XAsyncGetResultSize(async_block.cast(), &mut buffer_size) };
     result(buffer_size, hr)
 }
@@ -260,6 +271,8 @@ fn run_sync_queue() -> &'static Arc<task_queue::Queue> {
 /// the XAsync protocol pins for us: the context is only freed on `Cleanup`, which the
 /// caller cannot reach until it has seen the completion this worker posts.
 struct SendPtr<T>(*mut T);
+// SAFETY: the pointee's lifetime is pinned by XAsync's Cleanup contract (see struct doc above),
+// so moving the pointer to a worker thread doesn't violate aliasing.
 unsafe impl<T> Send for SendPtr<T> {}
 
 /// Hand ownership of `value` to an FFI callback as an opaque context pointer.
@@ -275,6 +288,7 @@ fn ctx_box_into_raw<T>(value: T) -> *mut c_void {
 /// and this must be the only reclaim of it (the GDK `Cleanup`/completion contract at
 /// each call site guarantees both).
 unsafe fn ctx_box_from_raw<T>(ptr: *mut c_void) -> Box<T> {
+    // SAFETY: caller upholds the preconditions documented above.
     unsafe { Box::from_raw(ptr.cast::<T>()) }
 }
 
@@ -302,9 +316,13 @@ unsafe extern "system" fn run_sync_helper<
     op: XAsyncOp,
     data: *const XAsyncProviderData,
 ) -> HRESULT {
+    // SAFETY: XAsync always passes a non-null `data` to provider callbacks; checked here
+    // defensively before dereferencing.
     let Some(data) = (unsafe { data.as_ref() }) else {
         return E_POINTER;
     };
+    // SAFETY: `data.context` is the pointer this module handed to XAsync via `ctx_box_into_raw`
+    // in `run_sync` below, live for the duration of provider callbacks.
     let Some(async_context) = (unsafe { (data.context as *mut XsyncContextHelper<T, F>).as_mut() })
     else {
         return E_POINTER;
@@ -320,6 +338,8 @@ unsafe extern "system" fn run_sync_helper<
             let work: BoxedWork = Box::new(move |canceled: bool| {
                 let context = context;
                 let block = block;
+                // SAFETY: `context.0` is the `async_context` pointer captured above, kept alive
+                // until `Cleanup` runs after this work completes.
                 let async_context = unsafe { &mut *context.0 };
                 if canceled {
                     // The pool is going away. Still complete, or the caller waits forever.
@@ -333,6 +353,8 @@ unsafe extern "system" fn run_sync_helper<
                         Err(hr) => async_context.result = hr,
                     }
                 }
+                // SAFETY: `block.0` is the caller's `XAsyncBlock`, still valid until this
+                // worker posts completion.
                 let _ = unsafe { complete(block.0, async_context.result, size_of::<T>()) };
             });
             let submitted = run_sync_queue().submit(
@@ -351,6 +373,8 @@ unsafe extern "system" fn run_sync_helper<
                     }
                     Err(hr) => async_context.result = hr,
                 }
+                // SAFETY: `data.async_` is the block XAsync supplied to this provider callback,
+                // valid for this synchronous completion.
                 return unsafe { complete(data.async_, async_context.result, size_of::<T>()) }
                     .map(|_| S_OK)
                     .unwrap_or_else(|hr| hr);
@@ -406,6 +430,9 @@ where
         result: E_ABORT,
         future,
     });
+    // SAFETY: `begin`'s contract is satisfied: `async_` is caller-supplied, `async_context`
+    // was just boxed via `ctx_box_into_raw`, and `run_sync_helper` matches `provider`'s
+    // required signature.
     match unsafe {
         begin(
             async_,

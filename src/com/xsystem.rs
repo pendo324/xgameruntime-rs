@@ -107,6 +107,7 @@ impl IXSystem_Impl for XSystem_Impl {
         if console_id_used.is_null() {
             return E_POINTER;
         }
+        // SAFETY: `console_id_used` was checked non-null above.
         unsafe {
             *console_id_used = ID.count_bytes() + 1;
         }
@@ -143,6 +144,7 @@ impl IXSystem_Impl for XSystem_Impl {
             std::ptr::copy_nonoverlapping(ID.as_ptr(), sandbox_id, ID.count_bytes() + 1);
         }
         if !sandbox_id_used.is_null() {
+            // SAFETY: `sandbox_id_used` was checked non-null above.
             unsafe {
                 *sandbox_id_used = ID.count_bytes() + 1;
             }
@@ -186,6 +188,7 @@ impl IXSystem_Impl for XSystem_Impl {
             CString::new(text).expect("hex-formatted guid string has no NUL bytes")
         });
         if !device_id_used.is_null() {
+            // SAFETY: `device_id_used` was checked non-null above.
             unsafe {
                 *device_id_used = id.count_bytes() + 1;
             }

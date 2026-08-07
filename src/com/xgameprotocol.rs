@@ -35,6 +35,8 @@ impl IXGameProtocolImpl_Impl for XGameProtocol_Impl {
         token: *mut c_void,
     ) -> HRESULT {
         if !token.is_null() {
+            // SAFETY: `token` was checked non-null above; XGameProtocolRegisterForActivation's
+            // GDK contract declares it a `*mut u64` out-param.
             unsafe {
                 *(token as *mut u64) = 0;
             }

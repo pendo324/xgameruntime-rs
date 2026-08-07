@@ -761,6 +761,10 @@ pub(crate) fn game_save_root() -> Option<String> {
 }
 
 #[cfg(test)]
+// Test code exercises this crate's own already-documented internal APIs against
+// synthetic, controlled inputs, not untrusted FFI callers - a per-site SAFETY comment
+// here would just restate the production contract already documented at each fn.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use std::net::TcpListener;
     use std::sync::Mutex;

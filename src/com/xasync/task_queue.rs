@@ -107,10 +107,15 @@ struct Task {
 
 // The context is opaque to us - it belongs to whoever submitted the callback, and the
 // GDK contract is that a callback may run on any thread the queue chooses.
+// SAFETY: see comment above - the caller-owned, opaque `context` is safe to touch from any
+// thread per the GDK contract.
 unsafe impl Send for Task {}
 
 impl Task {
     fn run(self, canceled: bool) {
+        // SAFETY: `self.callback` was caller-registered via `XTaskQueueSubmitCallback`/
+        // `XTaskQueueSubmitDelayedCallback`, whose contract requires a valid callback for
+        // this task's lifetime; `self.context` is the matching caller-supplied context.
         unsafe { (self.callback)(self.context, canceled) };
     }
 
@@ -555,6 +560,8 @@ struct Monitor {
     callback: MonitorCallback,
 }
 
+// SAFETY: `context` is opaque and caller-owned, kept valid for the queue's lifetime per the
+// `XTaskQueueRegisterMonitor` contract, and is safe to touch from any thread that dispatches.
 unsafe impl Send for Monitor {}
 
 /// A queue's handle on an underlying [`Port`].
@@ -687,6 +694,9 @@ impl Queue {
             .canonical_handle
             .get_or_init(|| QueueHandle::create(self.clone()));
         for monitor in monitors.iter() {
+            // SAFETY: `monitor.callback` was caller-registered via
+            // `XTaskQueueRegisterMonitor`, whose contract requires a valid callback for the
+            // queue's lifetime; `monitor.context` is the matching caller-supplied context.
             unsafe { (monitor.callback)(monitor.context, handle, kind.as_raw()) };
         }
     }
@@ -822,6 +832,10 @@ pub fn has_process_queue() -> bool {
 }
 
 #[cfg(test)]
+// Test code exercises this crate's own already-documented internal APIs against
+// synthetic, controlled inputs, not untrusted FFI callers - a per-site SAFETY comment
+// here would just restate the production contract already documented at each fn.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
