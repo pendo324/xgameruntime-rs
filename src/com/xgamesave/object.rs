@@ -607,11 +607,11 @@ impl IXGameSaveImpl2_Impl for XGameSaveObject_Impl {
         if folderSize < payload.len + 1 {
             return E_NOT_SUFFICIENT_BUFFER;
         }
+        // SAFETY: `folderSize >= payload.len + 1` was checked above.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                payload.bytes.as_ptr(),
+            crate::ffi_util::write_out_bytes(
+                &payload.bytes[..payload.len],
                 folderResult.cast::<u8>(),
-                payload.len,
             );
             *folderResult.add(payload.len) = 0;
         }

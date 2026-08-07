@@ -362,6 +362,9 @@ unsafe extern "system" fn run_sync_helper<
             if async_context.result == S_OK
                 && let Some(payload) = &async_context.payload
             {
+                // SAFETY: `data.buffer` is the caller-supplied output buffer XAsync sized
+                // via the `size_of::<T>()` passed to `complete` above, valid for a `T`-sized
+                // write.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         (payload as *const T).cast::<u8>(),

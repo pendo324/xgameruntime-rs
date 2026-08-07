@@ -1076,8 +1076,9 @@ impl IXStore_Impl for XStoreObject_Impl {
                 if result.is_null() {
                     return E_POINTER;
                 }
+                // SAFETY: `size >= needed` was checked above.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), result.cast::<u8>(), bytes.len());
+                    crate::ffi_util::write_out_bytes(bytes, result.cast::<u8>());
                     *result.cast::<u8>().add(bytes.len()) = 0;
                 }
                 S_OK
@@ -1172,8 +1173,9 @@ impl IXStore_Impl for XStoreObject_Impl {
                 if result.is_null() {
                     return E_POINTER;
                 }
+                // SAFETY: `size >= needed` was checked above.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), result.cast::<u8>(), bytes.len());
+                    crate::ffi_util::write_out_bytes(bytes, result.cast::<u8>());
                     *result.cast::<u8>().add(bytes.len()) = 0;
                 }
                 S_OK

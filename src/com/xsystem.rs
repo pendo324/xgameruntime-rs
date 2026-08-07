@@ -116,6 +116,8 @@ impl IXSystem_Impl for XSystem_Impl {
         if console_id_size < X_SYSTEM_CONSOLE_ID_BYTES {
             return E_NOT_SUFFICIENT_BUFFER;
         }
+        // SAFETY: `console_id_size >= X_SYSTEM_CONSOLE_ID_BYTES` was checked above, which
+        // covers `ID.count_bytes() + 1`.
         unsafe {
             std::ptr::copy_nonoverlapping(ID.as_ptr(), console_id, ID.count_bytes() + 1);
         }
@@ -135,6 +137,8 @@ impl IXSystem_Impl for XSystem_Impl {
         if sandbox_id_size < X_SYSTEM_SANDBOX_ID_MAX_BYTES {
             return E_NOT_SUFFICIENT_BUFFER;
         }
+        // SAFETY: `sandbox_id_size >= X_SYSTEM_SANDBOX_ID_MAX_BYTES` was checked above,
+        // which covers `ID.count_bytes() + 1`.
         unsafe {
             std::ptr::copy_nonoverlapping(ID.as_ptr(), sandbox_id, ID.count_bytes() + 1);
         }
@@ -190,6 +194,8 @@ impl IXSystem_Impl for XSystem_Impl {
             return S_OK;
         }
         let len = (id.count_bytes() + 1).min(device_id_size as usize);
+        // SAFETY: `len` is clamped to `device_id_size`, and `device_id_size > 0` was
+        // checked above.
         unsafe {
             std::ptr::copy_nonoverlapping(id.as_ptr(), device_id, len);
         }

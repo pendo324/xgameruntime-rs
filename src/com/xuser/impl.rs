@@ -542,11 +542,9 @@ impl IXUserImpl_Impl for XUserObject_Impl {
                 }
                 unsafe {
                     if !picture.is_empty() {
-                        std::ptr::copy_nonoverlapping(
-                            picture.as_ptr(),
-                            buffer.cast::<u8>(),
-                            picture.len(),
-                        );
+                        // SAFETY: `buffer_size >= picture.len()` was checked above, and
+                        // non-null was checked for the non-empty case.
+                        crate::ffi_util::write_out_bytes(picture, buffer.cast::<u8>());
                     }
                     if !buffer_used.is_null() {
                         *buffer_used = picture.len();
@@ -723,18 +721,16 @@ impl IXUserImpl_Impl for XUserObject_Impl {
                     return E_POINTER;
                 }
 
+                // SAFETY: `buffer_size >= needed` was checked above, so `base` has room for
+                // the header plus both nul-terminated byte strings laid out below it.
                 unsafe {
                     let base = buffer.cast::<u8>();
                     let token_ptr = base.add(header_size);
                     let signature_ptr = token_ptr.add(token_size);
 
-                    std::ptr::copy_nonoverlapping(token.as_ptr(), token_ptr, token.len());
+                    crate::ffi_util::write_out_bytes(token.as_bytes(), token_ptr);
                     *token_ptr.add(token.len()) = 0;
-                    std::ptr::copy_nonoverlapping(
-                        signature.as_ptr(),
-                        signature_ptr,
-                        signature.len(),
-                    );
+                    crate::ffi_util::write_out_bytes(signature.as_bytes(), signature_ptr);
                     *signature_ptr.add(signature.len()) = 0;
 
                     let data = buffer.cast::<XUserGetTokenAndSignatureData>();
@@ -855,6 +851,8 @@ impl IXUserImpl_Impl for XUserObject_Impl {
                     return E_POINTER;
                 }
 
+                // SAFETY: `buffer_size >= needed` was checked above, so `base` has room for
+                // the header plus both UTF-16 strings laid out below it.
                 unsafe {
                     let base = buffer.cast::<u8>();
                     let token_ptr = base.add(header_size).cast::<u16>();
@@ -1110,12 +1108,9 @@ impl IXUserImpl3_Impl for XUserObject_Impl {
                 if result_token.is_null() {
                     return E_POINTER;
                 }
+                // SAFETY: `result_token_size >= needed` was checked above.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        result_token.cast::<u8>(),
-                        bytes.len(),
-                    );
+                    crate::ffi_util::write_out_bytes(bytes, result_token.cast::<u8>());
                     *result_token.cast::<u8>().add(bytes.len()) = 0;
                 }
                 if !result_token_used.is_null() {
@@ -1246,8 +1241,9 @@ impl IXUserGamertagImpl_Impl for XUserObject_Impl {
         if gamertag_size < needed {
             return E_NOT_SUFFICIENT_BUFFER;
         }
+        // SAFETY: `gamertag_size >= needed` was checked above.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), gamertag.cast::<u8>(), bytes.len());
+            crate::ffi_util::write_out_bytes(bytes, gamertag.cast::<u8>());
             *gamertag.cast::<u8>().add(bytes.len()) = 0;
         }
         S_OK
