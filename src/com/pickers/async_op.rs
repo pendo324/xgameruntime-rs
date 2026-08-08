@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_core::{GUID, HRESULT, IInspectable_Vtbl, IUnknown_Vtbl, Interface, RuntimeType};
-use windows_future::IAsyncOperation;
+use windows_future::{AsyncStatus, IAsyncInfo_Vtbl, IAsyncOperation};
 
 use super::deferred::run_later;
 use super::{E_POINTER, IID_IAGILE_OBJECT, S_OK, com_release, spy_get_iids, spy_get_trust_level};
@@ -29,11 +29,6 @@ use crate::diag::stub;
 const IID_IASYNC_INFO: GUID = GUID::from_u128(0x00000036_0000_0000_c000_000000000046);
 /// `E_ILLEGAL_METHOD_CALL`, which is what asking for results before they exist earns.
 const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
-
-/// `AsyncStatus`, in the order the ABI numbers it.
-const STATUS_STARTED: i32 = 0;
-const STATUS_COMPLETED: i32 = 1;
-const STATUS_ERROR: i32 = 3;
 
 /// What one picker family's pick produces, and how its operation identifies itself.
 ///
@@ -65,19 +60,9 @@ struct AsyncOperationVtbl {
     GetResults: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
 }
 
-#[repr(C)]
-struct AsyncInfoVtbl {
-    base__: IInspectable_Vtbl,
-    Id: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
-    Status: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
-    ErrorCode: unsafe extern "system" fn(*mut c_void, *mut HRESULT) -> HRESULT,
-    Cancel: unsafe extern "system" fn(*mut c_void) -> HRESULT,
-    Close: unsafe extern "system" fn(*mut c_void) -> HRESULT,
-}
-
 #[derive(Default)]
 struct OperationState {
-    status: i32,
+    status: AsyncStatus,
     error: HRESULT,
     /// Where the pick landed, or `None` for a cancelled pick - which is a successful completion
     /// with no file, not a failure.
@@ -93,7 +78,7 @@ struct OperationState {
 #[repr(C)]
 pub(super) struct PickOperation<T: PickOutcome> {
     operation_vtable: &'static AsyncOperationVtbl,
-    info_vtable: &'static AsyncInfoVtbl,
+    info_vtable: &'static IAsyncInfo_Vtbl,
     refs: AtomicU32,
     state: Mutex<OperationState>,
     outcome: PhantomData<fn() -> T>,
@@ -118,7 +103,7 @@ impl<T: PickOutcome> PickOperation<T> {
         GetResults: get_results::<T>,
     };
 
-    const INFO_VTABLE: &'static AsyncInfoVtbl = &AsyncInfoVtbl {
+    const INFO_VTABLE: &'static IAsyncInfo_Vtbl = &IAsyncInfo_Vtbl {
         base__: IInspectable_Vtbl {
             base: IUnknown_Vtbl {
                 QueryInterface: info_query_interface::<T>,
@@ -152,7 +137,7 @@ impl<T: PickOutcome> PickOperation<T> {
             // One reference for the caller, one for the deferred work below.
             refs: AtomicU32::new(2),
             state: Mutex::new(OperationState {
-                status: STATUS_STARTED,
+                status: AsyncStatus::Started,
                 ..Default::default()
             }),
             outcome: PhantomData,
@@ -192,7 +177,7 @@ impl<T: PickOutcome> PickOperation<T> {
             // One reference, for the caller.
             refs: AtomicU32::new(1),
             state: Mutex::new(OperationState {
-                status: STATUS_STARTED,
+                status: AsyncStatus::Started,
                 ..Default::default()
             }),
             outcome: PhantomData,
@@ -213,11 +198,11 @@ impl<T: PickOutcome> PickOperation<T> {
             let mut state = self.state.lock().expect("pick operation state poisoned");
             match outcome {
                 Ok(picked) => {
-                    state.status = STATUS_COMPLETED;
+                    state.status = AsyncStatus::Completed;
                     state.picked = picked;
                 }
                 Err(error) => {
-                    state.status = STATUS_ERROR;
+                    state.status = AsyncStatus::Error;
                     state.error = error;
                 }
             }
@@ -243,7 +228,7 @@ unsafe fn invoke_handler<T: PickOutcome>(handler: usize, operation: *mut c_void)
     #[repr(C)]
     struct CompletedHandlerVtbl {
         base__: IUnknown_Vtbl,
-        Invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT,
+        Invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, AsyncStatus) -> HRESULT,
     }
 
     // SAFETY: guaranteed by this function's contract - `handler` points at an interface whose
@@ -410,7 +395,7 @@ unsafe extern "system" fn set_completed<T: PickOutcome>(
                 com_add_ref(handler);
             }
             state.handler = handler as usize;
-            (previous, state.status != STATUS_STARTED)
+            (previous, state.status != AsyncStatus::Started)
         };
         if previous != 0 {
             com_release(previous as *mut c_void);
@@ -465,7 +450,7 @@ unsafe extern "system" fn get_results<T: PickOutcome>(
             .lock()
             .expect("pick operation state poisoned");
         match state.status {
-            STATUS_COMPLETED => {
+            AsyncStatus::Completed => {
                 let Some(path) = state.picked.clone() else {
                     // A cancelled pick: successful, with no file. This null is the whole reason
                     // these vtables are hand-written.
@@ -480,7 +465,7 @@ unsafe extern "system" fn get_results<T: PickOutcome>(
                 std::mem::forget(result);
                 S_OK
             }
-            STATUS_ERROR => state.error,
+            AsyncStatus::Error => state.error,
             _ => E_ILLEGAL_METHOD_CALL,
         }
     }
@@ -498,7 +483,7 @@ unsafe extern "system" fn info_id(_this: *mut c_void, value: *mut u32) -> HRESUL
 
 unsafe extern "system" fn info_status<T: PickOutcome>(
     this: *mut c_void,
-    value: *mut i32,
+    value: *mut AsyncStatus,
 ) -> HRESULT {
     if value.is_null() {
         return E_POINTER;
