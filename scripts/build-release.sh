@@ -30,8 +30,11 @@ cd "$root"
 
 # `.2.17` pins a glibc floor old enough for the runtimes games actually launch under; a
 # plain cargo build would bind to the build host's glibc. Both host arches are built from
-# whatever machine runs this script - zig's bundled cross-linker/sysroot makes the
-# aarch64 leg possible without an aarch64 host or `rustup target add`.
+# whatever machine runs this script - zig's bundled cross-linker/sysroot supplies the C
+# side of cross-linking, but rustc's own std/core for the non-host triple still has to
+# come from rustup, hence the `target add` for both (a no-op for whichever one is
+# already the host's default).
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 echo ">>> unixlib (native, via zig)"
 (cd unixlib && cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17)
 (cd unixlib && cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.17)
