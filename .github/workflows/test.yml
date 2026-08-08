@@ -112,6 +112,10 @@ jobs:
       - name: Run check
         run: cargo check --workspace
         working-directory: unixlib
+        env:
+          CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu
       - name: Run tests
         run: cargo test --workspace
         working-directory: unixlib
+        env:
+          CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu
