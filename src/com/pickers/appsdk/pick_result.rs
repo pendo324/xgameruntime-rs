@@ -42,10 +42,6 @@ impl IPickFileResult_Impl for PickedPath_Impl {
 /// What the open picker's operation completes with.
 impl PickOutcome for PickedPath {
     const LABEL: &'static str = "PickFileResultOperation";
-    const RUNTIME_CLASS_NAME: &'static str = concat!(
-        "Windows.Foundation.IAsyncOperation`1<",
-        "Microsoft.Windows.Storage.Pickers.PickFileResult>"
-    );
     type Value = PickFileResult;
 
     fn create_result(path: PathBuf) -> Self::Value {

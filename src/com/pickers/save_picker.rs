@@ -5,7 +5,6 @@
 //! for that interface before it touches a property. Naming both interfaces on the one object is
 //! what gives them the shared identity and reference count COM requires.
 
-use std::ffi::c_void;
 use std::sync::Mutex;
 
 use windows::shobjidl_core::{IInitializeWithWindow, IInitializeWithWindow_Impl};
@@ -157,9 +156,9 @@ impl IFileSavePicker_Impl for SavePicker_Impl {
     /// The save picker's `SuggestedSaveFile`, which nothing here tracks: it takes a `StorageFile`
     /// that would have to have come from a picker this runtime does not implement.
     ///
-    /// WinRT would report an unset reference as a null result, which a `Result<StorageFile>`
-    /// cannot carry - the same reason the async operation's vtable is written out by hand. A
-    /// failure is the honest answer available here, and nothing observed reads this property.
+    /// WinRT would report an unset reference as a null result, which is expressible but not
+    /// obviously worth expressing: nothing observed reads this property, and a failure says the
+    /// same thing more loudly if something starts to.
     fn SuggestedSaveFile(&self) -> Result<StorageFile> {
         stub!("FileSavePicker::SuggestedSaveFile (unset)");
         Err(super::E_FAIL.into())
@@ -177,12 +176,9 @@ impl IFileSavePicker_Impl for SavePicker_Impl {
             request.suggested_name,
             request.file_types.len()
         );
-        let operation =
-            PickOperation::<PickedFile>::start(Box::new(move || show_save_dialog(request)));
-
-        // SAFETY: `IAsyncOperation` is a `repr(transparent)` interface pointer; `start` returns a
-        // non-null one carrying the reference that passes to the caller here.
-        Ok(unsafe { std::mem::transmute::<*mut c_void, IAsyncOperation<StorageFile>>(operation) })
+        Ok(PickOperation::<PickedFile>::start(Box::new(move || {
+            show_save_dialog(request)
+        })))
     }
 }
 

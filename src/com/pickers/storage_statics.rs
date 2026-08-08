@@ -53,13 +53,7 @@ impl IStorageFileStatics_Impl for StorageFileStatics_Impl {
             stub!("StorageFile::GetFileFromPathAsync({path:?}) -> not found");
             Err(HRESULT_FILE_NOT_FOUND)
         };
-        let operation = PickOperation::<PickedFile>::completed(outcome);
-
-        // SAFETY: `IAsyncOperation` is a `repr(transparent)` interface pointer; `completed`
-        // returns a non-null one carrying the reference that passes to the caller here.
-        Ok(unsafe {
-            std::mem::transmute::<*mut std::ffi::c_void, IAsyncOperation<StorageFile>>(operation)
-        })
+        Ok(PickOperation::<PickedFile>::completed(outcome))
     }
 
     fn GetFileFromApplicationUriAsync(

@@ -1,6 +1,5 @@
 //! `Microsoft.Windows.Storage.Pickers.FileOpenPicker`.
 
-use std::ffi::c_void;
 use std::sync::Mutex;
 
 use windows_collections::IVector;
@@ -119,13 +118,9 @@ impl IFileOpenPicker_Impl for OpenPicker_Impl {
             request.file_types.len()
         );
 
-        let operation =
-            PickOperation::<PickedPath>::start(Box::new(move || show_open_dialog(request)));
-        // SAFETY: `IAsyncOperation` is a `repr(transparent)` interface pointer; `start` returns a
-        // non-null one carrying the reference that passes to the caller here.
-        Ok(unsafe {
-            std::mem::transmute::<*mut c_void, IAsyncOperation<PickFileResult>>(operation)
-        })
+        Ok(PickOperation::<PickedPath>::start(Box::new(move || {
+            show_open_dialog(request)
+        })))
     }
 
     /// Picking several files at once, which no title seen here does. The dialog can do it, but

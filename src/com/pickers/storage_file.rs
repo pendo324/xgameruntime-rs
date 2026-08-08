@@ -398,8 +398,6 @@ impl IStorageFilePropertiesWithAvailability_Impl for PickedFile_Impl {
 /// one means nothing has to rely on that.
 impl PickOutcome for PickedFile {
     const LABEL: &'static str = "StorageFileOperation";
-    const RUNTIME_CLASS_NAME: &'static str =
-        "Windows.Foundation.IAsyncOperation`1<Windows.Storage.StorageFile>";
     type Value = super::bindings::StorageFile;
 
     fn create_result(path: PathBuf) -> Self::Value {
