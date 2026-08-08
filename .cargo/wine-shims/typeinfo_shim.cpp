@@ -1,6 +1,6 @@
-// MSVC's `type_info` and the sized `operator delete` live in the C++ runtime, which
-// Wine does not ship. Nothing in this crate uses RTTI, but the linker still needs the
-// vtable and the delete symbol to resolve.
+// MSVC's `type_info` and `operator delete` live in the C++ runtime, which Wine does
+// not ship. Nothing in this crate uses RTTI, but the linker still needs the vtable
+// and both the sized and unsized delete symbols to resolve.
 extern "C" int strcmp(const char*, const char*);
 extern "C" void free(void*);
 
@@ -40,6 +40,10 @@ unsigned long long type_info::hash_code() const noexcept {
 }
 
 type_info::~type_info() {}
+
+void operator delete(void* p) noexcept {
+  free(p);
+}
 
 void operator delete(void* p, unsigned long long) noexcept {
   free(p);
