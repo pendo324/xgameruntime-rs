@@ -32,7 +32,7 @@ jobs:
           sudo wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
           sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/noble/winehq-noble.sources
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends winehq-staging clang lld zsh
+          sudo apt-get install -y --no-install-recommends winehq-devel clang lld zsh
       - uses: Swatinem/rust-cache@v2
       - name: Add the target
         run: rustup target add x86_64-pc-windows-msvc
