@@ -26,9 +26,7 @@
 use std::ffi::c_void;
 
 use windows::activation::{IActivationFactory, IActivationFactory_Impl};
-use windows_core::{
-    GUID, HRESULT, HSTRING, IInspectable, IUnknown_Vtbl, Interface, Result, implement,
-};
+use windows_core::{HRESULT, HSTRING, IInspectable, Interface, Result, implement};
 
 use crate::diag::stub;
 
@@ -52,57 +50,7 @@ const S_OK: HRESULT = HRESULT(0);
 const E_FAIL: HRESULT = HRESULT(0x80004005u32 as i32);
 const E_NOTIMPL: HRESULT = HRESULT(0x80004001u32 as i32);
 const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
-const E_NOINTERFACE: HRESULT = HRESULT(0x80004002u32 as i32);
 const CLASS_E_CLASSNOTAVAILABLE: HRESULT = HRESULT(0x80040111u32 as i32);
-
-/// `IAgileObject`, asked for by anything that marshals an object across apartments. Everything
-/// here is thread-safe by construction, so claiming it is honest.
-const IID_IAGILE_OBJECT: GUID = GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90);
-
-/// `IInspectable::GetIids`, which nothing observed here calls for anything but completeness.
-///
-/// # Safety
-/// `count` and `values` must be writable out-parameters or null.
-unsafe extern "system" fn spy_get_iids(
-    _this: *mut c_void,
-    count: *mut u32,
-    values: *mut *mut GUID,
-) -> HRESULT {
-    // SAFETY: COM guarantees both out-parameters are writable for the duration of the call.
-    unsafe {
-        if !count.is_null() {
-            *count = 0;
-        }
-        if !values.is_null() {
-            *values = std::ptr::null_mut();
-        }
-    }
-    S_OK
-}
-
-/// # Safety
-/// `value` must be a writable `TrustLevel` out-parameter or null.
-unsafe extern "system" fn spy_get_trust_level(_this: *mut c_void, value: *mut i32) -> HRESULT {
-    // SAFETY: COM guarantees `value` is writable for the duration of the call.
-    unsafe {
-        if !value.is_null() {
-            *value = 0; // BaseTrust
-        }
-    }
-    S_OK
-}
-
-/// Releases a COM interface pointer through its own vtable.
-///
-/// # Safety
-/// `this` must be a live COM interface pointer this caller holds a reference to.
-unsafe fn com_release(this: *mut c_void) -> u32 {
-    // SAFETY: guaranteed by this function's contract - slot 2 of any COM vtable is `Release`.
-    unsafe {
-        let vtable = *(this as *const *const IUnknown_Vtbl);
-        ((*vtable).Release)(this)
-    }
-}
 
 /// The classic class this module serves, spelled the way a title asks for it.
 const FILE_SAVE_PICKER: &str = "Windows.Storage.Pickers.FileSavePicker";
