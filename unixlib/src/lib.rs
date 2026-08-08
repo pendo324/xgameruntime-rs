@@ -24,6 +24,9 @@
 //! where Wine cannot interrupt it. Every socket carries `SO_SNDTIMEO`/`SO_RCVTIMEO`.
 
 #![warn(clippy::undocumented_unsafe_blocks)]
+// zig cc's linker doesn't recognize the GNU-ld `-O1` hint rustc passes by default when
+// linking with an ld/lld-flavored cc, and warns (harmlessly) instead of accepting it.
+#![allow(linker_messages)]
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};

@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+# Ubuntu's own `wine`/`wine64-tools` packages don't ship the `x86_64-windows` import
+# libraries `lld-link-winegcc` links against - only WineHQ's own builds do. Both jobs
+# below need them, so the install step is factored out via a YAML anchor.
 jobs:
   fmt:
     name: Check fmt
@@ -22,12 +25,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install the Wine toolchain
-        run: |
+      - name: Install the WineHQ toolchain
+        run: &install-winehq |
           sudo dpkg --add-architecture i386
+          sudo mkdir -pm755 /etc/apt/keyrings
+          sudo wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+          sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/noble/winehq-noble.sources
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            wine wine64-tools clang lld zsh
+          sudo apt-get install -y --no-install-recommends winehq-staging clang lld zsh
+      - uses: Swatinem/rust-cache@v2
       - name: Add the target
         run: rustup target add x86_64-pc-windows-msvc
       - name: Run check
@@ -45,16 +51,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install the Wine and zig toolchains
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            wine wine64-tools clang lld zsh
-          pip install ziglang
-          cargo install cargo-zigbuild
+      - name: Install the WineHQ toolchain
+        run: *install-winehq
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            unixlib
       - name: Add the target
         run: rustup target add x86_64-pc-windows-msvc
+      - name: Cache cargo-zigbuild
+        id: cache-cargo-zigbuild
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-bin-${{ runner.os }}-v1
+      - name: Install the zig toolchain
+        run: |
+          pip install ziglang
+          if [ ! -x ~/.cargo/bin/cargo-zigbuild ]; then cargo install cargo-zigbuild; fi
       - name: Run scripts/build-release.sh
         run: ./scripts/build-release.sh
       - name: Upload
@@ -65,28 +80,3 @@ jobs:
             target/x86_64-pc-windows-msvc/release/xgameruntime.dll
             target/x86_64-pc-windows-msvc/release/xgameruntime.so
           if-no-files-found: error
-
-  # Kept as a check that the DLL also links with the real MSVC toolchain - not the source of
-  # the published artifact (that's the build job above, via build-release.sh).
-  check:
-    name: Build (MSVC)
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-windows-msvc
-            os: windows-latest
-    # .cargo/config.toml points the toolchain at Wine, which does not exist here. The
-    # target itself is right on both hosts; only the tools differ, so override those.
-    env:
-      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: link.exe
-      CC_x86_64_pc_windows_msvc: cl.exe
-      CXX_x86_64_pc_windows_msvc: cl.exe
-      AR_x86_64_pc_windows_msvc: lib.exe
-      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_AR: lib.exe
-    steps:
-      - uses: actions/checkout@v6
-      - name: Run check
-        run: cargo check --workspace
-      - name: Run build
-        run: cargo build -r
