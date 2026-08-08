@@ -91,14 +91,32 @@ jobs:
           if [ ! -x ~/.cargo/bin/cargo-zigbuild ]; then cargo install cargo-zigbuild; fi
       - name: Run scripts/build-release.sh
         run: ./scripts/build-release.sh
-      - name: Upload
+      # Uploaded separately, not as one bundle, so a consumer that only needs one arch
+      # (xodus's combine-proton.sh) can fetch just that .so instead of the DLL and both
+      # arches every time.
+      - name: Upload DLL
         uses: actions/upload-artifact@v7
         with:
-          name: xgameruntime
+          name: xgameruntime-dll
           path: |
             target/x86_64-pc-windows-msvc/release/xgameruntime.dll
+            target/x86_64-pc-windows-msvc/release/xgameruntime.dll.sha512sum
+          if-no-files-found: error
+      - name: Upload x86_64 .so
+        uses: actions/upload-artifact@v7
+        with:
+          name: xgameruntime-x86_64-so
+          path: |
             target/x86_64-pc-windows-msvc/release/xgameruntime-x86_64.so
+            target/x86_64-pc-windows-msvc/release/xgameruntime-x86_64.so.sha512sum
+          if-no-files-found: error
+      - name: Upload aarch64 .so
+        uses: actions/upload-artifact@v7
+        with:
+          name: xgameruntime-aarch64-so
+          path: |
             target/x86_64-pc-windows-msvc/release/xgameruntime-aarch64.so
+            target/x86_64-pc-windows-msvc/release/xgameruntime-aarch64.so.sha512sum
           if-no-files-found: error
 
   unixlib-arm64:
