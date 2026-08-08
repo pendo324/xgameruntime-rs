@@ -21,7 +21,8 @@ lib_dir="$script_dir/wine-msvc-libs"
 # (/usr on Arch and Debian, /usr/local for a source build), so probe instead of guess.
 if [[ -z ${WINE_MSVC_LIB_DIR-} ]]; then
   for candidate in /usr/lib/wine/x86_64-windows /usr/local/lib/wine/x86_64-windows \
-                   /usr/lib64/wine/x86_64-windows /opt/wine-stable/lib/wine/x86_64-windows; do
+                   /usr/lib64/wine/x86_64-windows /opt/wine-stable/lib/wine/x86_64-windows \
+                   /opt/wine-devel/lib/wine/x86_64-windows /opt/wine-staging/lib/wine/x86_64-windows; do
     if [[ -f "$candidate/libkernel32.a" ]]; then
       WINE_MSVC_LIB_DIR=$candidate
       break
