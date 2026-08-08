@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 # truth both this DLL and xodus-service serialize against, so the two hand-mirrored copies
 # can't drift apart. Pinned by git rev so CI resolves it without a sibling checkout; override
 # to a local path in your own (untracked) `~/.cargo/config.toml` for development.
-xodus-ipc-models = { git = "https://github.com/pendo324/xodus", rev = "297db9194540ebaea9f3d331e326c1a6780dd2e9" }
+xodus-ipc-models = { git = "https://github.com/pendo324/xodus", rev = "c33e3d01a02bb2339ef2579de5b4176f629c61d6" }
 serde = { version = "1", features = ["derive"] }
 quick-xml = { version = "0.40.1", features = ["serialize"] }
 
