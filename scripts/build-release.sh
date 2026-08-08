@@ -28,16 +28,20 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-# `x86_64-unknown-linux-gnu.2.17` pins a glibc floor old enough for the runtimes games
-# actually launch under; a plain cargo build would bind to the build host's glibc.
+# `.2.17` pins a glibc floor old enough for the runtimes games actually launch under; a
+# plain cargo build would bind to the build host's glibc. Both host arches are built from
+# whatever machine runs this script - zig's bundled cross-linker/sysroot makes the
+# aarch64 leg possible without an aarch64 host or `rustup target add`.
 echo ">>> unixlib (native, via zig)"
 (cd unixlib && cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17)
+(cd unixlib && cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.17)
 
 echo ">>> dll (x86_64-pc-windows-msvc)"
 cargo build --release
 
 dll="target/x86_64-pc-windows-msvc/release/xgameruntime.dll"
-so="unixlib/target/x86_64-unknown-linux-gnu/release/libxgameruntime.so"
+so_x86_64="unixlib/target/x86_64-unknown-linux-gnu/release/libxgameruntime.so"
+so_aarch64="unixlib/target/aarch64-unknown-linux-gnu/release/libxgameruntime.so"
 
 # `winebuild --builtin` writes the 32-byte signature over the DOS stub at file offset 0x40,
 # where the server looks for it (server/mapping.c). Using Wine's own tool rather than patching
@@ -56,10 +60,24 @@ else
     winebuild --builtin "$dll"
 fi
 
-# Named for the PE it pairs with, because that pairing is by filename.
-cp "$so" "target/x86_64-pc-windows-msvc/release/xgameruntime.so"
+# Wine's find_builtin_dll pairs a `.so` with its PE by swapping the extension, so the file
+# that actually loads at deploy time must be plain `xgameruntime.so` - these arch-suffixed
+# names exist so a single build output can carry both variants for a cross-arch deployer
+# (xodus's combine-proton.sh) to pick from and rename. A same-host deployer needs no
+# renaming step of its own, so the native arch's copy is also dropped in under the plain
+# name - this is what `xodus-cli run-umu` (via hack/build.sh) installs directly.
+cp "$so_x86_64" "target/x86_64-pc-windows-msvc/release/xgameruntime-x86_64.so"
+cp "$so_aarch64" "target/x86_64-pc-windows-msvc/release/xgameruntime-aarch64.so"
+case $(uname -m) in
+    x86_64) native_so=$so_x86_64 ;;
+    aarch64|arm64) native_so=$so_aarch64 ;;
+    *) echo "!! unsupported host arch: $(uname -m)" >&2; exit 1 ;;
+esac
+cp "$native_so" "target/x86_64-pc-windows-msvc/release/xgameruntime.so"
 
 echo
 echo "built:"
 echo "  $root/$dll"
 echo "  $root/target/x86_64-pc-windows-msvc/release/xgameruntime.so"
+echo "  $root/target/x86_64-pc-windows-msvc/release/xgameruntime-x86_64.so"
+echo "  $root/target/x86_64-pc-windows-msvc/release/xgameruntime-aarch64.so"

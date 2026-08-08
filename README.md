@@ -18,11 +18,13 @@ Use the script:
 ./scripts/build-release.sh
 ```
 
-It produces the two files that deploy together:
+It produces the DLL plus a `.so` per host arch it built on, since the DLL is architecture-independent PE code but the `.so` is native:
 
 ```
 target/x86_64-pc-windows-msvc/release/xgameruntime.dll
-target/x86_64-pc-windows-msvc/release/xgameruntime.so
+target/x86_64-pc-windows-msvc/release/xgameruntime.so           # matches the build host's own arch
+target/x86_64-pc-windows-msvc/release/xgameruntime-x86_64.so
+target/x86_64-pc-windows-msvc/release/xgameruntime-aarch64.so
 ```
 
 A plain `cargo build` is **not** a substitute. It builds only the PE half, and it skips the post-link step cargo has no hook for: stamping the 32-byte `"Wine builtin DLL"` signature at file offset `0x40` with `winebuild --builtin`. That signature decides the whole loading strategy, and the two strategies are mutually exclusive — signed, the DLL loads as a builtin and Wine will pair the `.so` with it, but `xgameruntime=n` makes `LoadLibrary` fail outright; unsigned, it loads natively and the `.so` is never looked for. The script's header comment carries the details.
