@@ -78,5 +78,21 @@ jobs:
           name: xgameruntime
           path: |
             target/x86_64-pc-windows-msvc/release/xgameruntime.dll
-            target/x86_64-pc-windows-msvc/release/xgameruntime.so
+            target/x86_64-pc-windows-msvc/release/xgameruntime-x86_64.so
+            target/x86_64-pc-windows-msvc/release/xgameruntime-aarch64.so
           if-no-files-found: error
+
+  unixlib-arm64:
+    name: Check and test unixlib (native arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: unixlib
+      - name: Run check
+        run: cargo check --workspace
+        working-directory: unixlib
+      - name: Run tests
+        run: cargo test --workspace
+        working-directory: unixlib
