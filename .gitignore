@@ -17,3 +17,4 @@
 /scripts/*
 !/scripts/build-release.sh
 !/scripts/generate-appsdk-bindings.sh
+!/scripts/generate-classic-bindings.sh

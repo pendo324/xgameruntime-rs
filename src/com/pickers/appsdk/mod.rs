@@ -11,8 +11,8 @@
 //! answers `IFileOpenPickerFactory::CreateInstance(WindowId)` as well as `IActivationFactory`,
 //! and the window travels with the picker from the moment it exists.
 //!
-//! Unlike the classic pickers, these interfaces come with generated `_Impl` traits - see
-//! [`bindings`] - so the vtables come from `#[implement]` rather than by hand.
+//! The interfaces come with generated `_Impl` traits - see [`bindings`] - so the vtables come
+//! from `#[implement]` rather than by hand.
 //!
 //! Only the open picker is implemented. The save and folder pickers in this namespace are
 //! separate classes, and nothing that runs here has asked for them.

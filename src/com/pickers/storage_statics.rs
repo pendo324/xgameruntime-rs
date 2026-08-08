@@ -13,18 +13,17 @@
 //! and streamed-file callbacks, neither of which a title can reach without more of WinRT than
 //! this runtime has.
 
-use std::ffi::c_void;
-use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 
-use windows::Storage::{IStorageFileStatics, IStorageFileStatics_Vtbl};
-use windows_core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, IUnknown_Vtbl, Interface};
+use windows_core::{HRESULT, HSTRING, Ref, Result, implement};
+use windows_future::IAsyncOperation;
 
 use super::async_op::PickOperation;
-use super::storage_file::PickedFile;
-use super::{
-    E_NOINTERFACE, E_NOTIMPL, E_POINTER, IID_IAGILE_OBJECT, S_OK, spy_get_iids, spy_get_trust_level,
+use super::bindings::{
+    IRandomAccessStreamReference, IStorageFile, IStorageFileStatics, IStorageFileStatics_Impl,
+    StorageFile, StreamedFileDataRequestedHandler, Uri,
 };
+use super::storage_file::PickedFile;
 use crate::diag::stub;
 
 /// The class this module serves, spelled the way a title asks for it.
@@ -34,95 +33,16 @@ pub(super) const STORAGE_FILE: &str = "Windows.Storage.StorageFile";
 /// nothing.
 const HRESULT_FILE_NOT_FOUND: HRESULT = HRESULT(0x80070002u32 as i32);
 
-/// The factory is stateless, so one static instance serves every lookup and its reference count
-/// never has to mean anything.
-#[repr(C)]
-struct StorageFileStatics {
-    vtable: &'static IStorageFileStatics_Vtbl,
-}
+/// The statics object behind that class name.
+///
+/// It holds nothing - every route is a function of its arguments - so a fresh one per activation
+/// is as good as a shared one, and lets `#[implement]` do the reference counting.
+#[implement(IStorageFileStatics)]
+struct StorageFileStatics;
 
-// SAFETY: the factory holds no state, so sharing the one static instance across threads is safe.
-unsafe impl Sync for StorageFileStatics {}
-
-static STATICS: StorageFileStatics = StorageFileStatics {
-    vtable: &STATICS_VTABLE,
-};
-
-/// Returns the factory for this class, which the caller does not have to release.
-pub(super) fn activation_factory() -> *mut c_void {
-    (&STATICS) as *const _ as *mut c_void
-}
-
-unsafe extern "system" fn statics_query_interface(
-    this: *mut c_void,
-    iid: *const GUID,
-    interface: *mut *mut c_void,
-) -> HRESULT {
-    if iid.is_null() || interface.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: both pointers were just null-checked and COM guarantees they stay valid here.
-    unsafe {
-        let requested = *iid;
-        let known = requested == windows_core::IUnknown::IID
-            || requested == windows_core::IInspectable::IID
-            || requested == IStorageFileStatics::IID
-            || requested == IID_IAGILE_OBJECT;
-        if known {
-            *interface = this;
-            S_OK
-        } else {
-            // `IActivationFactory` lands here: `StorageFile` has no constructor, so there is
-            // nothing for `ActivateInstance` to make, and refusing says exactly that.
-            stub!("StorageFileStatics::QueryInterface({requested:?}) -> E_NOINTERFACE");
-            *interface = std::ptr::null_mut();
-            E_NOINTERFACE
-        }
-    }
-}
-
-/// The factory outlives every caller, so its reference count is a constant.
-unsafe extern "system" fn statics_add_ref(_this: *mut c_void) -> u32 {
-    2
-}
-
-unsafe extern "system" fn statics_release(_this: *mut c_void) -> u32 {
-    1
-}
-
-unsafe extern "system" fn statics_runtime_class_name(
-    _this: *mut c_void,
-    value: *mut *mut c_void,
-) -> HRESULT {
-    if value.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: `value` was just null-checked; the string is handed to the caller to free.
-    unsafe {
-        *value = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from(STORAGE_FILE));
-    }
-    S_OK
-}
-
-/// # Safety
-/// `path` must be a valid `HSTRING` or null, and `operation` a writable out-parameter.
-unsafe extern "system" fn GetFileFromPathAsync(
-    _this: *mut c_void,
-    path: *mut c_void,
-    operation: *mut *mut c_void,
-) -> HRESULT {
-    if operation.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: `operation` was just null-checked. The path belongs to the caller, so it is read
-    // without taking ownership - dropping it here would free a string the caller still uses.
-    unsafe {
-        *operation = std::ptr::null_mut();
-        if path.is_null() {
-            return E_POINTER;
-        }
-        let borrowed = ManuallyDrop::new(std::mem::transmute::<*mut c_void, HSTRING>(path));
-        let path = PathBuf::from(borrowed.to_string_lossy());
+impl IStorageFileStatics_Impl for StorageFileStatics_Impl {
+    fn GetFileFromPathAsync(&self, path: &HSTRING) -> Result<IAsyncOperation<StorageFile>> {
+        let path = PathBuf::from(path.to_string_lossy());
 
         // A file that is not there is the one failure a caller of this is written to expect, and
         // it is worth telling apart from anything else that could go wrong.
@@ -133,64 +53,75 @@ unsafe extern "system" fn GetFileFromPathAsync(
             stub!("StorageFile::GetFileFromPathAsync({path:?}) -> not found");
             Err(HRESULT_FILE_NOT_FOUND)
         };
-        *operation = PickOperation::<PickedFile>::completed(outcome);
+        let operation = PickOperation::<PickedFile>::completed(outcome);
+
+        // SAFETY: `IAsyncOperation` is a `repr(transparent)` interface pointer; `completed`
+        // returns a non-null one carrying the reference that passes to the caller here.
+        Ok(unsafe {
+            std::mem::transmute::<*mut std::ffi::c_void, IAsyncOperation<StorageFile>>(operation)
+        })
     }
-    S_OK
+
+    fn GetFileFromApplicationUriAsync(
+        &self,
+        _uri: Ref<Uri>,
+    ) -> Result<IAsyncOperation<StorageFile>> {
+        stub!("StorageFile::GetFileFromApplicationUriAsync (unimplemented)");
+        Err(super::E_NOTIMPL.into())
+    }
+
+    fn CreateStreamedFileAsync(
+        &self,
+        _displayNameWithExtension: &HSTRING,
+        _dataRequested: Ref<StreamedFileDataRequestedHandler>,
+        _thumbnail: Ref<IRandomAccessStreamReference>,
+    ) -> Result<IAsyncOperation<StorageFile>> {
+        stub!("StorageFile::CreateStreamedFileAsync (unimplemented)");
+        Err(super::E_NOTIMPL.into())
+    }
+
+    fn ReplaceWithStreamedFileAsync(
+        &self,
+        _fileToReplace: Ref<IStorageFile>,
+        _dataRequested: Ref<StreamedFileDataRequestedHandler>,
+        _thumbnail: Ref<IRandomAccessStreamReference>,
+    ) -> Result<IAsyncOperation<StorageFile>> {
+        stub!("StorageFile::ReplaceWithStreamedFileAsync (unimplemented)");
+        Err(super::E_NOTIMPL.into())
+    }
+
+    fn CreateStreamedFileFromUriAsync(
+        &self,
+        _displayNameWithExtension: &HSTRING,
+        _uri: Ref<Uri>,
+        _thumbnail: Ref<IRandomAccessStreamReference>,
+    ) -> Result<IAsyncOperation<StorageFile>> {
+        stub!("StorageFile::CreateStreamedFileFromUriAsync (unimplemented)");
+        Err(super::E_NOTIMPL.into())
+    }
+
+    fn ReplaceWithStreamedFileFromUriAsync(
+        &self,
+        _fileToReplace: Ref<IStorageFile>,
+        _uri: Ref<Uri>,
+        _thumbnail: Ref<IRandomAccessStreamReference>,
+    ) -> Result<IAsyncOperation<StorageFile>> {
+        stub!("StorageFile::ReplaceWithStreamedFileFromUriAsync (unimplemented)");
+        Err(super::E_NOTIMPL.into())
+    }
 }
 
-/// The routes that build a file out of something other than a path.
+/// Returns the factory for this class, with a reference the caller owns.
 ///
-/// # Safety
-/// `operation` must be a writable out-parameter.
-unsafe extern "system" fn refuse_2(
-    _this: *mut c_void,
-    _one: *mut c_void,
-    operation: *mut *mut c_void,
-) -> HRESULT {
-    stub!("StorageFileStatics: unimplemented route");
-    // SAFETY: COM guarantees `operation` is writable for the duration of the call.
+/// `StorageFile` has no constructor, so this object answers `IStorageFileStatics` and not
+/// `IActivationFactory`: there is nothing for `ActivateInstance` to make.
+pub(super) fn activation_factory() -> *mut std::ffi::c_void {
+    let statics: IStorageFileStatics = StorageFileStatics.into();
+    // SAFETY: `IStorageFileStatics` is a `repr(transparent)` interface pointer, and the reference
+    // it holds passes to the caller rather than being dropped here.
     unsafe {
-        if !operation.is_null() {
-            *operation = std::ptr::null_mut();
-        }
+        let raw = std::mem::transmute_copy(&statics);
+        std::mem::forget(statics);
+        raw
     }
-    E_NOTIMPL
 }
-
-/// # Safety
-/// `operation` must be a writable out-parameter.
-unsafe extern "system" fn refuse_4(
-    _this: *mut c_void,
-    _one: *mut c_void,
-    _two: *mut c_void,
-    _three: *mut c_void,
-    operation: *mut *mut c_void,
-) -> HRESULT {
-    stub!("StorageFileStatics: unimplemented route");
-    // SAFETY: COM guarantees `operation` is writable for the duration of the call.
-    unsafe {
-        if !operation.is_null() {
-            *operation = std::ptr::null_mut();
-        }
-    }
-    E_NOTIMPL
-}
-
-static STATICS_VTABLE: IStorageFileStatics_Vtbl = IStorageFileStatics_Vtbl {
-    base__: IInspectable_Vtbl {
-        base: IUnknown_Vtbl {
-            QueryInterface: statics_query_interface,
-            AddRef: statics_add_ref,
-            Release: statics_release,
-        },
-        GetIids: spy_get_iids,
-        GetRuntimeClassName: statics_runtime_class_name,
-        GetTrustLevel: spy_get_trust_level,
-    },
-    GetFileFromPathAsync,
-    GetFileFromApplicationUriAsync: refuse_2,
-    CreateStreamedFileAsync: refuse_4,
-    ReplaceWithStreamedFileAsync: refuse_4,
-    CreateStreamedFileFromUriAsync: refuse_4,
-    ReplaceWithStreamedFileFromUriAsync: refuse_4,
-};

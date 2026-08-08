@@ -1,29 +1,23 @@
 //! `Windows.Storage.Pickers.FileSavePicker`.
 //!
-//! The vtable is written out by hand because `windows-rs` generates no `_Impl` trait for the
-//! picker interfaces - only the raw `*_Vtbl` structs - so there is no `#[implement]` shortcut.
-//!
-//! The object carries two vtables. A packaged app's picker takes its owner window from the app
-//! view, but a Win32 host has none, so it hands one over through `IInitializeWithWindow`
-//! instead - and every title seen here asks for that interface before it touches a property.
-//! Both vtables live in the same allocation and share one reference count, which is what COM's
-//! identity rule requires.
+//! A packaged app's picker takes its owner window from the app view, but a Win32 host has none,
+//! so it hands one over through `IInitializeWithWindow` instead - and every title seen here asks
+//! for that interface before it touches a property. Naming both interfaces on the one object is
+//! what gives them the shared identity and reference count COM requires.
 
 use std::ffi::c_void;
-use std::mem::{ManuallyDrop, offset_of};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows::Storage::Pickers::{IFileSavePicker, IFileSavePicker_Vtbl, PickerLocationId};
-use windows::shobjidl_core::{IInitializeWithWindow, IInitializeWithWindow_Vtbl};
+use windows::shobjidl_core::{IInitializeWithWindow, IInitializeWithWindow_Impl};
 use windows::windef::HWND;
 use windows_collections::{IMap, IVector};
-use windows_core::{GUID, HRESULT, HSTRING, IInspectable_Vtbl, IUnknown_Vtbl, Interface};
+use windows_core::{HSTRING, Ref, Result, implement};
+use windows_future::IAsyncOperation;
 
 use super::async_op::PickOperation;
+use super::bindings::{IFileSavePicker, IFileSavePicker_Impl, PickerLocationId, StorageFile};
 use super::dialog::{SaveRequest, show_save_dialog};
 use super::storage_file::PickedFile;
-use super::{E_NOINTERFACE, E_POINTER, IID_IAGILE_OBJECT, S_OK, spy_get_iids, spy_get_trust_level};
 use crate::diag::stub;
 
 /// The properties a title sets before it picks.
@@ -38,23 +32,18 @@ struct PickerState {
     owner: isize,
 }
 
-#[repr(C)]
-pub(super) struct FileSavePickerObject {
-    picker_vtable: &'static IFileSavePicker_Vtbl,
-    init_vtable: &'static IInitializeWithWindow_Vtbl,
-    refs: AtomicU32,
+#[implement(IFileSavePicker, IInitializeWithWindow)]
+pub(super) struct SavePicker {
     state: Mutex<PickerState>,
     /// The file-type map, created once and handed out by reference: a title inserts its types
     /// into whatever `FileTypeChoices` returns, so returning a fresh map would discard them.
     choices: IMap<HSTRING, IVector<HSTRING>>,
 }
 
-impl FileSavePickerObject {
-    pub(super) fn create() -> *mut c_void {
-        let object = Box::new(FileSavePickerObject {
-            picker_vtable: &PICKER_VTABLE,
-            init_vtable: &INITIALIZE_VTABLE,
-            refs: AtomicU32::new(1),
+impl SavePicker {
+    /// Builds a picker and hands back the reference the caller owns.
+    pub(super) fn create() -> IFileSavePicker {
+        SavePicker {
             state: Mutex::new(PickerState {
                 settings_identifier: HSTRING::new(),
                 suggested_start_location: PickerLocationId::DocumentsLibrary,
@@ -64,8 +53,8 @@ impl FileSavePickerObject {
                 owner: 0,
             }),
             choices: IMap::from(std::collections::BTreeMap::new()),
-        });
-        Box::into_raw(object).cast()
+        }
+        .into()
     }
 
     /// Flattens the picker's live COM state into something the dialog thread can own.
@@ -110,323 +99,97 @@ impl FileSavePickerObject {
     }
 }
 
-/// # Safety
-/// `this` must be a live picker seen through its `IFileSavePicker` vtable.
-unsafe fn picker<'a>(this: *mut c_void) -> &'a FileSavePickerObject {
-    // SAFETY: guaranteed by this function's contract.
-    unsafe { &*this.cast::<FileSavePickerObject>() }
-}
-
-/// # Safety
-/// `this` must be a live picker seen through its `IInitializeWithWindow` vtable.
-unsafe fn picker_from_init<'a>(this: *mut c_void) -> &'a FileSavePickerObject {
-    // SAFETY: `this` addresses the `init_vtable` field, so the object starts at that offset back.
-    unsafe {
-        &*this
-            .cast::<u8>()
-            .sub(offset_of!(FileSavePickerObject, init_vtable))
-            .cast::<FileSavePickerObject>()
-    }
-}
-
-/// Reads an `HSTRING` argument without taking ownership of it: the caller still owns the string
-/// it passed, and dropping it here would free a string it goes on to use.
-///
-/// # Safety
-/// `value` must be a valid `HSTRING` or null.
-unsafe fn borrowed_hstring(value: *mut c_void) -> HSTRING {
-    if value.is_null() {
-        return HSTRING::new();
-    }
-    // SAFETY: guaranteed by this function's contract.
-    unsafe { (*ManuallyDrop::new(std::mem::transmute::<*mut c_void, HSTRING>(value))).clone() }
-}
-
-/// Hands an `HSTRING` to a caller that will free it.
-///
-/// # Safety
-/// `out` must be a writable out-parameter.
-unsafe fn write_hstring(out: *mut *mut c_void, value: HSTRING) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: `out` was just null-checked; ownership of the string passes to the caller.
-    unsafe { *out = std::mem::transmute::<HSTRING, *mut c_void>(value) };
-    S_OK
-}
-
 /// A property backed by a string, in the two halves WinRT splits it into.
 macro_rules! string_property {
     ($get:ident, $set:ident, $field:ident) => {
-        /// # Safety
-        /// `this` must be a live picker and `out` a writable out-parameter.
-        unsafe extern "system" fn $get(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
-            // SAFETY: guaranteed by this function's contract.
-            unsafe {
-                let value = picker(this)
-                    .state
-                    .lock()
-                    .expect("picker state poisoned")
-                    .$field
-                    .clone();
-                write_hstring(out, value)
-            }
+        fn $get(&self) -> Result<HSTRING> {
+            Ok(self
+                .state
+                .lock()
+                .expect("picker state poisoned")
+                .$field
+                .clone())
         }
 
-        /// # Safety
-        /// `this` must be a live picker and `value` a valid `HSTRING` or null.
-        unsafe extern "system" fn $set(this: *mut c_void, value: *mut c_void) -> HRESULT {
-            // SAFETY: guaranteed by this function's contract.
-            unsafe {
-                let value = borrowed_hstring(value);
-                stub!("FileSavePicker::{}({value:?})", stringify!($set));
-                picker(this)
-                    .state
-                    .lock()
-                    .expect("picker state poisoned")
-                    .$field = value;
-            }
-            S_OK
+        fn $set(&self, value: &HSTRING) -> Result<()> {
+            stub!("FileSavePicker::{}({value:?})", stringify!($set));
+            self.state.lock().expect("picker state poisoned").$field = value.clone();
+            Ok(())
         }
     };
 }
 
-string_property!(
-    SettingsIdentifier,
-    SetSettingsIdentifier,
-    settings_identifier
-);
-string_property!(CommitButtonText, SetCommitButtonText, commit_button_text);
-string_property!(
-    DefaultFileExtension,
-    SetDefaultFileExtension,
-    default_file_extension
-);
-string_property!(SuggestedFileName, SetSuggestedFileName, suggested_file_name);
+impl IFileSavePicker_Impl for SavePicker_Impl {
+    string_property!(
+        SettingsIdentifier,
+        SetSettingsIdentifier,
+        settings_identifier
+    );
+    string_property!(CommitButtonText, SetCommitButtonText, commit_button_text);
+    string_property!(
+        DefaultFileExtension,
+        SetDefaultFileExtension,
+        default_file_extension
+    );
+    string_property!(SuggestedFileName, SetSuggestedFileName, suggested_file_name);
 
-/// # Safety
-/// `this` must be a live picker and `out` a writable out-parameter.
-unsafe extern "system" fn SuggestedStartLocation(
-    this: *mut c_void,
-    out: *mut PickerLocationId,
-) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: `out` was just null-checked; `this` is live per the vtable contract.
-    unsafe {
-        *out = picker(this)
+    fn SuggestedStartLocation(&self) -> Result<PickerLocationId> {
+        Ok(self
             .state
             .lock()
             .expect("picker state poisoned")
-            .suggested_start_location;
+            .suggested_start_location)
     }
-    S_OK
-}
 
-/// # Safety
-/// `this` must be a live picker.
-unsafe extern "system" fn SetSuggestedStartLocation(
-    this: *mut c_void,
-    value: PickerLocationId,
-) -> HRESULT {
-    // SAFETY: guaranteed by this function's contract.
-    unsafe {
-        picker(this)
-            .state
+    fn SetSuggestedStartLocation(&self, value: PickerLocationId) -> Result<()> {
+        self.state
             .lock()
             .expect("picker state poisoned")
             .suggested_start_location = value;
+        Ok(())
     }
-    S_OK
-}
 
-/// # Safety
-/// `this` must be a live picker and `out` a writable out-parameter.
-unsafe extern "system" fn FileTypeChoices(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
+    fn FileTypeChoices(&self) -> Result<IMap<HSTRING, IVector<HSTRING>>> {
+        // Cloned rather than moved, so the picker keeps holding the one the title writes into.
+        Ok(self.choices.clone())
     }
-    // SAFETY: `out` was just null-checked; `this` is live per the vtable contract. The map is
-    // cloned rather than moved, so the picker keeps holding the one the title writes into.
-    unsafe {
-        let choices = picker(this).choices.clone();
-        *out = std::mem::transmute_copy(&choices);
-        std::mem::forget(choices);
-    }
-    S_OK
-}
 
-/// The save picker's `SuggestedSaveFile`, which nothing here tracks: it takes a `StorageFile`
-/// that would have to have come from a picker this runtime does not implement.
-///
-/// # Safety
-/// `out` must be a writable out-parameter.
-unsafe extern "system" fn SuggestedSaveFile(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
+    /// The save picker's `SuggestedSaveFile`, which nothing here tracks: it takes a `StorageFile`
+    /// that would have to have come from a picker this runtime does not implement.
+    ///
+    /// WinRT would report an unset reference as a null result, which a `Result<StorageFile>`
+    /// cannot carry - the same reason the async operation's vtable is written out by hand. A
+    /// failure is the honest answer available here, and nothing observed reads this property.
+    fn SuggestedSaveFile(&self) -> Result<StorageFile> {
+        stub!("FileSavePicker::SuggestedSaveFile (unset)");
+        Err(super::E_FAIL.into())
     }
-    // SAFETY: `out` was just null-checked; an unset reference is spelled null.
-    unsafe { *out = std::ptr::null_mut() };
-    S_OK
-}
 
-/// # Safety
-/// `this` must be a live picker.
-unsafe extern "system" fn SetSuggestedSaveFile(_this: *mut c_void, _value: *mut c_void) -> HRESULT {
-    stub!("FileSavePicker::SetSuggestedSaveFile (ignored)");
-    S_OK
-}
-
-/// # Safety
-/// `this` must be a live picker and `out` a writable out-parameter.
-unsafe extern "system" fn PickSaveFileAsync(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
+    fn SetSuggestedSaveFile(&self, _value: Ref<StorageFile>) -> Result<()> {
+        stub!("FileSavePicker::SetSuggestedSaveFile (ignored)");
+        Ok(())
     }
-    // SAFETY: `out` was just null-checked; `this` is live per the vtable contract.
-    unsafe {
-        let request = picker(this).to_request();
+
+    fn PickSaveFileAsync(&self) -> Result<IAsyncOperation<StorageFile>> {
+        let request = self.to_request();
         stub!(
             "FileSavePicker::PickSaveFileAsync name={:?} types={}",
             request.suggested_name,
             request.file_types.len()
         );
-        *out = PickOperation::<PickedFile>::start(Box::new(move || show_save_dialog(request)));
+        let operation =
+            PickOperation::<PickedFile>::start(Box::new(move || show_save_dialog(request)));
+
+        // SAFETY: `IAsyncOperation` is a `repr(transparent)` interface pointer; `start` returns a
+        // non-null one carrying the reference that passes to the caller here.
+        Ok(unsafe { std::mem::transmute::<*mut c_void, IAsyncOperation<StorageFile>>(operation) })
     }
-    S_OK
 }
 
-/// # Safety
-/// `this` must be a live picker seen through its `IInitializeWithWindow` vtable.
-unsafe extern "system" fn initialize_with_window(this: *mut c_void, hwnd: HWND) -> HRESULT {
-    // SAFETY: guaranteed by this function's contract.
-    unsafe {
+impl IInitializeWithWindow_Impl for SavePicker_Impl {
+    fn Initialize(&self, hwnd: HWND) -> Result<()> {
         stub!("FileSavePicker::Initialize(hwnd={:?})", hwnd.0);
-        picker_from_init(this)
-            .state
-            .lock()
-            .expect("picker state poisoned")
-            .owner = hwnd.0 as isize;
-    }
-    S_OK
-}
-
-unsafe extern "system" fn picker_query_interface(
-    this: *mut c_void,
-    iid: *const GUID,
-    interface: *mut *mut c_void,
-) -> HRESULT {
-    if iid.is_null() || interface.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: both pointers were just null-checked, and `this` is live per the vtable contract.
-    unsafe {
-        let requested = *iid;
-        let object = picker(this);
-        if requested == IInitializeWithWindow::IID {
-            object.refs.fetch_add(1, Ordering::Relaxed);
-            *interface = (&object.init_vtable) as *const _ as *mut c_void;
-            return S_OK;
-        }
-        let known = requested == windows_core::IUnknown::IID
-            || requested == windows_core::IInspectable::IID
-            || requested == IFileSavePicker::IID
-            || requested == IID_IAGILE_OBJECT;
-        if known {
-            object.refs.fetch_add(1, Ordering::Relaxed);
-            *interface = this;
-            S_OK
-        } else {
-            stub!("FileSavePicker::QueryInterface({requested:?}) -> E_NOINTERFACE");
-            *interface = std::ptr::null_mut();
-            E_NOINTERFACE
-        }
+        self.state.lock().expect("picker state poisoned").owner = hwnd.0 as isize;
+        Ok(())
     }
 }
-
-unsafe extern "system" fn init_query_interface(
-    this: *mut c_void,
-    iid: *const GUID,
-    interface: *mut *mut c_void,
-) -> HRESULT {
-    // SAFETY: resolved back to the object, whose QueryInterface shares this contract.
-    unsafe {
-        let object = picker_from_init(this);
-        picker_query_interface(object as *const _ as *mut c_void, iid, interface)
-    }
-}
-
-unsafe extern "system" fn picker_add_ref(this: *mut c_void) -> u32 {
-    // SAFETY: `this` is a live picker per the vtable contract.
-    unsafe { picker(this) }.refs.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-unsafe extern "system" fn picker_release(this: *mut c_void) -> u32 {
-    // SAFETY: `this` is a live picker per the vtable contract.
-    let remaining = unsafe { picker(this) }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
-    if remaining == 0 {
-        // SAFETY: the count reached zero, so no method can still be running against it.
-        drop(unsafe { Box::from_raw(this.cast::<FileSavePickerObject>()) });
-    }
-    remaining
-}
-
-unsafe extern "system" fn init_add_ref(this: *mut c_void) -> u32 {
-    // SAFETY: resolved back to the object, whose AddRef shares this contract.
-    unsafe { picker_add_ref(picker_from_init(this) as *const _ as *mut c_void) }
-}
-
-unsafe extern "system" fn init_release(this: *mut c_void) -> u32 {
-    // SAFETY: resolved back to the object, whose Release shares this contract.
-    unsafe { picker_release(picker_from_init(this) as *const _ as *mut c_void) }
-}
-
-unsafe extern "system" fn picker_runtime_class_name(
-    _this: *mut c_void,
-    value: *mut *mut c_void,
-) -> HRESULT {
-    // SAFETY: forwarded to the shared helper, which null-checks `value` itself.
-    unsafe {
-        write_hstring(
-            value,
-            HSTRING::from("Windows.Storage.Pickers.FileSavePicker"),
-        )
-    }
-}
-
-static PICKER_VTABLE: IFileSavePicker_Vtbl = IFileSavePicker_Vtbl {
-    base__: IInspectable_Vtbl {
-        base: IUnknown_Vtbl {
-            QueryInterface: picker_query_interface,
-            AddRef: picker_add_ref,
-            Release: picker_release,
-        },
-        GetIids: spy_get_iids,
-        GetRuntimeClassName: picker_runtime_class_name,
-        GetTrustLevel: spy_get_trust_level,
-    },
-    SettingsIdentifier,
-    SetSettingsIdentifier,
-    SuggestedStartLocation,
-    SetSuggestedStartLocation,
-    CommitButtonText,
-    SetCommitButtonText,
-    FileTypeChoices,
-    DefaultFileExtension,
-    SetDefaultFileExtension,
-    SuggestedSaveFile,
-    SetSuggestedSaveFile,
-    SuggestedFileName,
-    SetSuggestedFileName,
-    PickSaveFileAsync,
-};
-
-static INITIALIZE_VTABLE: IInitializeWithWindow_Vtbl = IInitializeWithWindow_Vtbl {
-    base__: IUnknown_Vtbl {
-        QueryInterface: init_query_interface,
-        AddRef: init_add_ref,
-        Release: init_release,
-    },
-    Initialize: initialize_with_window,
-};
