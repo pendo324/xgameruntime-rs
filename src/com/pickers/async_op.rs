@@ -1,17 +1,23 @@
 //! The `IAsyncOperation<T>` a pick hands back.
 //!
-//! `windows-future` can build one of these from a closure, but not this one. A cancelled pick
-//! completes *successfully* with no file, and the only way to say that at the ABI is `S_OK` with
-//! a null result - refusing instead would turn a user pressing Escape into an exception in the
-//! title. A generated `GetResults` returns `Result<T>`, whose `Ok` cannot hold a null because
-//! `IUnknown` wraps a `NonNull`.
+//! A cancelled pick completes *successfully* with no file, and the way to say that at the ABI is
+//! `S_OK` with a null result - refusing instead would turn a user pressing Escape into an
+//! exception in the title. A `Result<T>` cannot carry that null in its `Ok`, because a generated
+//! class wraps a `NonNull` and so has no bit pattern spare for one.
 //!
-//! It can still say it, though: `Error::empty()` carries a sentinel whose `HRESULT` reads back as
-//! zero, and the generated vtable returns that code without writing the caller's out-parameter.
-//! That is the same value the calling side produces from a null result, so the two halves agree.
-//! Which means the vtables here need not be written out at all - `#[implement]` supplies them,
-//! along with the reference counting and the `QueryInterface` between the operation, its
-//! `IAsyncInfo`, and the agility every caller asks about.
+//! It can still be said: `Error::empty()` carries a sentinel whose `HRESULT` reads back as zero,
+//! and the generated vtable returns that code without writing the caller's out-parameter. That is
+//! the same value the calling side produces from a null result, so the two halves agree. Which
+//! means the vtables here need not be written out - `#[implement]` supplies them, along with the
+//! reference counting and the `QueryInterface` between the operation, its `IAsyncInfo`, and the
+//! agility every caller asks about.
+//!
+//! `windows-future` builds operations from a closure, and that is *not* what rules it out here -
+//! it replays the closure's `Result` from `GetResults` faithfully, null and all. Two other things
+//! rule it out. It derives the status from whether that `Result` is `Ok`, so a cancelled pick
+//! reports `AsyncStatus::Error` with no error code and tells its completion handler the same. And
+//! it runs the closure on the thread pool, where a dialog modal to the title's window cannot go.
+//! The tests at the foot of this file pin both, since neither is visible from the signatures.
 //!
 //! One thing it supplies imperfectly. `GetRuntimeClassName` builds its answer from the result
 //! type's own name, and a generated runtime class carries an empty one - the bindings emit that
@@ -249,5 +255,73 @@ impl<T: PickOutcome> IAsyncInfo_Impl for PickOperation_Impl<T> {
 
     fn Close(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::com::pickers::bindings::StorageFile;
+
+    /// The header claims a cancelled pick has to be reported as `S_OK` with a null result, and
+    /// that a `Result<T>` cannot carry the null in its `Ok`. This is the second half of that.
+    #[test]
+    fn null_is_not_a_representable_result() {
+        // A niche-packed `Option` is the proof: if `None` and a null pointer are the same bits,
+        // then null is not a value the `Some` - and so the `Ok` - side can also hold.
+        assert_eq!(
+            size_of::<Option<StorageFile>>(),
+            size_of::<StorageFile>(),
+            "no niche, so null may be a representable interface pointer after all"
+        );
+        let none: Option<StorageFile> = None;
+        // SAFETY: both are pointer-sized, asserted above, and the bits are only read as an
+        // integer.
+        let bits: usize = unsafe { std::mem::transmute_copy(&none) };
+        assert_eq!(bits, 0, "`None` is not the null the ABI sends");
+    }
+
+    /// And the first half: the null is still expressible, because this is what it costs to say.
+    #[test]
+    fn an_empty_error_is_s_ok_on_the_wire() {
+        let code = HRESULT::from(Error::empty());
+        assert!(code.is_ok());
+        assert_eq!(code, HRESULT(0));
+    }
+
+    /// The two halves have to agree, or a null this side sends is not the null the other side
+    /// reads back.
+    #[test]
+    fn the_calling_side_turns_that_null_back_into_the_same_error() {
+        use windows_core::Type;
+        // SAFETY: `from_abi` is defined for a null pointer - refusing it is what is being tested.
+        let round_tripped = unsafe { <StorageFile as Type<_>>::from_abi(std::ptr::null_mut()) };
+        let error = round_tripped.expect_err("a null result must not arrive as an `Ok`");
+        assert_eq!(HRESULT::from(error), HRESULT(0));
+    }
+
+    /// Why `IAsyncOperation::spawn` cannot stand in for the type above, which is worth pinning
+    /// because the reason is not the obvious one: it replays the closure's `Result` from
+    /// `GetResults` exactly, null and all. What it gets wrong is everything around it.
+    #[test]
+    fn spawn_reports_a_cancelled_pick_as_a_failure() {
+        let operation = IAsyncOperation::<StorageFile>::spawn(|| Err(Error::empty()));
+        for _ in 0..100 {
+            if operation.Status().expect("status") != AsyncStatus::Started {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // The result itself survives: still `S_OK`, still no file.
+        assert_eq!(
+            HRESULT::from(operation.GetResults().expect_err("a null result")),
+            HRESULT(0)
+        );
+        // But the operation calls itself failed, and its completion handler is told the same -
+        // which for a user who pressed Escape is not what happened.
+        assert_eq!(operation.Status().expect("status"), AsyncStatus::Error);
+        // With no error to show for it.
+        assert_eq!(operation.ErrorCode().expect("error code"), HRESULT(0));
     }
 }
