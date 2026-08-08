@@ -27,7 +27,7 @@ jobs:
           sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            wine wine64-tools clang lld
+            wine wine64-tools clang lld zsh
       - name: Add the target
         run: rustup target add x86_64-pc-windows-msvc
       - name: Run check
@@ -37,8 +37,37 @@ jobs:
         env:
           WINEDEBUG: -all
 
-  # Kept as the ground truth that the DLL also links with the real MSVC toolchain, and
-  # as the source of the published artifact.
+  # The build developers actually ship: scripts/build-release.sh cross-compiles both halves
+  # and stamps the DLL as a Wine builtin, neither of which a plain `cargo build` does - see
+  # README.md's Building section. This is the source of the published artifact.
+  build:
+    name: Build release (build-release.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the Wine and zig toolchains
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            wine wine64-tools clang lld zsh
+          pip install ziglang
+          cargo install cargo-zigbuild
+      - name: Add the target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Run scripts/build-release.sh
+        run: ./scripts/build-release.sh
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: xgameruntime
+          path: |
+            target/x86_64-pc-windows-msvc/release/xgameruntime.dll
+            target/x86_64-pc-windows-msvc/release/xgameruntime.so
+          if-no-files-found: error
+
+  # Kept as a check that the DLL also links with the real MSVC toolchain - not the source of
+  # the published artifact (that's the build job above, via build-release.sh).
   check:
     name: Build (MSVC)
     runs-on: ${{ matrix.os }}
@@ -61,10 +90,3 @@ jobs:
         run: cargo check --workspace
       - name: Run build
         run: cargo build -r
-      - name: Upload
-        uses: actions/upload-artifact@v7
-        with:
-          name: xgameruntime
-          # `[build] target` in .cargo/config.toml moves this out of target/release.
-          path: target/x86_64-pc-windows-msvc/release/*.dll
-          if-no-files-found: error
