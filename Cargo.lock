@@ -271,6 +271,7 @@ dependencies = [
 [[package]]
 name = "xodus-ipc-models"
 version = "0.1.0"
+source = "git+https://github.com/pendo324/xodus?rev=297db9194540ebaea9f3d331e326c1a6780dd2e9#297db9194540ebaea9f3d331e326c1a6780dd2e9"
 dependencies = [
  "quick-xml",
  "serde",

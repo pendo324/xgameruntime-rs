@@ -11,8 +11,9 @@ crate-type = ["cdylib", "rlib"]
 # XML wire format for xodus-service's loopback IPC (src/ipc.rs) - the request/response
 # shapes live in xodus-ipc-models (a sub-crate of the xodus repo), the single source of
 # truth both this DLL and xodus-service serialize against, so the two hand-mirrored copies
-# can't drift apart. Pinned by git rev in CI; overridden to a local path in development.
-xodus-ipc-models = { git = "https://github.com/xodus-gaming/xodus", branch = "main" }
+# can't drift apart. Pinned by git rev so CI resolves it without a sibling checkout; override
+# to a local path in your own (untracked) `~/.cargo/config.toml` for development.
+xodus-ipc-models = { git = "https://github.com/pendo324/xodus", rev = "297db9194540ebaea9f3d331e326c1a6780dd2e9" }
 serde = { version = "1", features = ["derive"] }
 quick-xml = { version = "0.40.1", features = ["serialize"] }
 
@@ -125,11 +126,6 @@ features = [
     "wtypes",
     "wtypesbase",
 ]
-
-# Development override: until the xodus-ipc-models crate is pushed to
-# github.com/xodus-gaming/xodus, resolve it from the sibling checkout on disk.
-[patch."https://github.com/xodus-gaming/xodus"]
-xodus-ipc-models = { path = "../xodus/crates/xodus-ipc-models" }
 
 [profile.dev]
 panic = "abort"
