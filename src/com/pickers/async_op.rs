@@ -13,13 +13,15 @@
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
-use std::mem::offset_of;
+use std::mem::{ManuallyDrop, offset_of};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_core::{GUID, HRESULT, IInspectable_Vtbl, IUnknown_Vtbl, Interface, RuntimeType};
-use windows_future::{AsyncStatus, IAsyncInfo_Vtbl, IAsyncOperation};
+use windows_future::{
+    AsyncOperationCompletedHandler, AsyncStatus, IAsyncInfo_Vtbl, IAsyncOperation,
+};
 
 use super::deferred::run_later;
 use super::{E_POINTER, IID_IAGILE_OBJECT, S_OK, com_release, spy_get_iids, spy_get_trust_level};
@@ -212,8 +214,8 @@ impl<T: PickOutcome> PickOperation<T> {
         if handler != 0 {
             // The handler runs outside the lock: it calls straight back into `GetResults`, which
             // takes the same lock.
-            // SAFETY: `handler` is an interface pointer this object holds a reference to, and
-            // its vtable slot 4 is `Invoke(this, asyncInfo, status)` per the WinRT ABI.
+            // SAFETY: `handler` is a completion handler this object holds a reference to, and
+            // `self` is the operation it was registered on.
             unsafe { invoke_handler::<T>(handler, self as *const _ as *mut c_void) };
         }
     }
@@ -221,21 +223,25 @@ impl<T: PickOutcome> PickOperation<T> {
 
 /// Calls a completion handler with this operation and its status.
 ///
+/// The call goes through the generated `AsyncOperationCompletedHandler` rather than a vtable
+/// written out here: this one is only ever called, never implemented, so nothing about it needs
+/// the null a `GetResults` does.
+///
 /// # Safety
-/// `handler` must be a live `AsyncOperationCompletedHandler<T>` and `operation` the operation it
-/// was registered on.
+/// `handler` must be a live `AsyncOperationCompletedHandler<T::Value>` and `operation` the
+/// operation it was registered on.
 unsafe fn invoke_handler<T: PickOutcome>(handler: usize, operation: *mut c_void) {
-    #[repr(C)]
-    struct CompletedHandlerVtbl {
-        base__: IUnknown_Vtbl,
-        Invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, AsyncStatus) -> HRESULT,
-    }
-
-    // SAFETY: guaranteed by this function's contract - `handler` points at an interface whose
-    // first field is its vtable.
+    // SAFETY: both are `repr(transparent)` interface pointers, live per this function's contract.
+    // Neither reference is this call's to give back, so neither wrapper is allowed to drop.
     unsafe {
-        let handler = handler as *mut c_void;
-        let vtable = *(handler as *const *const CompletedHandlerVtbl);
+        let handler = ManuallyDrop::new(std::mem::transmute_copy::<
+            *mut c_void,
+            AsyncOperationCompletedHandler<T::Value>,
+        >(&(handler as *mut c_void)));
+        let operation_ref = ManuallyDrop::new(std::mem::transmute_copy::<
+            *mut c_void,
+            IAsyncOperation<T::Value>,
+        >(&operation));
         let status = (*(operation as *const PickOperation<T>))
             .state
             .lock()
@@ -243,7 +249,7 @@ unsafe fn invoke_handler<T: PickOutcome>(handler: usize, operation: *mut c_void)
             .status;
         // Nothing useful can be done with a handler that fails: the title wrote it, and this
         // is the notification that its own pick finished.
-        let _ = ((*vtable).Invoke)(handler, operation, status);
+        let _ = handler.Invoke(&*operation_ref, status);
     }
 }
 
