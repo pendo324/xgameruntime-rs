@@ -25,6 +25,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - &cache-winehq-apt
+        name: Cache WineHQ apt packages
+        id: cache-apt
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-cache
+          key: ${{ runner.os }}-apt-winehq-${{ hashFiles('.github/workflows/test.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-winehq-
       - name: Install the WineHQ toolchain
         run: &install-winehq |
           sudo dpkg --add-architecture i386
@@ -32,7 +41,11 @@ jobs:
           sudo wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
           sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/noble/winehq-noble.sources
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends winehq-devel clang lld zsh
+          mkdir -p "$HOME/apt-cache/partial"
+          if [ "${{ steps.cache-apt.outputs.cache-hit }}" != "true" ]; then
+            sudo apt-get install -y --no-install-recommends --download-only -o Dir::Cache::Archives="$HOME/apt-cache" winehq-devel clang lld zsh
+          fi
+          sudo dpkg -i "$HOME"/apt-cache/*.deb || sudo apt-get install -f -y
       - uses: Swatinem/rust-cache@v2
       - name: Add the target
         run: rustup target add x86_64-pc-windows-msvc
@@ -51,6 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - *cache-winehq-apt
       - name: Install the WineHQ toolchain
         run: *install-winehq
       - uses: Swatinem/rust-cache@v2
@@ -66,6 +80,11 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-zigbuild
           key: cargo-zigbuild-bin-${{ runner.os }}-v1
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-ziglang-v1
       - name: Install the zig toolchain
         run: |
           pip install ziglang
