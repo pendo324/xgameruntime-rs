@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows_core::{GUID, HRESULT, IInspectable_Vtbl, IUnknown_Vtbl, Interface};
+use windows_core::{GUID, HRESULT, IInspectable_Vtbl, IUnknown_Vtbl, Interface, RuntimeType};
+use windows_future::IAsyncOperation;
 
 use super::deferred::run_later;
 use super::{E_POINTER, IID_IAGILE_OBJECT, S_OK, com_release, spy_get_iids, spy_get_trust_level};
@@ -36,21 +37,21 @@ const STATUS_ERROR: i32 = 3;
 
 /// What one picker family's pick produces, and how its operation identifies itself.
 ///
-/// The two IIDs and the class name are not interchangeable between families even though the
-/// operation behaves identically: a parameterised WinRT interface has a distinct IID per type
-/// argument, and a title that asks for the wrong one gets `E_NOINTERFACE` from an object that
-/// would otherwise have served it.
+/// The IIDs and the class name are not interchangeable between families even though the operation
+/// behaves identically: a parameterised WinRT interface has a distinct IID per type argument, and
+/// a title that asks for the wrong one gets `E_NOINTERFACE` from an object that would otherwise
+/// have served it. Naming the type argument here is what makes those follow rather than be
+/// restated - the IID is read off `IAsyncOperation<Self::Value>`.
 pub(super) trait PickOutcome: 'static {
     /// How this family's operation names itself in diagnostics.
     const LABEL: &'static str;
-    /// The IID of `IAsyncOperation<Self>`.
-    const OPERATION_IID: GUID;
-    /// The runtime class name of `IAsyncOperation<Self>`.
+    /// The runtime class name of `IAsyncOperation<Self::Value>`.
     const RUNTIME_CLASS_NAME: &'static str;
+    /// The type the operation is parameterised by - the WinRT runtime class a completed pick
+    /// hands back, which at the ABI is one interface pointer.
+    type Value: RuntimeType;
     /// Builds the object `GetResults` hands back for a pick that landed somewhere.
-    ///
-    /// The returned pointer carries one reference, which passes to the caller.
-    fn create_result(path: PathBuf) -> *mut c_void;
+    fn create_result(path: PathBuf) -> Self::Value;
 }
 
 /// The work a pick does once the title is back in its message loop, and what it produced.
@@ -301,7 +302,7 @@ unsafe extern "system" fn operation_query_interface<T: PickOutcome>(
         }
         let known = requested == windows_core::IUnknown::IID
             || requested == windows_core::IInspectable::IID
-            || requested == T::OPERATION_IID
+            || requested == IAsyncOperation::<T::Value>::IID
             || requested == IID_IAGILE_OBJECT;
         if known {
             object.refs.fetch_add(1, Ordering::Relaxed);
@@ -472,7 +473,11 @@ unsafe extern "system" fn get_results<T: PickOutcome>(
                     return S_OK;
                 };
                 stub!("{}::GetResults -> {path:?}", T::LABEL);
-                *out = T::create_result(path);
+                let result = T::create_result(path);
+                // A runtime class is one interface pointer at the ABI, and the reference it
+                // carries passes to the caller rather than being dropped here.
+                *out = std::mem::transmute_copy(&result);
+                std::mem::forget(result);
                 S_OK
             }
             STATUS_ERROR => state.error,

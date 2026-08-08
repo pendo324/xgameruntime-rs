@@ -5,11 +5,9 @@
 //! object with a single read-only `Path`. A title that wants the file's contents opens the path
 //! itself.
 
-use std::ffi::c_void;
 use std::path::PathBuf;
 
-use windows_core::{GUID, HSTRING, Interface, Result, implement};
-use windows_future::IAsyncOperation;
+use windows_core::{HSTRING, Result, implement};
 
 use super::bindings::{IPickFileResult, IPickFileResult_Impl, PickFileResult};
 use crate::com::pickers::async_op::PickOutcome;
@@ -44,20 +42,13 @@ impl IPickFileResult_Impl for PickedPath_Impl {
 /// What the open picker's operation completes with.
 impl PickOutcome for PickedPath {
     const LABEL: &'static str = "PickFileResultOperation";
-    const OPERATION_IID: GUID = IAsyncOperation::<PickFileResult>::IID;
     const RUNTIME_CLASS_NAME: &'static str = concat!(
         "Windows.Foundation.IAsyncOperation`1<",
         "Microsoft.Windows.Storage.Pickers.PickFileResult>"
     );
+    type Value = PickFileResult;
 
-    fn create_result(path: PathBuf) -> *mut c_void {
-        let result = PickedPath::create(path);
-        // SAFETY: `PickFileResult` is a `repr(transparent)` interface pointer, and the reference
-        // it holds passes to the caller rather than being dropped here.
-        unsafe {
-            let raw = std::mem::transmute_copy(&result);
-            std::mem::forget(result);
-            raw
-        }
+    fn create_result(path: PathBuf) -> Self::Value {
+        PickedPath::create(path)
     }
 }

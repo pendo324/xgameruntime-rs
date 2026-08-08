@@ -8,10 +8,10 @@
 //! log instead of failing somewhere less obvious.
 //!
 //! `windows-rs` ships `_Impl` traits for these interfaces - they are not exclusive to a class the
-//! way a picker's interface is - so the vtables come from `#[implement]` and the bindings come
-//! straight from the `windows` crate rather than from [`super::bindings`].
+//! way a picker's interface is - so the vtables come from `#[implement]` and the interfaces come
+//! straight from the `windows` crate rather than from [`super::bindings`]. Only the class name
+//! the finished file is handed back under comes from there, for the reason given below.
 
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use windows::Storage::FileProperties::BasicProperties;
@@ -31,7 +31,7 @@ use windows::Storage::{
     IStorageItemPropertiesWithProvider_Impl, NameCollisionOption, StorageDeleteOption, StorageFile,
     StorageFolder, StorageItemTypes, StorageOpenOptions, StorageProvider, StorageStreamTransaction,
 };
-use windows_core::{GUID, HSTRING, Interface, Ref, Result, implement};
+use windows_core::{HSTRING, Ref, Result, implement};
 use windows_future::{IAsyncAction, IAsyncOperation};
 
 use super::async_op::PickOutcome;
@@ -74,7 +74,7 @@ impl PickedFile {
     /// there is no difference between the two: both are one pointer, and every caller reaches
     /// the file through `IStorageFile`/`IStorageItem`, which this does implement. The cast is
     /// what lets the operation's result carry the declared type.
-    pub(super) fn create(path: PathBuf) -> StorageFile {
+    pub(super) fn create(path: PathBuf) -> super::bindings::StorageFile {
         let file: IStorageFile = PickedFile { path }.into();
         // SAFETY: `StorageFile` and `IStorageFile` are both `repr(transparent)` wrappers around
         // a single interface pointer, and the pointer being wrapped implements `IStorageFile`.
@@ -392,24 +392,17 @@ impl IStorageFilePropertiesWithAvailability_Impl for PickedFile_Impl {
 
 /// What an operation producing a `StorageFile` completes with - a save pick, or a lookup by path.
 ///
-/// The IID comes from the generated `StorageFile` rather than the one this file builds, because
-/// that is the type the callers declare the operation as. The two are the same class by name and
-/// by interface, so they are the same signature and the same IID; taking it from the declared one
-/// means nothing has to rely on that.
+/// The operation is parameterised by the generated `StorageFile` rather than the one this file
+/// builds, because that is the type the callers declare it as. The two are the same class by name
+/// and by interface, so they are the same signature and the same IID; taking it from the declared
+/// one means nothing has to rely on that.
 impl PickOutcome for PickedFile {
     const LABEL: &'static str = "StorageFileOperation";
-    const OPERATION_IID: GUID = IAsyncOperation::<super::bindings::StorageFile>::IID;
     const RUNTIME_CLASS_NAME: &'static str =
         "Windows.Foundation.IAsyncOperation`1<Windows.Storage.StorageFile>";
+    type Value = super::bindings::StorageFile;
 
-    fn create_result(path: PathBuf) -> *mut c_void {
-        let file = PickedFile::create(path);
-        // SAFETY: `StorageFile` is a `repr(transparent)` interface pointer, and the reference it
-        // holds passes to the caller rather than being dropped here.
-        unsafe {
-            let raw = std::mem::transmute_copy(&file);
-            std::mem::forget(file);
-            raw
-        }
+    fn create_result(path: PathBuf) -> Self::Value {
+        PickedFile::create(path)
     }
 }
