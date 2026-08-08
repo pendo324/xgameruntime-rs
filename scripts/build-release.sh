@@ -78,9 +78,20 @@ case $(uname -m) in
 esac
 cp "$native_so" "target/x86_64-pc-windows-msvc/release/xgameruntime.so"
 
+# A sibling .sha512sum per file a deployer downloads independently (xodus's
+# combine-proton.sh fetches the DLL and each arch's .so as separate CI artifacts) lets it
+# verify what it pulled without needing to trust the transfer alone.
+(
+    cd target/x86_64-pc-windows-msvc/release
+    for f in xgameruntime.dll xgameruntime-x86_64.so xgameruntime-aarch64.so; do
+        sha512sum "$f" > "$f.sha512sum"
+    done
+)
+
 echo
 echo "built:"
 echo "  $root/$dll"
 echo "  $root/target/x86_64-pc-windows-msvc/release/xgameruntime.so"
 echo "  $root/target/x86_64-pc-windows-msvc/release/xgameruntime-x86_64.so"
 echo "  $root/target/x86_64-pc-windows-msvc/release/xgameruntime-aarch64.so"
+echo "  (plus a .sha512sum beside the dll and each arch-suffixed .so)"
