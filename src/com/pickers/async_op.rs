@@ -3,8 +3,13 @@
 //! `windows-future` can build one of these from a closure, but not this one: a cancelled pick
 //! completes *successfully* with a null result, and the generated `GetResults` takes a
 //! `Result<T>` whose `Ok` cannot hold a null - `IUnknown` wraps a `NonNull`. Refusing instead
-//! would turn a user pressing Escape into an exception in the title. So the two vtables are
+//! would turn a user pressing Escape into an exception in the title. So the vtable functions are
 //! written out here, where `GetResults` can write the null the contract calls for.
+//!
+//! Their *layouts* still come from `windows-future` wherever they can. `IAsyncInfo`'s vtable is
+//! used as generated. `IAsyncOperation`'s cannot be - it carries a private field, so nothing
+//! outside that crate can build one - so it is restated below and held to the generated one by
+//! [`PickOperation::LAYOUT`], which fails to compile if the slots ever stop lining up.
 //!
 //! What a completed pick produces differs between the picker families this runtime serves - one
 //! hands back a `StorageFile`, the other a `PickFileResult` - but nothing else about the
@@ -21,6 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use windows_core::{GUID, HRESULT, IInspectable_Vtbl, IUnknown_Vtbl, Interface, RuntimeType};
 use windows_future::{
     AsyncOperationCompletedHandler, AsyncStatus, IAsyncInfo_Vtbl, IAsyncOperation,
+    IAsyncOperation_Vtbl,
 };
 
 use super::deferred::run_later;
@@ -54,6 +60,7 @@ pub(super) trait PickOutcome: 'static {
 /// The work a pick does once the title is back in its message loop, and what it produced.
 pub(super) type PickJob = Box<dyn FnOnce() -> Result<Option<PathBuf>, HRESULT>>;
 
+/// `IAsyncOperation<T>`'s vtable, restated because the generated one cannot be built here.
 #[repr(C)]
 struct AsyncOperationVtbl {
     base__: IInspectable_Vtbl,
@@ -87,6 +94,26 @@ pub(super) struct PickOperation<T: PickOutcome> {
 }
 
 impl<T: PickOutcome> PickOperation<T> {
+    /// Holds [`AsyncOperationVtbl`] to the layout `windows-future` generates for this family's
+    /// operation: the same size, and the same three slots in the same order after `IInspectable`.
+    /// Evaluated where the vtable is built, so a mismatch is a compile error rather than a call
+    /// landing in the wrong function.
+    const LAYOUT: () = {
+        assert!(size_of::<AsyncOperationVtbl>() == size_of::<IAsyncOperation_Vtbl<T::Value>>());
+        assert!(
+            offset_of!(AsyncOperationVtbl, SetCompleted)
+                == offset_of!(IAsyncOperation_Vtbl<T::Value>, SetCompleted)
+        );
+        assert!(
+            offset_of!(AsyncOperationVtbl, Completed)
+                == offset_of!(IAsyncOperation_Vtbl<T::Value>, Completed)
+        );
+        assert!(
+            offset_of!(AsyncOperationVtbl, GetResults)
+                == offset_of!(IAsyncOperation_Vtbl<T::Value>, GetResults)
+        );
+    };
+
     /// The vtables this family's operations carry. Written as constants rather than statics
     /// because they are per-result-type, and a `static` cannot be generic.
     const OPERATION_VTABLE: &'static AsyncOperationVtbl = &AsyncOperationVtbl {
@@ -133,6 +160,7 @@ impl<T: PickOutcome> PickOperation<T> {
     /// seen it, and a pick that is already finished by the time it is handed over is not a
     /// sequence a title has any reason to expect.
     pub(super) fn start(job: PickJob) -> *mut c_void {
+        let () = Self::LAYOUT;
         let operation = Box::into_raw(Box::new(PickOperation::<T> {
             operation_vtable: Self::OPERATION_VTABLE,
             info_vtable: Self::INFO_VTABLE,
@@ -173,6 +201,7 @@ impl<T: PickOutcome> PickOperation<T> {
     /// deferred would be worse than pointless - the deferral runs on a message loop, and nothing
     /// promises the thread doing a lookup has one.
     pub(super) fn completed(outcome: Result<Option<PathBuf>, HRESULT>) -> *mut c_void {
+        let () = Self::LAYOUT;
         let operation = Box::into_raw(Box::new(PickOperation::<T> {
             operation_vtable: Self::OPERATION_VTABLE,
             info_vtable: Self::INFO_VTABLE,
@@ -459,7 +488,7 @@ unsafe extern "system" fn get_results<T: PickOutcome>(
             AsyncStatus::Completed => {
                 let Some(path) = state.picked.clone() else {
                     // A cancelled pick: successful, with no file. This null is the whole reason
-                    // these vtables are hand-written.
+                    // these functions are written out here.
                     stub!("{}::GetResults -> cancelled", T::LABEL);
                     return S_OK;
                 };
