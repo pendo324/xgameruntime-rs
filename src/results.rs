@@ -13,3 +13,10 @@ pub(crate) const E_ACCESSDENIED: HRESULT = HRESULT(0x80070005u32 as i32);
 /// Returned when an XAsync entry point is called out of order, e.g. asking for a result
 /// before the call has completed.
 pub(crate) const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
+/// Nobody is signed in for `XUserAddAsync(AddDefaultUserSilently)` to add (`xgameerr.h`).
+///
+/// The distinction from a generic failure is load-bearing: a title asks silently first and
+/// reads this specific code as "ask the human", where `E_FAIL` means the platform is broken
+/// and there is nothing to retry. Minecraft answers the latter with a "Failed to login"
+/// dialog and never opens its sign-in screen.
+pub(crate) const E_GAMEUSER_NO_DEFAULT_USER: HRESULT = HRESULT(0x89245106u32 as i32);

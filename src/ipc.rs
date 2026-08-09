@@ -36,7 +36,7 @@ use std::time::Duration;
 use windows_core::HRESULT;
 
 use crate::diag::diag;
-use crate::results::E_ACCESSDENIED;
+use crate::results::{E_ACCESSDENIED, E_GAMEUSER_NO_DEFAULT_USER};
 use crate::{E_FAIL, E_NOTIMPL};
 
 mod unixlib;
@@ -583,6 +583,13 @@ pub fn get_user_info() -> Result<(String, String, String, String), HRESULT> {
         response.gamertag_modern,
         response.age_group
     );
+    // The service answers "nobody is signed in" as a successful lookup with nothing in it,
+    // because that is a state rather than a failure. It only becomes an error here, where
+    // there is an HRESULT that says exactly it - and saying exactly it is what lets a title
+    // tell "ask the human" apart from "the platform is broken".
+    if response.xuid.is_empty() {
+        return Err(E_GAMEUSER_NO_DEFAULT_USER);
+    }
     Ok((
         response.xuid,
         response.gamertag,
