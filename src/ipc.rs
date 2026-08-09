@@ -64,10 +64,11 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Interactive sign-in blocks on a human finishing (or abandoning) a webview login, which
-/// runs on human timescale, not the sub-second round trips [`IO_TIMEOUT`] is sized for. Ten
-/// minutes is generous enough not to cut off a real attempt while still eventually giving
-/// up if the webview process wedges.
+/// Interactive sign-in and Store-UI webviews (purchase, redeem, rate-and-review, ...) both
+/// block on a human finishing (or abandoning) a native window, which runs on human timescale,
+/// not the sub-second round trips [`IO_TIMEOUT`] is sized for. Ten minutes is generous enough
+/// not to cut off a real attempt while still eventually giving up if the webview process
+/// wedges.
 const INTERACTIVE_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// `XodusMessageType::MSA_TOKEN_REQUEST` / `MSA_TOKEN_RESPONSE` (`proto/xodus/common.proto`).
@@ -99,6 +100,8 @@ const MSG_TYPE_PRODUCTS_REQUEST: u16 = 27;
 const MSG_TYPE_PRODUCTS_RESPONSE: u16 = 28;
 const MSG_TYPE_PURCHASE_ID_REQUEST: u16 = 29;
 const MSG_TYPE_PURCHASE_ID_RESPONSE: u16 = 30;
+const MSG_TYPE_STORE_UI_REQUEST: u16 = 31;
+const MSG_TYPE_STORE_UI_RESPONSE: u16 = 32;
 /// Mirrors `xodus_service::connection::xml::ERROR_REPLY_TYPE`: sent instead of
 /// `msg_type + 1` when the service hit an internal error handling the request (e.g. a
 /// transient failure talking to a real Microsoft endpoint), with the error's `Display`
@@ -222,7 +225,7 @@ use xodus_ipc_models::xstore::{
     CollectionsIdRequest, CollectionsIdResponse, EntitledProduct, EntitledProductsRequest,
     EntitledProductsResponse, LicenseRequest, LicenseResponse, LicenseTokenRequest,
     LicenseTokenResponse, ProductsRequest, ProductsResponse, PurchaseIdRequest, PurchaseIdResponse,
-    ResolveProductIdRequest, ResolveProductIdResponse,
+    ResolveProductIdRequest, ResolveProductIdResponse, StoreUiKind, StoreUiRequest, StoreUiResponse,
 };
 use xodus_ipc_models::xuser::{
     GamerPictureRequest, GamerPictureResponse, InteractiveSignInRequest, InteractiveSignInResponse,
@@ -616,6 +619,43 @@ pub fn interactive_sign_in() -> Result<Option<(String, String, String, String)>,
         response.gamertag_modern,
         response.age_group,
     )))
+}
+
+/// The whole `XStoreShow*UIAsync` family's real backing - opens `xodus-cli store-ui` in a
+/// native webview against a real Microsoft storefront page and blocks until the human closes
+/// it, on the same [`INTERACTIVE_SIGN_IN_TIMEOUT`] human-timescale budget as
+/// [`interactive_sign_in`]. `Ok(true)` only means the window ran and closed normally - it is
+/// not a claim that a purchase, redemption, or review was actually completed; the title finds
+/// that out the same way a real console would, by re-querying entitlements afterward.
+#[allow(clippy::too_many_arguments)]
+pub fn show_store_ui(
+    kind: StoreUiKind,
+    store_id: &str,
+    name: &str,
+    extended_json_data: &str,
+    token: &str,
+    allowed_store_ids: &[String],
+    market: &str,
+) -> Result<bool, HRESULT> {
+    diag!("show_store_ui called");
+    let response: StoreUiResponse = exchange_with_timeout(
+        MSG_TYPE_STORE_UI_REQUEST,
+        MSG_TYPE_STORE_UI_RESPONSE,
+        &StoreUiRequest {
+            kind,
+            store_id: store_id.to_string(),
+            name: name.to_string(),
+            extended_json_data: extended_json_data.to_string(),
+            token: token.to_string(),
+            allowed_store_ids: allowed_store_ids.to_vec(),
+            market: market.to_string(),
+        },
+        INTERACTIVE_SIGN_IN_TIMEOUT,
+    )?;
+    if !response.completed {
+        diag!("show_store_ui: server reported the webview did not run");
+    }
+    Ok(response.completed)
 }
 
 unsafe extern "system" {
@@ -1351,6 +1391,126 @@ mod tests {
         server.join().expect("server thread");
 
         assert_eq!(result.expect("round trip succeeds"), None);
+    }
+
+    #[test]
+    fn show_store_ui_round_trips_against_a_fake_service() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0xccu8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            assert_eq!(
+                u16::from_le_bytes([header[0], header[1]]),
+                MSG_TYPE_STORE_UI_REQUEST
+            );
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let body = read_exact_blocking(&mut socket, size);
+            let request: StoreUiRequest =
+                quick_xml::de::from_str(std::str::from_utf8(&body).unwrap()).expect("parses");
+            assert_eq!(request.kind, StoreUiKind::RedeemToken);
+            assert_eq!(request.token, "TESTCODE");
+            assert_eq!(
+                request.allowed_store_ids,
+                vec!["9NBLGGH2JHXJ".to_string(), "9PDX9K4VN3F0".to_string()]
+            );
+
+            let response = StoreUiResponse { completed: true };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_STORE_UI_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = show_store_ui(
+            StoreUiKind::RedeemToken,
+            "",
+            "",
+            "",
+            "TESTCODE",
+            &["9NBLGGH2JHXJ".to_string(), "9PDX9K4VN3F0".to_string()],
+            "",
+        );
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert_eq!(result.expect("round trip succeeds"), true);
+    }
+
+    #[test]
+    fn show_store_ui_reports_false_when_the_webview_did_not_run() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let secret = [0xddu8; SECRET_LEN];
+        let secret_for_server = secret;
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+
+            let mut magic = [0u8; 4];
+            socket.read_exact(&mut magic).expect("read handshake magic");
+            assert_eq!(u32::from_le_bytes(magic), HANDSHAKE_MAGIC);
+            let presented = read_exact_blocking(&mut socket, SECRET_LEN);
+            assert_eq!(presented, secret_for_server);
+            socket
+                .write_all(&[HANDSHAKE_ACCEPTED])
+                .expect("write accepted");
+
+            let mut msg_magic = [0u8; 4];
+            socket
+                .read_exact(&mut msg_magic)
+                .expect("read message magic");
+            assert_eq!(u32::from_le_bytes(msg_magic), XML_MAGIC_V2);
+            let mut header = [0u8; 6];
+            socket.read_exact(&mut header).expect("read header");
+            assert_eq!(
+                u16::from_le_bytes([header[0], header[1]]),
+                MSG_TYPE_STORE_UI_REQUEST
+            );
+            let size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            let _body = read_exact_blocking(&mut socket, size);
+
+            let response = StoreUiResponse { completed: false };
+            let payload = quick_xml::se::to_string(&response).unwrap().into_bytes();
+            let mut reply = Vec::new();
+            reply.extend(XML_MAGIC_V2.to_le_bytes());
+            reply.extend(MSG_TYPE_STORE_UI_RESPONSE.to_le_bytes());
+            reply.extend((payload.len() as u32).to_le_bytes());
+            reply.extend(payload);
+            socket.write_all(&reply).expect("write reply");
+        });
+
+        set_endpoint_env(port, &hex_encode(&secret));
+        let result = show_store_ui(StoreUiKind::ProductPage, "9NBLGGH2JHXJ", "", "", "", &[], "");
+        clear_endpoint_env();
+        server.join().expect("server thread");
+
+        assert_eq!(result.expect("round trip succeeds"), false);
     }
 
     #[test]

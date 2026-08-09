@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
 use windows_sys::core::BOOL;
-use xodus_ipc_models::xstore::CatalogProductEntry;
+use xodus_ipc_models::xstore::{CatalogProductEntry, StoreUiKind};
 
 use super::bool_stub;
 use super::hresult_stub;
@@ -970,12 +970,6 @@ impl IXStore_Impl for XStoreObject_Impl {
         unsafe fn __ReservedSlot46(&self) -> HRESULT;
         unsafe fn __ReservedSlot47(&self) -> HRESULT;
         unsafe fn __ReservedSlot48(&self) -> HRESULT;
-        unsafe fn XStoreShowPurchaseUIAsync(&self, storeContextHandle: u64, storeId: *mut c_char, name: *mut c_char, extendedJsonData: *mut c_char, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowPurchaseUIResult(&self, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowRateAndReviewUIAsync(&self, storeContextHandle: u64, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowRateAndReviewUIResult(&self, async_: *mut c_void, result: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowRedeemTokenUIAsync(&self, storeContextHandle: u64, token: *mut c_char, allowedStoreIds: *mut *mut c_char, allowedStoreIdsCount: u64, disallowCsvRedemption: BOOL, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowRedeemTokenUIResult(&self, async_: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryGameAndDlcPackageUpdatesAsync(&self, storeContextHandle: u64, async_: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryGameAndDlcPackageUpdatesResultCount(&self, async_: *mut c_void, count: *mut u32) -> HRESULT;
         unsafe fn XStoreQueryGameAndDlcPackageUpdatesResult(&self, async_: *mut c_void, count: u32, packageUpdates: *mut c_void) -> HRESULT;
@@ -991,17 +985,11 @@ impl IXStore_Impl for XStoreObject_Impl {
         unsafe fn __ReservedSlot70(&self) -> HRESULT;
         unsafe fn XStoreAcquireLicenseForDurablesAsync(&self, storeContextHandle: u64, storeId: *mut c_char, async_: *mut c_void) -> HRESULT;
         unsafe fn XStoreAcquireLicenseForDurablesResult(&self, async_: *mut c_void, storeLicenseHandle: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowAssociatedProductsUIAsync(&self, storeContextHandle: u64, storeId: *mut c_char, productKinds: u64, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowAssociatedProductsUIResult(&self, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowProductPageUIAsync(&self, storeContextHandle: u64, storeId: *mut c_char, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowProductPageUIResult(&self, async_: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryAssociatedProductsForStoreIdAsync(&self, storeContextHandle: u64, storeProductId: *mut c_char, productKinds: u64, maxItemsToRetrievePerPage: u32, async_: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryAssociatedProductsForStoreIdResult(&self, async_: *mut c_void, productQueryHandle: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryPackageUpdatesAsync(&self, storeContextHandle: u64, packageIdentifiers: *mut *mut c_char, packageIdentifiersCount: u64, async_: *mut c_void) -> HRESULT;
         unsafe fn XStoreQueryPackageUpdatesResultCount(&self, async_: *mut c_void, count: *mut u32) -> HRESULT;
         unsafe fn XStoreQueryPackageUpdatesResult(&self, async_: *mut c_void, count: u32, packageUpdates: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowGiftingUIAsync(&self, storeContextHandle: u64, storeId: *mut c_char, name: *mut c_char, extendedJsonData: *mut c_char, async_: *mut c_void) -> HRESULT;
-        unsafe fn XStoreShowGiftingUIResult(&self, async_: *mut c_void) -> HRESULT;
     }
     bool_stub! {
         unsafe fn XStoreIsLicenseValid(&self, storeLicenseHandle: u64) -> BOOL;
@@ -1479,6 +1467,242 @@ impl IXStore_Impl for XStoreObject_Impl {
             )
         }
     }
+
+    /// `XStoreShowPurchaseUIAsync`'s real backing - see [`show_store_ui_async`].
+    unsafe fn XStoreShowPurchaseUIAsync(
+        &self,
+        storeContextHandle: u64,
+        storeId: *mut c_char,
+        name: *mut c_char,
+        extendedJsonData: *mut c_char,
+        async_: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 {
+            return E_POINTER;
+        }
+        // SAFETY: storeId/name/extendedJsonData are GDK-caller-supplied pointers that are
+        // null or NUL-terminated per the XStoreShowPurchaseUIAsync contract.
+        let (store_id, name, extended_json_data) = unsafe {
+            (
+                c_string_or_empty(storeId),
+                c_string_or_empty(name),
+                c_string_or_empty(extendedJsonData),
+            )
+        };
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract;
+        // show_store_ui_async itself no-ops on a null pointer via run_sync.
+        unsafe {
+            show_store_ui_async(
+                async_,
+                StoreUiKind::Purchase,
+                store_id,
+                name,
+                extended_json_data,
+                String::new(),
+                Vec::new(),
+            )
+        }
+    }
+
+    unsafe fn XStoreShowPurchaseUIResult(&self, async_: *mut c_void) -> HRESULT {
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract.
+        unsafe { show_store_ui_result(async_) }
+    }
+
+    /// `XStoreShowRateAndReviewUIAsync`'s real backing - see [`show_store_ui_async`].
+    unsafe fn XStoreShowRateAndReviewUIAsync(
+        &self,
+        storeContextHandle: u64,
+        async_: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 {
+            return E_POINTER;
+        }
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract;
+        // show_store_ui_async itself no-ops on a null pointer via run_sync.
+        unsafe {
+            show_store_ui_async(
+                async_,
+                StoreUiKind::RateAndReview,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+            )
+        }
+    }
+
+    /// `result` is `XStoreRateAndReviewResult { wasUpdated: bool }`. Nothing here can observe
+    /// whether the page the human saw actually submitted a review - `false` is the honest
+    /// "unknown, not a guess at success" answer, same stance as [`crate::ipc::show_store_ui`]'s
+    /// `completed` flag never claiming a transaction outcome.
+    unsafe fn XStoreShowRateAndReviewUIResult(
+        &self,
+        async_: *mut c_void,
+        result: *mut c_void,
+    ) -> HRESULT {
+        if result.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract.
+        let hr = unsafe { show_store_ui_result(async_) };
+        if hr.is_ok() {
+            // SAFETY: result was null-checked above and is a valid
+            // XStoreRateAndReviewResult out-pointer per the GDK contract.
+            unsafe {
+                *result.cast::<BOOL>() = false.into();
+            }
+        }
+        hr
+    }
+
+    /// `XStoreShowRedeemTokenUIAsync`'s real backing - see [`show_store_ui_async`].
+    unsafe fn XStoreShowRedeemTokenUIAsync(
+        &self,
+        storeContextHandle: u64,
+        token: *mut c_char,
+        allowedStoreIds: *mut *mut c_char,
+        allowedStoreIdsCount: u64,
+        _disallowCsvRedemption: BOOL,
+        async_: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 {
+            return E_POINTER;
+        }
+        // SAFETY: token is a GDK-caller-supplied pointer that's null or NUL-terminated per
+        // the XStoreShowRedeemTokenUIAsync contract.
+        let token_value = unsafe { c_string_or_empty(token) };
+        // SAFETY: allowedStoreIds is the caller's array of allowedStoreIdsCount
+        // nul-terminated strings per the GDK contract, copied here and not retained.
+        let allowed_store_ids = unsafe { read_string_array(allowedStoreIds, allowedStoreIdsCount) };
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract;
+        // show_store_ui_async itself no-ops on a null pointer via run_sync.
+        unsafe {
+            show_store_ui_async(
+                async_,
+                StoreUiKind::RedeemToken,
+                String::new(),
+                String::new(),
+                String::new(),
+                token_value,
+                allowed_store_ids,
+            )
+        }
+    }
+
+    unsafe fn XStoreShowRedeemTokenUIResult(&self, async_: *mut c_void) -> HRESULT {
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract.
+        unsafe { show_store_ui_result(async_) }
+    }
+
+    /// `XStoreShowAssociatedProductsUIAsync`'s real backing - see [`show_store_ui_async`].
+    unsafe fn XStoreShowAssociatedProductsUIAsync(
+        &self,
+        storeContextHandle: u64,
+        storeId: *mut c_char,
+        _productKinds: u64,
+        async_: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 {
+            return E_POINTER;
+        }
+        // SAFETY: storeId is a GDK-caller-supplied pointer that's null or NUL-terminated
+        // per the XStoreShowAssociatedProductsUIAsync contract.
+        let store_id = unsafe { c_string_or_empty(storeId) };
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract;
+        // show_store_ui_async itself no-ops on a null pointer via run_sync.
+        unsafe {
+            show_store_ui_async(
+                async_,
+                StoreUiKind::AssociatedProducts,
+                store_id,
+                String::new(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+            )
+        }
+    }
+
+    unsafe fn XStoreShowAssociatedProductsUIResult(&self, async_: *mut c_void) -> HRESULT {
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract.
+        unsafe { show_store_ui_result(async_) }
+    }
+
+    /// `XStoreShowProductPageUIAsync`'s real backing - see [`show_store_ui_async`].
+    unsafe fn XStoreShowProductPageUIAsync(
+        &self,
+        storeContextHandle: u64,
+        storeId: *mut c_char,
+        async_: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 {
+            return E_POINTER;
+        }
+        // SAFETY: storeId is a GDK-caller-supplied pointer that's null or NUL-terminated
+        // per the XStoreShowProductPageUIAsync contract.
+        let store_id = unsafe { c_string_or_empty(storeId) };
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract;
+        // show_store_ui_async itself no-ops on a null pointer via run_sync.
+        unsafe {
+            show_store_ui_async(
+                async_,
+                StoreUiKind::ProductPage,
+                store_id,
+                String::new(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+            )
+        }
+    }
+
+    unsafe fn XStoreShowProductPageUIResult(&self, async_: *mut c_void) -> HRESULT {
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract.
+        unsafe { show_store_ui_result(async_) }
+    }
+
+    /// `XStoreShowGiftingUIAsync`'s real backing - see [`show_store_ui_async`].
+    unsafe fn XStoreShowGiftingUIAsync(
+        &self,
+        storeContextHandle: u64,
+        storeId: *mut c_char,
+        name: *mut c_char,
+        extendedJsonData: *mut c_char,
+        async_: *mut c_void,
+    ) -> HRESULT {
+        if storeContextHandle == 0 {
+            return E_POINTER;
+        }
+        // SAFETY: storeId/name/extendedJsonData are GDK-caller-supplied pointers that are
+        // null or NUL-terminated per the XStoreShowGiftingUIAsync contract.
+        let (store_id, name, extended_json_data) = unsafe {
+            (
+                c_string_or_empty(storeId),
+                c_string_or_empty(name),
+                c_string_or_empty(extendedJsonData),
+            )
+        };
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract;
+        // show_store_ui_async itself no-ops on a null pointer via run_sync.
+        unsafe {
+            show_store_ui_async(
+                async_,
+                StoreUiKind::Gifting,
+                store_id,
+                name,
+                extended_json_data,
+                String::new(),
+                Vec::new(),
+            )
+        }
+    }
+
+    unsafe fn XStoreShowGiftingUIResult(&self, async_: *mut c_void) -> HRESULT {
+        // SAFETY: async_ is the caller's XAsyncBlock pointer per the XAsync GDK contract.
+        unsafe { show_store_ui_result(async_) }
+    }
 }
 
 /// Keyed by the caller's `async_` pointer, same rationale and same leak-on-unread
@@ -1587,6 +1811,62 @@ unsafe fn opaque_result(
             diag!("{label} Result -> no result filed for this async block");
             E_ILLEGAL_METHOD_CALL
         }
+    }
+}
+
+/// Shared body of every `XStoreShow*UIAsync` entry point - builds a `StoreUiRequest` and
+/// blocks on [`crate::ipc::show_store_ui`]'s webview round trip via [`xasync::run_sync`].
+/// Never logs `token`/`extended_json_data`: the former can carry a redeemable code, the
+/// latter is caller-defined data with no guaranteed-safe shape to print.
+///
+/// # Safety
+/// `async_` must be null or the caller's live `XAsyncBlock*` per the XAsync GDK contract;
+/// `run_sync` itself no-ops on a null pointer.
+unsafe fn show_store_ui_async(
+    async_: *mut c_void,
+    kind: StoreUiKind,
+    store_id: String,
+    name: String,
+    extended_json_data: String,
+    token: String,
+    allowed_store_ids: Vec<String>,
+) -> HRESULT {
+    diag!("Show{kind:?}UIAsync(store_id={store_id:?})");
+    let market = crate::ipc::store_market();
+    // SAFETY: async_ is the caller's XAsyncBlock pointer per this function's own `# Safety`
+    // contract; run_sync itself no-ops on a null pointer.
+    unsafe {
+        xasync::run_sync(async_.cast(), move || {
+            crate::ipc::show_store_ui(
+                kind,
+                &store_id,
+                &name,
+                &extended_json_data,
+                &token,
+                &allowed_store_ids,
+                &market,
+            )
+        })
+    }
+}
+
+/// Shared body of every plain `XStoreShow*UIResult` (no output beyond success/failure): did
+/// the webview [`show_store_ui_async`] launched run and close normally. The `bool` itself
+/// isn't surfaced to the title here - only whether the async op resolved - since none of
+/// these calls have a payload to report beyond "the UI ran."
+///
+/// # Safety
+/// `async_` must be null or the caller's live `XAsyncBlock*` per the XAsync GDK contract.
+unsafe fn show_store_ui_result(async_: *mut c_void) -> HRESULT {
+    if async_.is_null() {
+        return E_POINTER;
+    }
+    let mut completed = false;
+    // SAFETY: async_ was null-checked above and completed's type (bool) matches what
+    // show_store_ui_async's run_sync closure stored.
+    match unsafe { get_result(async_.cast(), null_mut(), &mut completed) } {
+        Ok(_) => S_OK,
+        Err(hr) => hr,
     }
 }
 

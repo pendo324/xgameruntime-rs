@@ -14,3 +14,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
 ]
+
+[[patch.unused]]
+name = "xodus-ipc-models"
+version = "0.1.0"
