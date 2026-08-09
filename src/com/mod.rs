@@ -78,6 +78,17 @@ pub(crate) type SIZE_T = usize;
 pub(crate) type UINT32 = u32;
 pub(crate) type UINT64 = u64;
 pub(crate) type INT32 = i32;
+/// Every GDK entry point that takes or returns a boolean declares it as C++ `bool`, which is
+/// one byte - never Win32 `BOOL`, which is four. Use this alias for all of them, and never
+/// `windows_sys::core::BOOL`, which is `i32`.
+///
+/// The width is not cosmetic in either direction. As a *parameter*, the caller only sets the
+/// low byte of the register and leaves whatever was above it alone, so reading four bytes
+/// turns a `false` the title passed into a garbage non-zero number - see
+/// [`crate::com::xasync::IXAsyncProvider::XTaskQueueTerminate`], where that misread parked
+/// Minecraft's only task-queue pump thread and silently killed all of its networking. As an
+/// *out-pointer*, the caller sized the destination for one byte, so writing four overruns it
+/// by three.
 pub(crate) type BOOLEAN = u8;
 pub(crate) type FLOAT = f32;
 pub(crate) type DOUBLE = f64;
@@ -120,8 +131,8 @@ macro_rules! hresult_stub_panic {
 }
 
 macro_rules! bool_stub {
-    ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> BOOL;)*) => {
-        $(unsafe fn $name(&self $(, $arg: $ty)*) -> BOOL {
+    ($(unsafe fn $name:ident (&self $(, $arg:ident : $ty:ty)*) -> BOOLEAN;)*) => {
+        $(unsafe fn $name(&self $(, $arg: $ty)*) -> BOOLEAN {
             $(let _ = $arg;)*
             $crate::diag::stub!("{} -> false", stringify!($name));
             false.into()
@@ -554,7 +565,7 @@ mod tests {
 
         assert_eq!(
             unsafe { store.XStoreProductsQueryHasMorePages(handle) },
-            0i32
+            super::FALSE
         );
 
         unsafe extern "system" fn collect(

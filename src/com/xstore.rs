@@ -8,7 +8,7 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
-use windows_sys::core::BOOL;
+use crate::com::BOOLEAN;
 use xodus_ipc_models::xstore::{CatalogProductEntry, StoreUiKind};
 
 use super::bool_stub;
@@ -600,7 +600,7 @@ pub unsafe trait IXStore: IUnknown {
         context: *mut c_void,
         callback: *mut c_void,
     ) -> HRESULT;
-    pub unsafe fn XStoreProductsQueryHasMorePages(&self, productQueryHandle: u64) -> BOOL;
+    pub unsafe fn XStoreProductsQueryHasMorePages(&self, productQueryHandle: u64) -> BOOLEAN;
     pub unsafe fn XStoreProductsQueryNextPageAsync(
         &self,
         productQueryHandle: u64,
@@ -623,7 +623,7 @@ pub unsafe trait IXStore: IUnknown {
         async_: *mut c_void,
         storeLicenseHandle: *mut c_void,
     ) -> HRESULT;
-    pub unsafe fn XStoreIsLicenseValid(&self, storeLicenseHandle: u64) -> BOOL;
+    pub unsafe fn XStoreIsLicenseValid(&self, storeLicenseHandle: u64) -> BOOLEAN;
     pub unsafe fn XStoreCloseLicenseHandle(&self, storeLicenseHandle: u64) -> ();
     pub unsafe fn XStoreCanAcquireLicenseForStoreIdAsync(
         &self,
@@ -773,7 +773,7 @@ pub unsafe trait IXStore: IUnknown {
         token: *mut c_char,
         allowedStoreIds: *mut *mut c_char,
         allowedStoreIdsCount: u64,
-        disallowCsvRedemption: BOOL,
+        disallowCsvRedemption: BOOLEAN,
         async_: *mut c_void,
     ) -> HRESULT;
     pub unsafe fn XStoreShowRedeemTokenUIResult(&self, async_: *mut c_void) -> HRESULT;
@@ -848,8 +848,8 @@ pub unsafe trait IXStore: IUnknown {
         &self,
         storeContextHandle: u64,
         token: u64,
-        wait: BOOL,
-    ) -> BOOL;
+        wait: BOOLEAN,
+    ) -> BOOLEAN;
     pub unsafe fn XStoreRegisterPackageLicenseLost(
         &self,
         licenseHandle: u64,
@@ -862,8 +862,8 @@ pub unsafe trait IXStore: IUnknown {
         &self,
         licenseHandle: u64,
         token: u64,
-        wait: BOOL,
-    ) -> BOOL;
+        wait: BOOLEAN,
+    ) -> BOOLEAN;
     pub unsafe fn __ReservedSlot70(&self) -> HRESULT;
     pub unsafe fn XStoreAcquireLicenseForDurablesAsync(
         &self,
@@ -992,8 +992,8 @@ impl IXStore_Impl for XStoreObject_Impl {
         unsafe fn XStoreQueryPackageUpdatesResult(&self, async_: *mut c_void, count: u32, packageUpdates: *mut c_void) -> HRESULT;
     }
     bool_stub! {
-        unsafe fn XStoreIsLicenseValid(&self, storeLicenseHandle: u64) -> BOOL;
-        unsafe fn XStoreUnregisterPackageLicenseLost(&self, licenseHandle: u64, token: u64, wait: BOOL) -> BOOL;
+        unsafe fn XStoreIsLicenseValid(&self, storeLicenseHandle: u64) -> BOOLEAN;
+        unsafe fn XStoreUnregisterPackageLicenseLost(&self, licenseHandle: u64, token: u64, wait: BOOLEAN) -> BOOLEAN;
     }
     void_stub! {
         unsafe fn XStoreCloseContextHandle(&self, storeContextHandle: u64) -> ();
@@ -1228,8 +1228,8 @@ impl IXStore_Impl for XStoreObject_Impl {
         &self,
         _storeContextHandle: u64,
         token: u64,
-        _wait: BOOL,
-    ) -> BOOL {
+        _wait: BOOLEAN,
+    ) -> BOOLEAN {
         if token == 0 || token >= LICENSE_CHANGE_TOKENS.load(Ordering::Relaxed) {
             return false.into();
         }
@@ -1271,7 +1271,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         S_OK
     }
 
-    unsafe fn XStoreProductsQueryHasMorePages(&self, _productQueryHandle: u64) -> BOOL {
+    unsafe fn XStoreProductsQueryHasMorePages(&self, _productQueryHandle: u64) -> BOOLEAN {
         // "My games" doesn't paginate - every entitled product comes back in one page.
         false.into()
     }
@@ -1551,7 +1551,7 @@ impl IXStore_Impl for XStoreObject_Impl {
             // SAFETY: result was null-checked above and is a valid
             // XStoreRateAndReviewResult out-pointer per the GDK contract.
             unsafe {
-                *result.cast::<BOOL>() = false.into();
+                *result.cast::<BOOLEAN>() = false.into();
             }
         }
         hr
@@ -1564,7 +1564,7 @@ impl IXStore_Impl for XStoreObject_Impl {
         token: *mut c_char,
         allowedStoreIds: *mut *mut c_char,
         allowedStoreIdsCount: u64,
-        _disallowCsvRedemption: BOOL,
+        _disallowCsvRedemption: BOOLEAN,
         async_: *mut c_void,
     ) -> HRESULT {
         if storeContextHandle == 0 {

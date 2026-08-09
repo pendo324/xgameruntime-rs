@@ -21,7 +21,7 @@ use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use windows_core::{GUID, HRESULT, IUnknown, Interface, interface};
-use windows_sys::core::BOOL;
+use crate::com::BOOLEAN;
 
 type XTaskQueueHandle = *mut c_void;
 pub type XAsyncCompletionRoutine = unsafe extern "system" fn(async_block: *mut XAsyncBlock);
@@ -58,7 +58,7 @@ pub struct XAsyncProviderData {
 
 #[interface("073b7dcb-1fcf-4030-94be-e3c9eb623428")]
 pub unsafe trait IXAsync: IUnknown {
-    pub unsafe fn XAsyncGetStatus(&self, asyncBlock: *mut c_void, wait: BOOL) -> HRESULT;
+    pub unsafe fn XAsyncGetStatus(&self, asyncBlock: *mut c_void, wait: BOOLEAN) -> HRESULT;
     pub unsafe fn XAsyncGetResultSize(
         &self,
         asyncBlock: *mut c_void,
@@ -108,7 +108,7 @@ pub unsafe trait IXAsync: IUnknown {
         queueHandle: u64,
         duplicatedHandle: *mut u64,
     ) -> HRESULT;
-    pub unsafe fn XTaskQueueDispatch(&self, queue: u64, port: u64, timeoutInMs: u32) -> BOOL;
+    pub unsafe fn XTaskQueueDispatch(&self, queue: u64, port: u64, timeoutInMs: u32) -> BOOLEAN;
     pub unsafe fn XTaskQueueCloseHandle(&self, queue: u64) -> ();
     pub unsafe fn XTaskQueueSubmitCallback(
         &self,
@@ -135,10 +135,16 @@ pub unsafe trait IXAsync: IUnknown {
         token: *mut u64,
     ) -> HRESULT;
     pub unsafe fn XTaskQueueUnregisterWaiter(&self, queue: u64, token: u64) -> ();
+    /// This is the entry point whose `wait` width [`BOOLEAN`] documents, and the one that made
+    /// the difference observable: Minecraft tears its websocket queue down with
+    /// `XTaskQueueTerminate(q, false, ctx, cb)` from inside a process-queue dispatch, so a
+    /// `wait` read four bytes wide sends it down the blocking branch and parks the title's one
+    /// pump thread forever - every later callback queues behind it, and all of the game's
+    /// networking silently stops. Seen live as `wait=71890432` (`0x0448F600`, low byte zero).
     pub unsafe fn XTaskQueueTerminate(
         &self,
         queue: u64,
-        wait: BOOL,
+        wait: BOOLEAN,
         callbackContext: *mut c_void,
         callback: *mut c_void,
     ) -> HRESULT;
@@ -150,12 +156,12 @@ pub unsafe trait IXAsync: IUnknown {
         token: *mut u64,
     ) -> HRESULT;
     pub unsafe fn XTaskQueueUnregisterMonitor(&self, queue: u64, token: u64) -> ();
-    pub unsafe fn XTaskQueueGetCurrentProcessTaskQueue(&self, queue: *mut u64) -> BOOL;
+    pub unsafe fn XTaskQueueGetCurrentProcessTaskQueue(&self, queue: *mut u64) -> BOOLEAN;
     pub unsafe fn XTaskQueueSetCurrentProcessTaskQueue(&self, queue: u64) -> ();
-    pub unsafe fn XThreadSetTimeSensitive(&self, isTimeSensitiveThread: BOOL) -> HRESULT;
+    pub unsafe fn XThreadSetTimeSensitive(&self, isTimeSensitiveThread: BOOLEAN) -> HRESULT;
     pub unsafe fn __ReservedSlot28(&self) -> HRESULT;
     pub unsafe fn XThreadAssertNotTimeSensitive(&self) -> ();
-    pub unsafe fn XThreadIsTimeSensitive(&self) -> BOOL;
+    pub unsafe fn XThreadIsTimeSensitive(&self) -> BOOLEAN;
 }
 
 fn interface() -> Result<IXAsync, HRESULT> {

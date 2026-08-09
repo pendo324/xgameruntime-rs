@@ -2,7 +2,7 @@ use super::E_NOTIMPL;
 use crate::results::*;
 use std::ffi::{c_char, c_void};
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
-use windows_sys::core::BOOL;
+use crate::com::BOOLEAN;
 // The five classes below have no `.idl` entry in Wine's `xgameruntime` include tree (only
 // `xsystemanalytics.idl` exists there - the other four have no idl at all), so their
 // IIDs/method layouts come from `xgameruntime-docs` instead. That source documents some
@@ -28,7 +28,7 @@ pub unsafe trait IXGameInviteImpl: IUnknown {
         callback: *mut c_void,
         token: *mut c_void,
     ) -> HRESULT;
-    pub unsafe fn XGameInviteUnregisterForEvent(&self, token: u64, wait: BOOL) -> ();
+    pub unsafe fn XGameInviteUnregisterForEvent(&self, token: u64, wait: BOOLEAN) -> ();
 }
 
 #[interface("014d1cc3-bcfe-41ff-b2f0-e1ef07155828")]
@@ -40,7 +40,7 @@ pub unsafe trait IXGameInviteImpl2: IXGameInviteImpl {
         callback: *mut c_void,
         token: *mut c_void,
     ) -> HRESULT;
-    pub unsafe fn XGameInviteUnregisterForPendingEvent(&self, token: u64, wait: BOOL) -> ();
+    pub unsafe fn XGameInviteUnregisterForPendingEvent(&self, token: u64, wait: BOOLEAN) -> ();
     /// `xgameruntime-docs` has no documentation at all for this method (added in a GDK update
     /// alongside the "pending event" pair above) - not even a parameter list. This signature is
     /// a guess based on the name and the shape of every other invite-acceptance call in this
@@ -71,7 +71,7 @@ impl IXGameInviteImpl_Impl for XGameInvite_Impl {
         S_OK
     }
 
-    unsafe fn XGameInviteUnregisterForEvent(&self, _token: u64, _wait: BOOL) {}
+    unsafe fn XGameInviteUnregisterForEvent(&self, _token: u64, _wait: BOOLEAN) {}
 }
 
 impl IXGameInviteImpl2_Impl for XGameInvite_Impl {
@@ -92,7 +92,7 @@ impl IXGameInviteImpl2_Impl for XGameInvite_Impl {
         S_OK
     }
 
-    unsafe fn XGameInviteUnregisterForPendingEvent(&self, _token: u64, _wait: BOOL) {}
+    unsafe fn XGameInviteUnregisterForPendingEvent(&self, _token: u64, _wait: BOOLEAN) {}
 
     unsafe fn XGameInviteAcceptPendingInvite(&self, _invite_uri: *const c_char) -> HRESULT {
         E_NOTIMPL

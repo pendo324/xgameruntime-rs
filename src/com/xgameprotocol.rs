@@ -1,7 +1,7 @@
 use crate::results::*;
 use std::ffi::c_void;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
-use windows_sys::core::BOOL;
+use crate::com::BOOLEAN;
 /// Unlike `CLSID_XGAME_INVITE`, `XGameProtocolImpl`'s coclass id (`95fd18d2...`, confirmed via
 /// Wine trace logs) is *not* the same value as `IXGameProtocolImpl`'s own IID
 /// (`026b010c...`) - `xgameruntime-docs`' `XGameProtocolImpl/README.md` documents them as
@@ -17,7 +17,7 @@ pub unsafe trait IXGameProtocolImpl: IUnknown {
         callback: *mut c_void,
         token: *mut c_void,
     ) -> HRESULT;
-    pub unsafe fn XGameProtocolUnregisterForActivation(&self, token: u64, wait: BOOL) -> ();
+    pub unsafe fn XGameProtocolUnregisterForActivation(&self, token: u64, wait: BOOLEAN) -> ();
 }
 
 #[implement(IXGameProtocolImpl)]
@@ -44,5 +44,5 @@ impl IXGameProtocolImpl_Impl for XGameProtocol_Impl {
         S_OK
     }
 
-    unsafe fn XGameProtocolUnregisterForActivation(&self, _token: u64, _wait: BOOL) {}
+    unsafe fn XGameProtocolUnregisterForActivation(&self, _token: u64, _wait: BOOLEAN) {}
 }

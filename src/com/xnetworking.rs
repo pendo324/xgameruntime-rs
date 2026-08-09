@@ -7,7 +7,7 @@ pub const CLSID_XNETWORKING: GUID = GUID::from_u128(0x37e56907_2f10_41e8_b72f_36
 use std::mem::size_of;
 use std::ptr::null_mut;
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
-use windows_sys::core::BOOL;
+use crate::com::BOOLEAN;
 
 use super::bool_stub;
 use super::hresult_stub_panic;
@@ -36,8 +36,8 @@ pub unsafe trait IXNetworking: IUnknown {
     pub unsafe fn XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(
         &self,
         token: u64,
-        wait: BOOL,
-    ) -> BOOL;
+        wait: BOOLEAN,
+    ) -> BOOLEAN;
     pub unsafe fn XNetworkingQuerySecurityInformationForUrlAsync(
         &self,
         url: *mut c_char,
@@ -93,8 +93,8 @@ pub unsafe trait IXNetworking: IUnknown {
     pub unsafe fn XNetworkingUnregisterConnectivityHintChanged(
         &self,
         token: u64,
-        wait: BOOL,
-    ) -> BOOL;
+        wait: BOOLEAN,
+    ) -> BOOLEAN;
     pub unsafe fn XNetworkingQueryConfigurationSetting(
         &self,
         configurationSetting: u64,
@@ -176,8 +176,8 @@ impl IXNetworking_Impl for XNetworkingObject_Impl {
         unsafe fn XNetworkingQueryStatistics(&self, statisticsType: u64, statisticsBuffer: *mut c_void) -> HRESULT;
     }
     bool_stub! {
-        unsafe fn XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(&self, token: u64, wait: BOOL) -> BOOL;
-        unsafe fn XNetworkingUnregisterConnectivityHintChanged(&self, token: u64, wait: BOOL) -> BOOL;
+        unsafe fn XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(&self, token: u64, wait: BOOLEAN) -> BOOLEAN;
+        unsafe fn XNetworkingUnregisterConnectivityHintChanged(&self, token: u64, wait: BOOLEAN) -> BOOLEAN;
     }
 
     unsafe fn XNetworkingGetConnectivityHint(

@@ -34,10 +34,10 @@ pub const CLSID_XUSER: GUID = GUID::from_u128(0x01acd177_91f9_4763_a38e_ccbb55ce
 /// Also `IXUserDeviceImpl`'s own IID, for the same reason.
 pub const CLSID_XUSER_DEVICE: GUID = GUID::from_u128(0x7d824997_10dc_45ab_86b7_2737767c0bf1);
 
-/// Win32 `BOOLEAN` - one byte. Distinct from the four-byte `BOOL` used elsewhere in this
-/// crate; `xuser.idl` uses `BOOLEAN` throughout, so getting the width wrong would corrupt
-/// whatever field follows it across the FFI boundary.
-type Boolean = u8;
+/// One byte, as `xuser.idl` spells it and as every other GDK boolean is - see
+/// [`crate::com::BOOLEAN`], which this is the local name for, for what getting the width
+/// wrong costs.
+type Boolean = crate::com::BOOLEAN;
 
 pub(crate) const TRUE: Boolean = 1;
 pub(crate) const FALSE: Boolean = 0;

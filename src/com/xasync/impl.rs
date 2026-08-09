@@ -39,9 +39,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::com::BOOLEAN;
 use crate::diag::diag;
 use windows_core::{HRESULT, implement};
-use windows_sys::core::BOOL;
 
 type XAsyncProvider =
     unsafe extern "system" fn(op: XAsyncOp, data: *const XAsyncProviderData) -> HRESULT;
@@ -227,7 +227,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         complete_state(&state, HRESULT(result), required_buffer_size as usize);
     }
 
-    unsafe fn XAsyncGetStatus(&self, async_block: *mut c_void, wait: BOOL) -> HRESULT {
+    unsafe fn XAsyncGetStatus(&self, async_block: *mut c_void, wait: BOOLEAN) -> HRESULT {
         // SAFETY: `state_of` requires `async_block` be null or a valid `XAsyncBlock`, which
         // GDK guarantees for a block obtained from `XAsyncBegin`.
         let Some(state) = (unsafe { state_of(async_block as *mut XAsyncBlock) }) else {
@@ -522,7 +522,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         QueueHandle::close(queue);
     }
 
-    unsafe fn XTaskQueueDispatch(&self, queue: u64, port: u64, timeout_in_ms: u32) -> BOOL {
+    unsafe fn XTaskQueueDispatch(&self, queue: u64, port: u64, timeout_in_ms: u32) -> BOOLEAN {
         diag!("XTaskQueueDispatch enter handle={:#x} port={}", queue, port);
         let (Some(queue), Some(kind)) = (QueueHandle::get(queue), PortKind::from_raw(port)) else {
             diag!("XTaskQueueDispatch bad handle/port, bailing");
@@ -622,7 +622,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
     unsafe fn XTaskQueueTerminate(
         &self,
         queue: u64,
-        wait: BOOL,
+        wait: BOOLEAN,
         callback_context: *mut c_void,
         callback: *mut c_void,
     ) -> HRESULT {
@@ -702,7 +702,7 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         }
     }
 
-    unsafe fn XTaskQueueGetCurrentProcessTaskQueue(&self, queue: *mut u64) -> BOOL {
+    unsafe fn XTaskQueueGetCurrentProcessTaskQueue(&self, queue: *mut u64) -> BOOLEAN {
         // SAFETY: `queue` is the caller-supplied out-pointer for
         // `XTaskQueueGetCurrentProcessTaskQueue`, checked non-null via the `Some` match here.
         let Some(out) = (unsafe { queue.as_mut() }) else {
@@ -739,12 +739,12 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         task_queue::set_process_queue(resolved);
     }
 
-    unsafe fn XThreadSetTimeSensitive(&self, is_time_sensitive_thread: BOOL) -> HRESULT {
+    unsafe fn XThreadSetTimeSensitive(&self, is_time_sensitive_thread: BOOLEAN) -> HRESULT {
         TIME_SENSITIVE.with(|flag| flag.store(is_time_sensitive_thread != 0, Ordering::Relaxed));
         S_OK
     }
 
-    unsafe fn XThreadIsTimeSensitive(&self) -> BOOL {
+    unsafe fn XThreadIsTimeSensitive(&self) -> BOOLEAN {
         TIME_SENSITIVE
             .with(|flag| flag.load(Ordering::Relaxed))
             .into()

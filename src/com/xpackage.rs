@@ -2,7 +2,7 @@ use super::{E_NOTIMPL, XPackageMountHandle, XPackageMountHandleTable};
 use crate::results::*;
 use std::ffi::{c_char, c_void};
 use windows_core::{GUID, HRESULT, IUnknown, implement, interface};
-use windows_sys::core::BOOL;
+use crate::com::BOOLEAN;
 
 use super::bool_stub;
 use super::hresult_stub;
@@ -24,7 +24,7 @@ pub unsafe trait IXPackageImpl: IUnknown {
         bufferSize: usize,
         buffer: *mut c_char,
     ) -> HRESULT;
-    pub unsafe fn XPackageIsPackagedProcess(&self) -> BOOL;
+    pub unsafe fn XPackageIsPackagedProcess(&self) -> BOOLEAN;
     pub unsafe fn XPackageCreateInstallationMonitor(
         &self,
         packageIdentifier: *const c_char,
@@ -40,7 +40,7 @@ pub unsafe trait IXPackageImpl: IUnknown {
         installationMonitor: u64,
         progress: *mut c_void,
     ) -> ();
-    pub unsafe fn XPackageUpdateInstallationMonitor(&self, installationMonitor: u64) -> BOOL;
+    pub unsafe fn XPackageUpdateInstallationMonitor(&self, installationMonitor: u64) -> BOOLEAN;
     pub unsafe fn XPackageRegisterInstallationProgressChanged(
         &self,
         installationMonitor: u64,
@@ -52,8 +52,8 @@ pub unsafe trait IXPackageImpl: IUnknown {
         &self,
         installationMonitor: u64,
         token: u64,
-        wait: BOOL,
-    ) -> BOOL;
+        wait: BOOLEAN,
+    ) -> BOOLEAN;
     pub unsafe fn XPackageGetUserLocale(&self, localeSize: usize, locale: *mut c_char) -> HRESULT;
     pub unsafe fn XPackageFindChunkAvailability(
         &self,
@@ -81,7 +81,7 @@ pub unsafe trait IXPackageImpl: IUnknown {
         selectorCount: u32,
         selectors: *mut c_void,
         minimumUpdateIntervalMs: u32,
-        suppressUserConfirmation: BOOL,
+        suppressUserConfirmation: BOOLEAN,
         queue: *mut c_void,
         installationMonitor: *mut c_void,
     ) -> HRESULT;
@@ -91,7 +91,7 @@ pub unsafe trait IXPackageImpl: IUnknown {
         selectorCount: u32,
         selectors: *mut c_void,
         minimumUpdateIntervalMs: u32,
-        suppressUserConfirmation: BOOL,
+        suppressUserConfirmation: BOOLEAN,
         asyncBlock: *mut c_void,
     ) -> HRESULT;
     pub unsafe fn XPackageInstallChunksResult(
@@ -105,7 +105,7 @@ pub unsafe trait IXPackageImpl: IUnknown {
         selectorCount: u32,
         selectors: *mut c_void,
         downloadSize: *mut u64,
-        shouldPresentUserConfirmation: *mut BOOL,
+        shouldPresentUserConfirmation: *mut BOOLEAN,
     ) -> HRESULT;
     pub unsafe fn XPackageUninstallChunks(
         &self,
@@ -115,7 +115,7 @@ pub unsafe trait IXPackageImpl: IUnknown {
     ) -> HRESULT;
     pub unsafe fn __PADDING__(&self) -> HRESULT;
     pub unsafe fn __PADDING_2__(&self) -> HRESULT;
-    pub unsafe fn XPackageUnregisterPackageInstalled(&self, token: u64, wait: BOOL) -> BOOL;
+    pub unsafe fn XPackageUnregisterPackageInstalled(&self, token: u64, wait: BOOLEAN) -> BOOLEAN;
     pub unsafe fn __PADDING_3__(&self) -> HRESULT;
     pub unsafe fn XPackageGetMountPathSize(
         &self,
@@ -153,7 +153,7 @@ pub unsafe trait IXPackageImpl: IUnknown {
         context: *mut c_void,
         callback: *mut c_void,
     ) -> HRESULT;
-    pub unsafe fn XPackageUninstallPackage(&self, packageIdentifier: *const c_char) -> BOOL;
+    pub unsafe fn XPackageUninstallPackage(&self, packageIdentifier: *const c_char) -> BOOLEAN;
 }
 
 /// Adds `XPackageMountWithUiAsync`/`Result` over [`IXPackageImpl`] - not implemented, since
@@ -194,10 +194,10 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
         unsafe fn XPackageFindChunkAvailability(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, availability: *mut c_void) -> HRESULT;
         unsafe fn XPackageEnumerateChunkAvailability(&self, packageIdentifier: *const c_char, selectorType: u32, context: *mut c_void, callback: *mut c_void) -> HRESULT;
         unsafe fn XPackageChangeChunkInstallOrder(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void) -> HRESULT;
-        unsafe fn XPackageInstallChunks(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, minimumUpdateIntervalMs: u32, suppressUserConfirmation: BOOL, queue: *mut c_void, installationMonitor: *mut c_void) -> HRESULT;
-        unsafe fn XPackageInstallChunksAsync(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, minimumUpdateIntervalMs: u32, suppressUserConfirmation: BOOL, asyncBlock: *mut c_void) -> HRESULT;
+        unsafe fn XPackageInstallChunks(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, minimumUpdateIntervalMs: u32, suppressUserConfirmation: BOOLEAN, queue: *mut c_void, installationMonitor: *mut c_void) -> HRESULT;
+        unsafe fn XPackageInstallChunksAsync(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, minimumUpdateIntervalMs: u32, suppressUserConfirmation: BOOLEAN, asyncBlock: *mut c_void) -> HRESULT;
         unsafe fn XPackageInstallChunksResult(&self, asyncBlock: *mut c_void, installationMonitor: *mut c_void) -> HRESULT;
-        unsafe fn XPackageEstimateDownloadSize(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, downloadSize: *mut u64, shouldPresentUserConfirmation: *mut BOOL) -> HRESULT;
+        unsafe fn XPackageEstimateDownloadSize(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void, downloadSize: *mut u64, shouldPresentUserConfirmation: *mut BOOLEAN) -> HRESULT;
         unsafe fn XPackageUninstallChunks(&self, packageIdentifier: *const c_char, selectorCount: u32, selectors: *mut c_void) -> HRESULT;
         unsafe fn __PADDING__(&self) -> HRESULT;
         unsafe fn __PADDING_2__(&self) -> HRESULT;
@@ -212,11 +212,11 @@ impl IXPackageImpl_Impl for XPackageObject_Impl {
     }
 
     bool_stub! {
-        unsafe fn XPackageIsPackagedProcess(&self) -> BOOL;
-        unsafe fn XPackageUpdateInstallationMonitor(&self, installationMonitor: u64) -> BOOL;
-        unsafe fn XPackageUnregisterInstallationProgressChanged(&self, installationMonitor: u64, token: u64, wait: BOOL) -> BOOL;
-        unsafe fn XPackageUnregisterPackageInstalled(&self, token: u64, wait: BOOL) -> BOOL;
-        unsafe fn XPackageUninstallPackage(&self, packageIdentifier: *const c_char) -> BOOL;
+        unsafe fn XPackageIsPackagedProcess(&self) -> BOOLEAN;
+        unsafe fn XPackageUpdateInstallationMonitor(&self, installationMonitor: u64) -> BOOLEAN;
+        unsafe fn XPackageUnregisterInstallationProgressChanged(&self, installationMonitor: u64, token: u64, wait: BOOLEAN) -> BOOLEAN;
+        unsafe fn XPackageUnregisterPackageInstalled(&self, token: u64, wait: BOOLEAN) -> BOOLEAN;
+        unsafe fn XPackageUninstallPackage(&self, packageIdentifier: *const c_char) -> BOOLEAN;
     }
 
     void_stub! {
