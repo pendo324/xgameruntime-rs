@@ -329,11 +329,12 @@ impl IXUserImpl_Impl for XUserObject_Impl {
             // SAFETY: same as above - `async_` is a valid `XAsyncBlock*` or null.
             (unsafe { async_.as_ref() }).map(|b| b.queue)
         );
-        if options & 0b101 == 0 {
-            diag!("XUserAddAsync rejecting options={options:#x} -> E_ABORT");
-            return E_ABORT;
-        }
-        let allow_ui = options & 0x04 != 0;
+        // Showing the sign-in UI is the default, not an opt-in: `AddDefaultUserSilently` is
+        // the flag that suppresses it, and everything else - including plain `None` - is a
+        // request to ask the human. Minecraft relies on exactly that, calling silently first
+        // and then again with `None` once that reports nobody is signed in; treating `None`
+        // as a malformed call answered the only request for the UI with `E_ABORT`.
+        let allow_ui = options & 0x04 != 0 || options & 0x01 == 0;
 
         // SAFETY: the GDK's XUserAddAsync contract guarantees `async_` is a valid,
         // caller-owned `XAsyncBlock*` for the duration of this call.
