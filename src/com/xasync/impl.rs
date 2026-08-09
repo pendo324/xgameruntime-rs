@@ -639,7 +639,25 @@ impl IXAsync_Impl for XAsyncObject_Impl {
         let terminated: Option<TerminatedCallback> =
             (!callback.is_null()).then(|| unsafe { crate::ffi_util::fn_ptr_cast(callback) });
 
-        if wait != 0 {
+        // A `wait` from inside a dispatch callback is a request we cannot honour as asked:
+        // draining the queue means running the callbacks still on it, and this thread is the
+        // one that runs them, so waiting here waits on work only this thread can do. The same
+        // deadlock [`Self::XAsyncGetStatus`] declines above, reached by a different door.
+        // There is no `E_PENDING` to answer with here - `XTaskQueueTerminate` has no "not
+        // yet" - so the wait is downgraded to the non-blocking path below rather than
+        // refused: the queue still terminates and the callback still fires once it has
+        // actually drained, and the one promise broken is that draining finished before this
+        // returned. A caller that acts on that promise sees a queue still winding down; a
+        // caller that deadlocks here sees nothing ever again.
+        let in_dispatch = task_queue::in_dispatch();
+        if wait != 0 && in_dispatch {
+            diag!(
+                "XTaskQueueTerminate wait=true deferred (in dispatch callback; avoiding pump deadlock) queue={:#x}",
+                Arc::as_ptr(&queue) as usize
+            );
+        }
+
+        if wait != 0 && !in_dispatch {
             queue.terminate(true);
             if let Some(terminated) = terminated {
                 // SAFETY: `terminated` was caller-registered via `XTaskQueueTerminate`'s
